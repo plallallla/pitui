@@ -22,15 +22,15 @@ pub fn map_key(app: &AppState, event: KeyEvent) -> Option<Action> {
                 Screen::BranchOverview | Screen::CommitDetail | Screen::FileDiffDetail
             );
         if can_copy_commit {
-            return Some(
-                if event.modifiers.contains(KeyModifiers::SHIFT)
-                    || matches!(event.code, KeyCode::Char('C'))
-                {
-                    Action::CopyCurrentCommitInfo
-                } else {
-                    Action::CopySelectedCommitHashes
-                },
-            );
+            return Some(if event.modifiers.contains(KeyModifiers::ALT) {
+                Action::CopyCurrentCommitMessage
+            } else if event.modifiers.contains(KeyModifiers::SHIFT)
+                || matches!(event.code, KeyCode::Char('C'))
+            {
+                Action::CopyCurrentCommitInfo
+            } else {
+                Action::CopySelectedCommitHashes
+            });
         }
         return Some(Action::Quit);
     }
@@ -187,6 +187,10 @@ fn map_normal(event: KeyEvent, app: &AppState) -> Option<Action> {
         | (Screen::CommitDetail, FocusPanel::CommitList, KeyCode::Char('i')) => {
             Some(Action::CopyCurrentCommitInfo)
         }
+        (Screen::BranchOverview, FocusPanel::CommitList, KeyCode::Char('m'))
+        | (Screen::CommitDetail, FocusPanel::CommitList, KeyCode::Char('m')) => {
+            Some(Action::CopyCurrentCommitMessage)
+        }
         (Screen::BranchOverview, FocusPanel::CommitList, KeyCode::Char('/')) => {
             Some(Action::StartFilter)
         }
@@ -212,6 +216,9 @@ fn map_normal(event: KeyEvent, app: &AppState) -> Option<Action> {
         (Screen::CommitDetail, FocusPanel::CommitFileList, KeyCode::Char('i')) => {
             Some(Action::CopyCurrentCommitInfo)
         }
+        (Screen::CommitDetail, FocusPanel::CommitFileList, KeyCode::Char('m')) => {
+            Some(Action::CopyCurrentCommitMessage)
+        }
         (Screen::CommitDetail, FocusPanel::CommitFileList, KeyCode::Enter)
         | (Screen::CommitDetail, FocusPanel::CommitFileList, KeyCode::Char('v'))
         | (Screen::FileDiffDetail, FocusPanel::FileList, KeyCode::Enter) => {
@@ -221,6 +228,7 @@ fn map_normal(event: KeyEvent, app: &AppState) -> Option<Action> {
         (Screen::FileDiffDetail, _, KeyCode::Char('p')) => Some(Action::PrevFile),
         (Screen::FileDiffDetail, _, KeyCode::Char('v')) => Some(Action::ToggleDiffMode),
         (Screen::FileDiffDetail, _, KeyCode::Char('w')) => Some(Action::ToggleWrap),
+        (Screen::FileDiffDetail, _, KeyCode::Char('m')) => Some(Action::CopyCurrentCommitMessage),
         (Screen::Reflog, FocusPanel::ReflogList, KeyCode::Char('R')) => {
             Some(Action::OpenResetDialog)
         }
@@ -345,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_keys_toggle_selection_and_copy_hash_or_info() {
+    fn commit_keys_toggle_selection_and_copy_hash_info_or_message() {
         let mut state = AppState {
             focus: FocusPanel::CommitList,
             ..AppState::default()
@@ -383,6 +391,23 @@ mod tests {
                 )
             ),
             Some(Action::CopyCurrentCommitInfo)
+        );
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)
+            ),
+            Some(Action::CopyCurrentCommitMessage)
+        );
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT
+                )
+            ),
+            Some(Action::CopyCurrentCommitMessage)
         );
     }
 

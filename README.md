@@ -30,7 +30,7 @@ Any main view -- Ctrl+G --> Changes -> Staged / Unstaged -> Files + Diff
 - 查看单文件 unified diff。
 - 在宽度不小于 140 列时使用 side-by-side diff。
 - 分支和 commit 过滤。
-- commit 支持多选，并复制一个或多个完整 commit hash；也可复制当前 commit info。
+- commit 支持多选，并复制一个或多个完整 commit hash；也可单独复制当前 commit info 或完整 message。
 - cherry-pick queue。
 - 分支切换确认。
 - `reset --soft` / `--mixed` / `--hard`；hard reset 采用警告确认 + 短哈希输入的双重确认。
@@ -102,6 +102,7 @@ PITUI_LOG=/path/to/pitui.jsonl pitui /repo
 | `Ctrl-G` | 从任意主界面打开独立 Changes；再次按下或按 `Esc` 返回原界面和原焦点 |
 | `Ctrl-C` | commit 上下文中复制已多选的完整 hashes（没有多选时复制当前 hash）；其他上下文退出 |
 | `Ctrl-Shift-C` | commit 上下文中复制当前 commit info |
+| `Ctrl-Alt-C` | commit 上下文中复制当前完整 commit message |
 | `Tab` / `Shift-Tab` | 切换面板焦点 |
 | `↑` / `k`, `↓` / `j` | 移动选择或滚动 diff |
 | `PageUp`, `PageDown`, `Home`, `End` | 翻页或跳转 |
@@ -123,6 +124,7 @@ PITUI_LOG=/path/to/pitui.jsonl pitui /repo
 | Commits | `Space` | 加入/移出 commit 复制多选集合 |
 | Commits | `c` / `Ctrl-C` | 按当前列表顺序复制所有多选 commit 的完整 hash；无多选时复制当前 hash |
 | Commits | `i` / `Ctrl-Shift-C` | 复制当前 commit info（hash、author、date、refs 和 message） |
+| Commits | `m` / `Ctrl-Alt-C` | 复制当前完整 commit message；需要时后台加载 body，但不改变 screen/focus |
 | Commits | `/` | 过滤 commits |
 | Commits | `y` | 将 commit 加入 cherry-pick queue |
 | Commits | `Y` | 打开 queue 确认弹窗 |
@@ -180,17 +182,20 @@ Stage 使用 path-limited `git add --all -- <paths>`；unstage 使用 path-limit
 |---|---|
 | `Space` | 展开或折叠文件 hunk summary |
 | `Enter` / `v` | 打开所选文件 diff |
+| `m` / `Ctrl-Alt-C` | 复制当前完整 commit message |
 | `Esc` | 返回 Branch / Commit Overview |
 
 ### File Diff Detail
 
 | Key | 操作 |
 |---|---|
+| 文件列表 `↑` / `k`, `↓` / `j` | 选择文件并刷新右侧 diff，焦点保持在左侧文件列表 |
 | `n` / `p` | 下一个/上一个文件 |
 | `v` | unified / side-by-side 切换 |
 | `w` | diff 换行开关 |
 | `Ctrl-C` | 复制当前/已多选 commit hashes |
 | `Ctrl-Shift-C` | 复制当前 commit info |
+| `m` / `Ctrl-Alt-C` | 复制当前完整 commit message |
 | `Esc` | 返回 Commit Detail |
 
 ## 安全边界

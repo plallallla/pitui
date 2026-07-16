@@ -219,6 +219,23 @@ fn load_commit_detail(cwd: &Path, commit: CommitHash) -> Result<GitResponse, Git
     Ok(GitResponse::CommitDetailLoaded(detail))
 }
 
+fn load_commit_message(cwd: &Path, commit: CommitHash) -> Result<GitResponse, GitFailure> {
+    let output = run_git(
+        cwd,
+        [
+            OsString::from("show"),
+            OsString::from("--no-patch"),
+            OsString::from("--format=%B"),
+            OsString::from(commit.0.clone()),
+        ],
+    )?;
+    let mut message = String::from_utf8_lossy(&output.stdout).into_owned();
+    while message.ends_with(['\n', '\r']) {
+        message.pop();
+    }
+    Ok(GitResponse::CommitMessageLoaded { commit, message })
+}
+
 fn load_file_diff(
     cwd: &Path,
     commit: CommitHash,
@@ -533,6 +550,7 @@ pub fn execute_request(cwd: &Path, request: GitRequest) -> GitResponse {
         GitRequest::LoadBranches => load_branches(cwd),
         GitRequest::LoadCommits { branch, limit } => load_commits(cwd, branch, limit),
         GitRequest::LoadCommitDetail { commit } => load_commit_detail(cwd, commit),
+        GitRequest::LoadCommitMessage { commit } => load_commit_message(cwd, commit),
         GitRequest::LoadFileDiff {
             commit,
             path,

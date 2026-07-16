@@ -33,6 +33,9 @@ pub enum GitRequest {
     LoadCommitDetail {
         commit: CommitHash,
     },
+    LoadCommitMessage {
+        commit: CommitHash,
+    },
     LoadFileDiff {
         commit: CommitHash,
         path: GitPath,
@@ -83,6 +86,10 @@ pub enum GitResponse {
         commits: Vec<crate::domain::Commit>,
     },
     CommitDetailLoaded(CommitDetail),
+    CommitMessageLoaded {
+        commit: CommitHash,
+        message: String,
+    },
     FileDiffLoaded(FileDiff),
     ReflogLoaded(Vec<ReflogEntry>),
     WorkingTreeLoaded(Vec<WorkingTreeChange>),

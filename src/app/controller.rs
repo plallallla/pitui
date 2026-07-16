@@ -184,6 +184,20 @@ impl App {
         }
     }
 
+    fn submit_commit_message_for_copy(&mut self, repository_index: usize, commit: CommitHash) {
+        let kind = PendingJobKind::CommitMessage {
+            repository_index,
+            commit: commit.clone(),
+        };
+        if let Some(id) = self.submit(
+            repository_index,
+            GitRequest::LoadCommitMessage { commit },
+            kind,
+        ) {
+            self.state.latest_commit_message_job = Some(id);
+        }
+    }
+
     fn submit_reflog(&mut self, repository_index: usize) {
         if let Some(id) = self.submit(
             repository_index,
@@ -243,7 +257,7 @@ impl App {
         self.state.selection.changes_diff_scroll = 0;
     }
 
-    fn submit_selected_file_diff(&mut self) {
+    fn submit_selected_file_diff(&mut self, focus_diff: bool) {
         let Some(repository_index) = self.state.branch_commits_repository_index else {
             return;
         };
@@ -260,6 +274,7 @@ impl App {
             repository_index,
             commit: commit.clone(),
             path: path.clone(),
+            focus_diff,
         };
         if let Some(id) = self.submit(
             repository_index,
@@ -296,9 +311,21 @@ impl App {
                 self.state.latest_commit_detail_job != Some(id)
                     || self.state.branch_commits_repository_index != Some(repository_index)
             }
+            PendingJobKind::CommitMessage { commit, .. } => {
+                self.state.latest_commit_message_job != Some(id)
+                    || self.state.branch_commits_repository_index != Some(repository_index)
+                    || self
+                        .state
+                        .selected_commit()
+                        .is_none_or(|selected| &selected.hash != commit)
+            }
             PendingJobKind::FileDiff { .. } => {
                 self.state.latest_file_diff_job != Some(id)
                     || self.state.branch_commits_repository_index != Some(repository_index)
+                    || !matches!(
+                        self.state.screen,
+                        Screen::CommitDetail | Screen::FileDiffDetail
+                    )
             }
             PendingJobKind::Reflog { .. } => {
                 self.state.latest_reflog_job != Some(id)
@@ -346,6 +373,11 @@ impl App {
                 if self.state.latest_commit_detail_job == Some(id) =>
             {
                 self.state.latest_commit_detail_job = None;
+            }
+            PendingJobKind::CommitMessage { .. }
+                if self.state.latest_commit_message_job == Some(id) =>
+            {
+                self.state.latest_commit_message_job = None;
             }
             PendingJobKind::FileDiff { .. } if self.state.latest_file_diff_job == Some(id) => {
                 self.state.latest_file_diff_job = None;
@@ -540,11 +572,30 @@ impl App {
                 self.state.screen = Screen::CommitDetail;
                 self.state.focus = FocusPanel::CommitFileList;
             }
+            GitResponse::CommitMessageLoaded { commit, message } => {
+                let requested_commit = match &kind {
+                    PendingJobKind::CommitMessage { commit, .. } => commit,
+                    _ => return,
+                };
+                if &commit != requested_commit {
+                    return;
+                }
+                self.state.pending_clipboard = Some(message);
+                self.state.last_message = Some("Copied current commit message".into());
+            }
             GitResponse::FileDiffLoaded(diff) => {
+                let focus_diff = match &kind {
+                    PendingJobKind::FileDiff { focus_diff, .. } => *focus_diff,
+                    _ => return,
+                };
                 self.state.current_file_diff = Some(diff);
                 self.state.selection.diff_scroll = 0;
                 self.state.screen = Screen::FileDiffDetail;
-                self.state.focus = FocusPanel::DiffView;
+                // Enter/open deliberately focuses the diff. Up/Down/Home/End
+                // and n/p only refresh it and preserve the current panel.
+                if focus_diff {
+                    self.state.focus = FocusPanel::DiffView;
+                }
             }
             GitResponse::ReflogLoaded(entries) => {
                 self.state.reflog_repository_index = Some(repository_index);
@@ -1070,7 +1121,7 @@ impl App {
             }
             Action::OpenCommitDetail => self.open_commit_detail(),
             Action::ToggleFileExpanded => self.toggle_file_expanded(),
-            Action::OpenSelectedFileDiff => self.submit_selected_file_diff(),
+            Action::OpenSelectedFileDiff => self.submit_selected_file_diff(true),
             Action::ToggleDiffMode => {
                 self.state.diff_mode = match self.state.diff_mode {
                     DiffViewMode::Unified => DiffViewMode::SideBySide,
@@ -1088,6 +1139,7 @@ impl App {
             Action::ToggleCommitCopySelection => self.toggle_commit_copy_selection(),
             Action::CopySelectedCommitHashes => self.copy_selected_commit_hashes(),
             Action::CopyCurrentCommitInfo => self.copy_current_commit_info(),
+            Action::CopyCurrentCommitMessage => self.copy_current_commit_message(),
             Action::QueueCherryPickSelectedCommit => self.queue_selected_commit(),
             Action::OpenCherryPickQueueDialog => self.open_cherry_pick_dialog(),
             Action::OpenResetDialog => self.open_reset_dialog(),
@@ -1267,7 +1319,7 @@ impl App {
             FocusPanel::CommitFileList | FocusPanel::FileList => {
                 self.state.selection.selected_file_index = Some(0);
                 if self.state.focus == FocusPanel::FileList {
-                    self.submit_selected_file_diff();
+                    self.submit_selected_file_diff(false);
                 }
             }
             FocusPanel::DiffView => self.state.selection.diff_scroll = 0,
@@ -1304,7 +1356,7 @@ impl App {
                     .as_ref()
                     .and_then(|detail| detail.files.len().checked_sub(1));
                 if self.state.focus == FocusPanel::FileList {
-                    self.submit_selected_file_diff();
+                    self.submit_selected_file_diff(false);
                 }
             }
             FocusPanel::DiffView => {
@@ -1868,7 +1920,7 @@ impl App {
         if self.state.screen == Screen::FileDiffDetail
             && self.state.selection.selected_file_index != before
         {
-            self.submit_selected_file_diff();
+            self.submit_selected_file_diff(false);
         }
     }
 
@@ -1930,6 +1982,27 @@ impl App {
         };
         self.state.pending_clipboard = Some(info);
         self.state.last_message = Some("Copied current commit info".into());
+    }
+
+    fn copy_current_commit_message(&mut self) {
+        if let Some(message) = self.state.selected_commit_message_for_copy() {
+            self.state.pending_clipboard = Some(message);
+            self.state.last_message = Some("Copied current commit message".into());
+            return;
+        }
+
+        let Some(repository_index) = self.state.branch_commits_repository_index else {
+            return;
+        };
+        let Some(commit) = self
+            .state
+            .selected_commit()
+            .map(|commit| commit.hash.clone())
+        else {
+            return;
+        };
+        self.submit_commit_message_for_copy(repository_index, commit);
+        self.state.last_message = Some("Loading full commit message…".into());
     }
 
     fn queue_selected_commit(&mut self) {

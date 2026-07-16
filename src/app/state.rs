@@ -214,10 +214,17 @@ pub enum PendingJobKind {
         repository_index: usize,
         commit: CommitHash,
     },
+    CommitMessage {
+        repository_index: usize,
+        commit: CommitHash,
+    },
     FileDiff {
         repository_index: usize,
         commit: CommitHash,
         path: GitPath,
+        /// True only for an explicit Enter/open action. Selection-driven
+        /// refreshes must not steal focus from the file list.
+        focus_diff: bool,
     },
     Reflog {
         repository_index: usize,
@@ -247,6 +254,9 @@ impl PendingJobKind {
                 repository_index, ..
             }
             | Self::CommitDetail {
+                repository_index, ..
+            }
+            | Self::CommitMessage {
                 repository_index, ..
             }
             | Self::FileDiff {
@@ -442,6 +452,7 @@ pub struct AppState {
     pub pending_jobs: HashMap<GitJobId, PendingJobKind>,
     pub latest_commits_job: Option<GitJobId>,
     pub latest_commit_detail_job: Option<GitJobId>,
+    pub latest_commit_message_job: Option<GitJobId>,
     pub latest_file_diff_job: Option<GitJobId>,
     pub latest_reflog_job: Option<GitJobId>,
     pub latest_changes_job: Option<GitJobId>,
@@ -502,6 +513,7 @@ impl AppState {
             pending_jobs: HashMap::new(),
             latest_commits_job: None,
             latest_commit_detail_job: None,
+            latest_commit_message_job: None,
             latest_file_diff_job: None,
             latest_reflog_job: None,
             latest_changes_job: None,
@@ -843,6 +855,17 @@ impl AppState {
         ))
     }
 
+    /// Returns the full message only when detail for the currently selected
+    /// commit is already available. The controller otherwise requests the
+    /// message from Git instead of silently degrading to the one-line subject.
+    pub fn selected_commit_message_for_copy(&self) -> Option<String> {
+        let commit = self.selected_commit()?;
+        self.current_commit_detail
+            .as_ref()
+            .filter(|detail| detail.commit.hash == commit.hash)
+            .map(|detail| detail.message.clone())
+    }
+
     pub fn ensure_valid_branch_selection(&mut self) {
         let length = self.visible_tree_nodes().len();
         ensure_index(&mut self.selection.selected_branch_index, length);
@@ -1151,5 +1174,20 @@ mod tests {
         assert!(info.contains("Author: Ada"));
         assert!(info.contains("Refs: HEAD -> main"));
         assert!(info.ends_with("first"));
+
+        assert_eq!(state.selected_commit_message_for_copy(), None);
+        state.current_commit_detail = Some(CommitDetail {
+            commit: state.branch_commits.items[0].clone(),
+            author_email: "ada@example.invalid".into(),
+            committer: "Ada".into(),
+            committer_email: "ada@example.invalid".into(),
+            committed_at: "2026-07-16".into(),
+            message: "first\n\nfull body".into(),
+            files: Vec::new(),
+        });
+        assert_eq!(
+            state.selected_commit_message_for_copy().as_deref(),
+            Some("first\n\nfull body")
+        );
     }
 }

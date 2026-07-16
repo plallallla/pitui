@@ -323,6 +323,9 @@ pub(crate) fn operation_log(request: &GitRequest) -> OperationLog {
         GitRequest::LoadCommitDetail { commit } => {
             ("load_commit_detail", format!("commit={}", commit.0))
         }
+        GitRequest::LoadCommitMessage { commit } => {
+            ("load_commit_message", format!("commit={}", commit.0))
+        }
         GitRequest::LoadFileDiff {
             commit,
             path,
@@ -415,6 +418,11 @@ fn response_log(response: &GitResponse, operation: &str) -> (&'static str, &'sta
                 detail.commit.hash.0,
                 detail.files.len()
             ),
+        ),
+        GitResponse::CommitMessageLoaded { commit, message } => (
+            "INFO",
+            "success",
+            format!("commit={} message_bytes={}", commit.0, message.len()),
         ),
         GitResponse::FileDiffLoaded(diff) => (
             "INFO",

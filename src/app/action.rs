@@ -45,6 +45,7 @@ pub enum Action {
     ToggleCommitCopySelection,
     CopySelectedCommitHashes,
     CopyCurrentCommitInfo,
+    CopyCurrentCommitMessage,
     QueueCherryPickSelectedCommit,
     OpenCherryPickQueueDialog,
     OpenResetDialog,

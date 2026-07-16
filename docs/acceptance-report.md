@@ -4,7 +4,7 @@
 
 ## 结论
 
-`docs/git-tui-design.md` 中 Milestone 1–5 及多仓库安全操作扩展已实现。Pitui 可同时打开多个 Git 仓库，以真正分层的仓库/分支树浏览 commit、独立 Changes 三级树、changed files、两种 file diff 和 reflog，并通过仓库隔离的确认流程执行 fetch、switch、cherry-pick、soft/mixed/hard reset 和 safe rebase。Changes 支持文件/分组多选、stage、unstage 和 commit；Commits 支持独立多选后复制完整 hashes 及复制当前 commit info。所有 Git worker job 另有持久化 JSONL 生命周期日志。
+`docs/git-tui-design.md` 中 Milestone 1–5 及多仓库安全操作扩展已实现。Pitui 可同时打开多个 Git 仓库，以真正分层的仓库/分支树浏览 commit、独立 Changes 三级树、changed files、两种 file diff 和 reflog，并通过仓库隔离的确认流程执行 fetch、switch、cherry-pick、soft/mixed/hard reset 和 safe rebase。Changes 支持文件/分组多选、stage、unstage 和 commit；Commits 支持独立多选后复制完整 hashes、commit info 或完整 message。File Diff 左侧切换文件会刷新右侧内容但不再抢走 focus。所有 Git worker job 另有持久化 JSONL 生命周期日志。
 
 ## 里程碑证据
 
@@ -13,13 +13,13 @@
 | M1 框架与状态栏 | `src/tui/mod.rs`、`src/tui/render.rs`、`src/app/state.rs` | TestBackend 渲染测试、非仓库错误测试、实际 PTY 启动/退出冒烟 |
 | M2 Branch / Commit | `src/git/runner.rs`、`src/git/parser.rs`、`src/app/controller.rs` | `loads_repository_branches_commits_details_and_diffs`、controller 主浏览三视图测试 |
 | M3 Commit Detail | commit metadata、name-status、numstat、patch hunk 解析和 changed-files renderer | root commit、rename、binary、hunk integration tests |
-| M4 File Diff | unified parser、side-by-side 对齐、文件切换、wrap、宽度降级 | side-by-side 单元/渲染测试、真实 file diff integration test、PTY 导航冒烟 |
+| M4 File Diff | unified parser、side-by-side 对齐、文件切换且异步响应保持 focus、wrap、宽度降级 | side-by-side 单元/渲染测试、真实双文件 focus integration test、PTY 导航冒烟 |
 | M5 可写操作 | switch/cherry-pick/reset request、确认状态机和错误弹窗 | 临时仓库写操作 integration test、typed confirmation/controller tests |
 | 多仓库树 | positional repository paths、`RepositoryState`、扁平可见树节点、active repository context | 双仓库加载/折叠/跨仓库 commit 导航 integration test |
 | 独立 Changes | 全局 `Ctrl+G`；Changes → Staged/Unstaged → File 三级树；进入/返回上下文；按 group 隔离 patch | 真实临时仓库 `MM` 双分组、三类 diff、全局返回上下文 integration test；state/renderer tests |
 | Diff 组件复用 | commit 与 Changes 都使用 `FileDiff`、`render_diff_panel`、unified/side-by-side、wrap 与滚动 | Changes staged 渲染测试、既有宽屏 side-by-side 测试、真实 patch integration test |
 | Changes 写操作 | file/group/root checkbox 多选；tree/diff focus 均可 stage/unstage；commit message validation | 正常/unborn 仓库 stage→unstage→commit 语义测试、controller 多选端到端测试、input/renderer tests |
-| Commit 复制 | Space 独立多选；hash/info 格式化；OSC 52 terminal clipboard | selection/state、base64、controller clipboard payload tests |
+| Commit 复制 | Space 独立多选；hash/info/full-message；缺少 detail 时 clipboard-only 后台加载；OSC 52 | selection/input/base64 tests；多行 message 与 screen/focus 保持 integration test |
 | 树层级 / Unborn | `├─/└─` child connector；status 补全尚不存在 ref 的当前分支 | 空仓库 main 两行树 integration/unit/renderer tests |
 | Fetch / Reflog | job 级 cwd 路由、仓库节点 fetch/reflog、Reflog screen | 本地 bare remote fetch、reflog parser/renderer/真实仓库 integration tests |
 | Reset 安全分级 | soft/mixed/hard mode chooser；hard warning + hash 两阶段确认 | 三种真实 reset 语义、reflog target reset、hard controller end-to-end tests |
@@ -54,7 +54,7 @@ cargo test --doc
 
 ```text
 unit tests:        37 passed
-integration tests: 24 passed
+integration tests: 25 passed
 doc tests:          0 failed
 ```
 
@@ -64,6 +64,7 @@ doc tests:          0 failed
 - 普通、unborn 和 detached HEAD 仓库；
 - branch、commit、root commit、rename、binary file；
 - commit detail、numstat、hunk 和 file diff；
+- File Diff 左侧上下切换双文件时响应刷新右侧但 focus 持续保持 FileList；
 - 异步 controller 主浏览三视图状态转移；
 - 快速切换分支时的 stale response 丢弃；
 - 非 Git 目录错误显示与关闭；
@@ -72,7 +73,7 @@ doc tests:          0 failed
 - 选中仓库通过本地 bare remote 执行 fetch 并刷新 remote tracking branch；
 - staged、unstaged、untracked 文件发现、Changes 三级树、`MM` 跨组双节点和按边界加载 diff，以及空仓库 `main` 子节点补全；
 - Changes file/group 多选、tree/diff focus 下 stage/unstage、正常与 unborn repository 安全 unstage、commit message validation 和真实 commit；
-- 从 file diff 全局进入 Changes 后恢复原 screen/focus；commit 多选 hashes 与当前 commit info clipboard payload；
+- 从 file diff 全局进入 Changes 后恢复原 screen/focus；commit 多选 hashes、当前 commit info 与完整多行 message clipboard payload；
 - reflog 加载、渲染、返回时 stale response 丢弃及以 reflog entry 为 reset target；
 - soft/mixed/hard reset 语义和 hard 双阶段确认；
 - safe rebase 成功、worker 执行时脏工作区拒绝、真实冲突提示与自动 `git rebase --abort` 恢复；既存 rebase 会被拒绝且保持不变。

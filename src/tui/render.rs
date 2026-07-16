@@ -1151,6 +1151,7 @@ fn render_hotkeys(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                         "Space select",
                         "c copy hashes",
                         "i copy info",
+                        "m copy message",
                         "y queue",
                         "R reset",
                     ]);
@@ -1169,6 +1170,7 @@ fn render_hotkeys(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                         "Space select",
                         "c copy hashes",
                         "i copy info",
+                        "m copy message",
                         "y queue",
                         "R reset",
                     ]);
@@ -1185,13 +1187,18 @@ fn render_hotkeys(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                     keys.extend(["Space expand", "Enter file diff"]);
                 }
                 if app.selected_commit().is_some() {
-                    keys.extend(["i copy commit info", "y queue"]);
+                    keys.extend(["i copy commit info", "m copy message", "y queue"]);
                 }
                 keys.extend(["Tab focus", "Esc back", "q quit"]);
                 format!(" {} ", keys.join(" | "))
             }
             (Screen::FileDiffDetail, _) => {
-                let mut keys = vec!["v mode", "Ctrl+C hash", "Ctrl+Shift+C info"];
+                let mut keys = vec![
+                    "v mode",
+                    "Ctrl+C hash",
+                    "Ctrl+Shift+C info",
+                    "m/Ctrl+Alt+C message",
+                ];
                 if app.selected_file().is_some() {
                     keys.extend(["n next", "p prev"]);
                 }

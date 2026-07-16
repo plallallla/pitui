@@ -203,6 +203,7 @@ pub struct AppState {
     pub pending_jobs: HashMap<GitJobId, PendingJobKind>,
     pub latest_commits_job: Option<GitJobId>,
     pub latest_commit_detail_job: Option<GitJobId>,
+    pub latest_commit_message_job: Option<GitJobId>,
     pub latest_file_diff_job: Option<GitJobId>,
     pub last_error: Option<AppError>,
 }
@@ -322,6 +323,7 @@ pub enum Action {
     ToggleCommitCopySelection,
     CopySelectedCommitHashes,
     CopyCurrentCommitInfo,
+    CopyCurrentCommitMessage,
 
     QueueCherryPickSelectedCommit,
     OpenCherryPickQueueDialog,
@@ -502,6 +504,7 @@ focus = BranchList
 | Space | ToggleCommitCopySelection | 已选择 commit | 加入/移出独立的复制多选集合 |
 | c / Ctrl+C | CopySelectedCommitHashes | commits 非空 | 按列表顺序复制多选完整 hashes；集合为空则复制当前 hash |
 | i / Ctrl+Shift+C | CopyCurrentCommitInfo | 已选择 commit | 复制 hash、author、date、refs 与 message |
+| m / Ctrl+Alt+C | CopyCurrentCommitMessage | 已选择 commit | 复制完整 message；缺少 detail 时后台加载，不切换 screen/focus |
 | y | QueueCherryPickSelectedCommit | 已选择 commit | 加入 cherry-pick queue |
 | Y | OpenCherryPickQueueDialog | queue 非空 | 打开 cherry-pick queue 确认弹窗 |
 | R | OpenResetDialog | 已选择 commit | 打开 reset typed confirmation 弹窗 |
@@ -511,7 +514,7 @@ focus = BranchList
 | Esc | Back | 总是 | 若无上层视图，则保持当前视图 |
 | q | Quit | 总是 | 退出应用 |
 
-`commit_copy_selection` 与 cherry-pick queue 完全独立；切换仓库或 viewing branch 时清空，过滤列表不会改变集合。剪贴板由 TUI 层通过 OSC 52 写入，不引入平台特定 clipboard 命令。
+`commit_copy_selection` 与 cherry-pick queue 完全独立；切换仓库或 viewing branch 时清空，过滤列表不会改变集合。剪贴板由 TUI 层通过 OSC 52 写入，不引入平台特定 clipboard 命令。message copy 必须返回完整 subject/body；若 `CommitDetail` 尚未缓存，则发送独立 `LoadCommitMessage`，响应只写 clipboard，不得导航到 Commit Detail 或改变当前 focus。
 
 ### 6.6 View 1 状态转移
 
@@ -767,8 +770,8 @@ focus = DiffView
 
 | Key | Action | 前置条件 | 结果 |
 |---|---|---|---|
-| ↑ / k | MoveUp | files 非空 | 选择上一个文件，并加载该文件 diff |
-| ↓ / j | MoveDown | files 非空 | 选择下一个文件，并加载该文件 diff |
+| ↑ / k | MoveUp | files 非空 | 选择上一个文件并加载 diff，focus 保持 FileList |
+| ↓ / j | MoveDown | files 非空 | 选择下一个文件并加载 diff，focus 保持 FileList |
 | n | NextFile | files 非空 | 选择下一个文件，并加载该文件 diff |
 | p | PrevFile | files 非空 | 选择上一个文件，并加载该文件 diff |
 | Enter | OpenSelectedFileDiff | 已选择文件 | 加载该文件 diff |
@@ -823,7 +826,10 @@ FileDiffDetail + n / p / MoveUp / MoveDown in FileList
 
 GitResponse::FileDiffLoaded(diff)
   -> current_file_diff = Some(diff)
+  -> focus unchanged
 ```
+
+`PendingJobKind::FileDiff` 携带 `focus_diff` intent：只有显式 `Enter/OpenSelectedFileDiff` 的响应可以把 focus 设为 `DiffView`；由 `↑/↓/Home/End/n/p` 触发的 diff refresh 必须保留响应到达时的 focus，异步 response 不得抢走左侧文件列表焦点。
 
 #### 8.6.3 滚动 diff
 
@@ -1110,6 +1116,9 @@ pub enum GitRequest {
     LoadCommitDetail {
         commit: CommitHash,
     },
+    LoadCommitMessage {
+        commit: CommitHash,
+    },
     LoadFileDiff {
         commit: CommitHash,
         path: GitPath,
@@ -1165,6 +1174,10 @@ pub enum GitResponse {
         commits: Vec<Commit>,
     },
     CommitDetailLoaded(CommitDetail),
+    CommitMessageLoaded {
+        commit: CommitHash,
+        message: String,
+    },
     FileDiffLoaded(FileDiff),
     ReflogLoaded(Vec<ReflogEntry>),
     WorkingTreeLoaded(Vec<WorkingTreeChange>),
@@ -1224,6 +1237,7 @@ git log <branch> \
 
 ```bash
 git show --no-patch --date=iso-strict --format=<record-separated-metadata> <commit>
+git show --no-patch --format=%B <commit>  # clipboard-only full message request
 git diff-tree --root -m --first-parent --no-commit-id --name-status -r -M -z <commit>
 git show --first-parent --numstat -z --format= --find-renames <commit>
 git show --first-parent --format= --patch --find-renames --no-ext-diff --no-color <commit>
@@ -1354,13 +1368,13 @@ repo: Enter expand/collapse | f fetch | g reflog
 branch: Enter view commits | s switch | b rebase
 
 BranchOverview + CommitList:
-Space select | c copy hashes | i copy info | Enter detail | y queue | Y cherry-pick | R reset
+Space select | c copy hashes | i copy info | m copy message | Enter detail | y queue | Y cherry-pick | R reset
 
 CommitDetail + CommitFileList:
 Space expand | Enter file diff | y queue | Esc back | q quit
 
 FileDiffDetail + DiffView:
-v mode | n next file | p prev file | w wrap | Tab focus | Esc back
+v mode | n next file | p prev file | m/Ctrl+Alt+C message | w wrap | Tab focus | Esc back
 
 Reflog + ReflogList:
 R reset | Esc back | q quit
@@ -1653,7 +1667,8 @@ Error + Enter/Esc
 - global Changes screen + three-level staged/unstaged/file tree
 - shared unified/side-by-side diff component for commit and Changes patches
 - file/group multi-select + file-level stage/unstage + commit message dialog
-- multi-select commit hash copy + current commit-info copy through OSC 52
+- multi-select commit hash + current info/full-message copy through OSC 52
+- File Diff file selection refresh without asynchronous focus stealing
 - soft/mixed reset + two-stage hard reset
 - safe rebase + conflict auto-abort
 - persistent rotated JSONL lifecycle log for every Git worker job

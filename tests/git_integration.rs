@@ -967,6 +967,75 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
 }
 
 #[test]
+fn file_diff_navigation_keeps_file_list_focus_and_copies_full_commit_message() {
+    let repo = repository();
+    fs::write(repo.path().join("alpha.txt"), "alpha\n").unwrap();
+    fs::write(repo.path().join("beta.txt"), "beta\n").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(
+        repo.path(),
+        &[
+            "commit",
+            "-m",
+            "multi-file subject",
+            "-m",
+            "body line one\nbody line two",
+        ],
+    );
+    let expected_message = "multi-file subject\n\nbody line one\nbody line two";
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    app.dispatch(Action::FocusNext);
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+
+    // Overview only has the subject, so message copying loads the full body
+    // without navigating away from the current screen or focus.
+    app.dispatch(Action::CopyCurrentCommitMessage);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.screen, Screen::BranchOverview);
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(
+        app.take_clipboard_request().as_deref(),
+        Some(expected_message)
+    );
+
+    app.dispatch(Action::OpenCommitDetail);
+    wait_until_idle(&mut app);
+    assert_eq!(
+        app.state
+            .current_commit_detail
+            .as_ref()
+            .unwrap()
+            .files
+            .len(),
+        2
+    );
+    app.dispatch(Action::OpenSelectedFileDiff);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.focus, FocusPanel::DiffView);
+
+    app.dispatch(Action::FocusNext);
+    assert_eq!(app.state.focus, FocusPanel::FileList);
+    app.dispatch(Action::MoveDown);
+    assert_eq!(app.state.focus, FocusPanel::FileList);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.focus, FocusPanel::FileList);
+    assert_eq!(
+        app.state.current_file_diff.as_ref().unwrap().path,
+        app.state.selected_file().unwrap().path
+    );
+
+    app.dispatch(Action::MoveUp);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.focus, FocusPanel::FileList);
+    assert_eq!(
+        app.state.current_file_diff.as_ref().unwrap().path,
+        app.state.selected_file().unwrap().path
+    );
+}
+
+#[test]
 fn application_surfaces_and_dismisses_non_repository_errors() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = app_for(&[directory.path()]);
