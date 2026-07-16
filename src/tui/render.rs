@@ -809,7 +809,11 @@ fn commit_items(app: &AppState) -> (Vec<ListItem<'static>>, bool) {
     if commits.is_empty() {
         return (
             vec![ListItem::new(Line::styled(
-                "No commits",
+                if app.latest_commits_job.is_some() {
+                    "Loading selected branch commits…"
+                } else {
+                    "No commits"
+                },
                 Style::default().fg(Color::DarkGray),
             ))],
             true,
@@ -890,7 +894,11 @@ fn render_commit_metadata(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let lines = app.current_commit_detail.as_ref().map_or_else(
         || {
             vec![Line::styled(
-                "No commit selected",
+                if app.latest_commit_detail_job.is_some() {
+                    "Loading selected commit…"
+                } else {
+                    "No commit selected"
+                },
                 Style::default().fg(Color::DarkGray),
             )]
         },
@@ -938,7 +946,11 @@ fn render_changed_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         .unwrap_or_default();
     let items = if files.is_empty() {
         vec![ListItem::new(Line::styled(
-            "No changed files",
+            if app.latest_commit_detail_job.is_some() {
+                "Loading changed files…"
+            } else {
+                "No changed files"
+            },
             Style::default().fg(Color::DarkGray),
         ))]
     } else {

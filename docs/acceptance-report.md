@@ -4,14 +4,14 @@
 
 ## 结论
 
-`docs/git-tui-design.md` 中 Milestone 1–5 及多仓库安全操作扩展已实现。Pitui 可同时打开多个 Git 仓库，以真正分层的仓库/分支树浏览 commit、独立 Changes 三级树、changed files、两种 file diff、reflog 和 Remote Management，并通过仓库隔离的确认流程执行 fetch、pull --rebase、push、switch、cherry-pick、soft/mixed/hard reset 和 safe rebase。Remote Management 可新增 remote、归一 fetch/push URL 并为当前分支设置双向 upstream；worker 在联系网络前强制校验 URL 和分支路由一致。Changes 支持文件/分组多选、stage、unstage 和 commit；Commits 使用 `Ctrl+C` 二级快捷键复制完整 hashes、commit info 或完整 message。定时 Git 状态轮询已移除，任意主界面通过 `Ctrl+R` 手动刷新；Commit Files、File Diff 和 Changes Diff 统一支持 Home/End/PageUp/PageDown。File Diff 左侧切换文件会刷新右侧内容但不再抢走 focus。版本化全局 TOML 配置已接管 command bindings、逐级 chord、action-only footer、共享 diff 默认模式和后台日志策略，并在进入 terminal 前严格校验。所有 Git worker job 另有可配置的持久化 JSONL 生命周期日志。
+`docs/git-tui-design.md` 中 Milestone 1–5 及多仓库安全操作扩展已实现。Pitui 可同时打开多个 Git 仓库，以真正分层的仓库/分支树浏览 commit、独立 Changes 三级树、changed files、两种 file diff、reflog 和 Remote Management，并通过仓库隔离的确认流程执行 fetch、pull --rebase、push、switch、cherry-pick、soft/mixed/hard reset 和 safe rebase。Remote Management 可新增 remote、归一 fetch/push URL 并为当前分支设置双向 upstream；worker 在联系网络前强制校验 URL 和分支路由一致。Changes 支持文件/分组多选、stage、unstage 和 commit；Commits 使用 `Ctrl+C` 二级快捷键复制完整 hashes、commit info 或完整 message。定时 Git 状态轮询已移除，任意主界面通过 `Ctrl+R` 手动刷新；Commit Files、File Diff 和 Changes Diff 统一支持 Home/End/PageUp/PageDown。Branch 列切换分支会自动刷新右侧 commits；Commit Detail 左侧切换 commit 会自动刷新右侧 metadata/files；两者都保持左侧 focus，快速连续移动只接受最新响应。File Diff 左侧切换文件同样刷新右侧内容但不抢走 focus。版本化全局 TOML 配置已接管 command bindings、逐级 chord、action-only footer、共享 diff 默认模式和后台日志策略，并在进入 terminal 前严格校验。所有 Git worker job 另有可配置的持久化 JSONL 生命周期日志。
 
 ## 里程碑证据
 
 | 里程碑 | 实现证据 | 验证证据 |
 |---|---|---|
 | M1 框架与状态栏 | `src/tui/mod.rs`、`src/tui/render.rs`、`src/app/state.rs` | TestBackend 渲染测试、非仓库错误测试、实际 PTY 启动/退出冒烟 |
-| M2 Branch / Commit | `src/git/runner.rs`、`src/git/parser.rs`、`src/app/controller.rs` | `loads_repository_branches_commits_details_and_diffs`、controller 主浏览三视图测试 |
+| M2 Branch / Commit | `src/git/runner.rs`、`src/git/parser.rs`、`src/app/controller.rs` | 主浏览三视图、Branch 选择自动刷新 Commits、Commit 选择自动刷新 Detail 及 stale-response 测试 |
 | M3 Commit Detail | commit metadata、name-status、numstat、patch hunk 解析和 changed-files renderer | root commit、rename、binary、hunk integration tests |
 | M4 File Diff | unified parser、side-by-side 对齐、文件切换且异步响应保持 focus、wrap、宽度降级 | side-by-side 单元/渲染测试、真实双文件 focus integration test、PTY 导航冒烟 |
 | M5 可写操作 | switch/cherry-pick/reset request、确认状态机和错误弹窗 | 临时仓库写操作 integration test、typed confirmation/controller tests |
@@ -60,7 +60,7 @@ cargo test --doc
 ```text
 unit tests:             63 passed
 config CLI tests:        3 passed
-Git integration tests:  32 passed
+Git integration tests:  34 passed
 doc tests:               0 failed
 ```
 
@@ -75,6 +75,7 @@ doc tests:               0 failed
 - 超过原 2 秒轮询间隔后 Tick 仍不提交 Git 请求，只有 `Ctrl+R`/`RefreshRepository` 才读取外部工作区变化；
 - 异步 controller 主浏览三视图状态转移；
 - 快速切换分支时的 stale response 丢弃；
+- Branch 列用上下键选择分支时自动刷新右侧 commits 且保持 BranchList focus；Commit Detail 左侧 Commits 上下切换时自动刷新右侧详情且保持 CommitList focus；
 - 非 Git 目录错误显示与关闭；
 - switch、cherry-pick、reset 写操作；
 - 多仓库树加载、折叠、切换及所有请求的仓库隔离；

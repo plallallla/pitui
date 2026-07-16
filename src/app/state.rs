@@ -273,6 +273,9 @@ pub enum PendingJobKind {
     CommitDetail {
         repository_index: usize,
         commit: CommitHash,
+        /// True only for an explicit Enter/open action. Selection-driven
+        /// previews update the right pane without stealing focus from Commits.
+        focus_files: bool,
     },
     CommitMessage {
         repository_index: usize,

@@ -518,12 +518,12 @@ focus = BranchList
 
 | Key | Action | 前置条件 | 结果 |
 |---|---|---|---|
-| ↑ / k | MoveUp | tree 非空 | 扁平化 tree selection 上移；跨仓库时更新 active repository |
-| ↓ / j | MoveDown | tree 非空 | 扁平化 tree selection 下移；跨仓库时更新 active repository |
-| PageUp | PageUp | tree 非空 | 树向上翻页 |
-| PageDown | PageDown | tree 非空 | 树向下翻页 |
-| Home | Home | tree 非空 | 选择第一行 |
-| End | End | tree 非空 | 选择最后一行 |
+| ↑ / k | MoveUp | tree 非空 | 扁平化 tree selection 上移；选中分支时自动加载右侧 commits，焦点保持在 BranchList；跨仓库时更新 active repository |
+| ↓ / j | MoveDown | tree 非空 | 扁平化 tree selection 下移；选中分支时自动加载右侧 commits，焦点保持在 BranchList；跨仓库时更新 active repository |
+| PageUp | PageUp | tree 非空 | 树向上翻页，只为最终选中的分支加载右侧 commits |
+| PageDown | PageDown | tree 非空 | 树向下翻页，只为最终选中的分支加载右侧 commits |
+| Home | Home | tree 非空 | 选择第一行；若为分支则同步右侧 commits |
+| End | End | tree 非空 | 选择最后一行；若为分支则同步右侧 commits |
 | Enter | LoadCommitsForSelectedBranch | 已选择仓库 | 展开/折叠仓库节点 |
 | Enter | LoadCommitsForSelectedBranch | 已选择分支 | 加载该分支 commits，不切换真实分支 |
 | f | OpenFetchRepositoryDialog | 已选择仓库 | 确认执行 `git fetch --all --prune` |
@@ -578,7 +578,11 @@ focus = BranchList
 BranchOverview + BranchList + MoveUp/MoveDown
   -> selected_branch_index changed
   -> active_repository_index = selected node repository
-  -> 跨仓库时清空旧 detail/diff 并加载新仓库 viewing/current branch
+  -> 选中 branch node 时立即清空不匹配的旧 commits/detail/diff
+  -> GitRequest::LoadCommits { selected branch, limit: 300 }
+  -> response 更新右侧 Commits，focus 保持 BranchList
+  -> 快速连续移动时只接受最新选择对应的 job response
+  -> 跨仓库时加载新仓库上下文
 ```
 
 #### 6.6.2 加载分支 commits
@@ -687,10 +691,10 @@ focus = CommitFileList
 
 | Key | Action | 前置条件 | 结果 |
 |---|---|---|---|
-| ↑ / k | MoveUp | commits 非空 | 选择上一个 commit |
-| ↓ / j | MoveDown | commits 非空 | 选择下一个 commit |
-| PageUp | PageUp | commits 非空 | commit 列表向上翻页 |
-| PageDown | PageDown | commits 非空 | commit 列表向下翻页 |
+| ↑ / k | MoveUp | commits 非空 | 选择上一个 commit，自动刷新右侧 detail，focus 保持 CommitList |
+| ↓ / j | MoveDown | commits 非空 | 选择下一个 commit，自动刷新右侧 detail，focus 保持 CommitList |
+| PageUp | PageUp | commits 非空 | commit 列表向上翻页，只加载最终选中 commit detail |
+| PageDown | PageDown | commits 非空 | commit 列表向下翻页，只加载最终选中 commit detail |
 | Enter | OpenCommitDetail | 已选择 commit | 重新加载所选 commit detail |
 | y | QueueCherryPickSelectedCommit | 已选择 commit | 加入 cherry-pick queue |
 | Y | OpenCherryPickQueueDialog | queue 非空 | 打开 cherry-pick queue 确认弹窗 |
@@ -724,7 +728,15 @@ focus = CommitFileList
 ```text
 CommitDetail + CommitList + MoveUp/MoveDown
   -> selected_commit_index changed
-  -> current_commit_detail remains old until Enter
+  -> 清空不匹配的旧 current_commit_detail/current_file_diff
+  -> GitRequest::LoadCommitDetail { selected commit }
+  -> pending_jobs += job_id
+
+GitResponse::CommitDetailLoaded(detail)
+  -> 仅当 job 仍对应最新选择时更新 current_commit_detail
+  -> selected_file_index = first file if exists
+  -> expansion.expanded_files.clear()
+  -> focus 保持 CommitList
 ```
 
 ```text

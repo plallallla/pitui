@@ -184,10 +184,16 @@ impl App {
         }
     }
 
-    fn submit_commit_detail(&mut self, repository_index: usize, commit: CommitHash) {
+    fn submit_commit_detail(
+        &mut self,
+        repository_index: usize,
+        commit: CommitHash,
+        focus_files: bool,
+    ) {
         let kind = PendingJobKind::CommitDetail {
             repository_index,
             commit: commit.clone(),
+            focus_files,
         };
         if let Some(id) = self.submit(
             repository_index,
@@ -327,9 +333,18 @@ impl App {
                 self.state.latest_commits_job != Some(id)
                     || self.state.active_repository_index != Some(repository_index)
             }
-            PendingJobKind::CommitDetail { .. } => {
+            PendingJobKind::CommitDetail {
+                commit,
+                focus_files,
+                ..
+            } => {
                 self.state.latest_commit_detail_job != Some(id)
                     || self.state.branch_commits_repository_index != Some(repository_index)
+                    || self
+                        .state
+                        .selected_commit()
+                        .is_none_or(|selected| &selected.hash != commit)
+                    || (!focus_files && self.state.screen != Screen::CommitDetail)
             }
             PendingJobKind::CommitMessage { commit, .. } => {
                 self.state.latest_commit_message_job != Some(id)
@@ -608,13 +623,19 @@ impl App {
                 self.state.ensure_valid_commit_selection();
             }
             GitResponse::CommitDetailLoaded(detail) => {
+                let focus_files = match &kind {
+                    PendingJobKind::CommitDetail { focus_files, .. } => *focus_files,
+                    _ => return,
+                };
                 self.state.current_commit_detail = Some(detail);
                 self.state.current_file_diff = None;
                 self.state.selection.selected_file_index = None;
                 self.state.ensure_valid_file_selection();
                 self.state.expansion.expanded_files.clear();
                 self.state.screen = Screen::CommitDetail;
-                self.state.focus = FocusPanel::CommitFileList;
+                if focus_files {
+                    self.state.focus = FocusPanel::CommitFileList;
+                }
             }
             GitResponse::CommitMessageLoaded { commit, message } => {
                 let requested_commit = match &kind {
@@ -891,12 +912,21 @@ impl App {
                 self.state.mode = GlobalMode::Normal;
                 self.state.ensure_valid_branch_selection();
                 self.state.ensure_valid_commit_selection();
-                self.activate_selected_tree_repository();
+                match self.state.focus {
+                    FocusPanel::BranchList => self.preview_selected_branch_commits(),
+                    FocusPanel::CommitList => self.preview_selected_commit_detail(),
+                    _ => {}
+                }
             }
             Action::CancelFilter | Action::Cancel | Action::Back => {
                 self.state.mode = GlobalMode::Normal;
                 self.state.ensure_valid_branch_selection();
                 self.state.ensure_valid_commit_selection();
+                match self.state.focus {
+                    FocusPanel::BranchList => self.preview_selected_branch_commits(),
+                    FocusPanel::CommitList => self.preview_selected_commit_detail(),
+                    _ => {}
+                }
             }
             _ => {}
         }
@@ -1385,7 +1415,7 @@ impl App {
             Action::SelectBranch(index) => {
                 self.state.selection.selected_branch_index = Some(index);
                 self.state.ensure_valid_branch_selection();
-                self.activate_selected_tree_repository();
+                self.preview_selected_branch_commits();
             }
             Action::LoadCommitsForSelectedBranch => self.activate_selected_tree_node(),
             Action::OpenFetchRepositoryDialog => self.open_fetch_dialog(),
@@ -1407,6 +1437,7 @@ impl App {
             Action::SelectCommit(index) => {
                 self.state.selection.selected_commit_index = Some(index);
                 self.state.ensure_valid_commit_selection();
+                self.preview_selected_commit_detail();
             }
             Action::OpenCommitDetail => self.open_commit_detail(),
             Action::ToggleFileExpanded => self.toggle_file_expanded(),
@@ -1469,17 +1500,36 @@ impl App {
         *index = Some(current.saturating_add_signed(delta).min(length - 1));
     }
 
+    fn move_branch_selection(&mut self, delta: isize) {
+        let before = self.state.selection.selected_branch_index;
+        let length = self.state.visible_tree_nodes().len();
+        Self::move_selection(
+            &mut self.state.selection.selected_branch_index,
+            length,
+            delta,
+        );
+        if self.state.selection.selected_branch_index != before {
+            self.preview_selected_branch_commits();
+        }
+    }
+
+    fn move_commit_selection(&mut self, delta: isize) {
+        let before = self.state.selection.selected_commit_index;
+        let length = self.state.visible_commit_indices().len();
+        Self::move_selection(
+            &mut self.state.selection.selected_commit_index,
+            length,
+            delta,
+        );
+        if self.state.selection.selected_commit_index != before {
+            self.preview_selected_commit_detail();
+        }
+    }
+
     fn move_up(&mut self) {
         match self.state.focus {
-            FocusPanel::BranchList => {
-                let length = self.state.visible_tree_nodes().len();
-                Self::move_selection(&mut self.state.selection.selected_branch_index, length, -1);
-                self.activate_selected_tree_repository();
-            }
-            FocusPanel::CommitList => {
-                let length = self.state.visible_commit_indices().len();
-                Self::move_selection(&mut self.state.selection.selected_commit_index, length, -1);
-            }
+            FocusPanel::BranchList => self.move_branch_selection(-1),
+            FocusPanel::CommitList => self.move_commit_selection(-1),
             FocusPanel::CommitFileList => Self::move_selection(
                 &mut self.state.selection.selected_file_index,
                 self.state
@@ -1514,15 +1564,8 @@ impl App {
 
     fn move_down(&mut self) {
         match self.state.focus {
-            FocusPanel::BranchList => {
-                let length = self.state.visible_tree_nodes().len();
-                Self::move_selection(&mut self.state.selection.selected_branch_index, length, 1);
-                self.activate_selected_tree_repository();
-            }
-            FocusPanel::CommitList => {
-                let length = self.state.visible_commit_indices().len();
-                Self::move_selection(&mut self.state.selection.selected_commit_index, length, 1);
-            }
+            FocusPanel::BranchList => self.move_branch_selection(1),
+            FocusPanel::CommitList => self.move_commit_selection(1),
             FocusPanel::CommitFileList => Self::move_selection(
                 &mut self.state.selection.selected_file_index,
                 self.state
@@ -1567,6 +1610,8 @@ impl App {
 
     fn page_up(&mut self) {
         match self.state.focus {
+            FocusPanel::BranchList => self.move_branch_selection(-(PAGE_SIZE as isize)),
+            FocusPanel::CommitList => self.move_commit_selection(-(PAGE_SIZE as isize)),
             FocusPanel::CommitFileList => Self::move_selection(
                 &mut self.state.selection.selected_file_index,
                 self.state
@@ -1601,6 +1646,8 @@ impl App {
 
     fn page_down(&mut self) {
         match self.state.focus {
+            FocusPanel::BranchList => self.move_branch_selection(PAGE_SIZE as isize),
+            FocusPanel::CommitList => self.move_commit_selection(PAGE_SIZE as isize),
             FocusPanel::CommitFileList => Self::move_selection(
                 &mut self.state.selection.selected_file_index,
                 self.state
@@ -1640,11 +1687,21 @@ impl App {
     fn move_home(&mut self) {
         match self.state.focus {
             FocusPanel::BranchList => {
+                let before = self.state.selection.selected_branch_index;
                 self.state.selection.selected_branch_index = Some(0);
                 self.state.ensure_valid_branch_selection();
-                self.activate_selected_tree_repository();
+                if self.state.selection.selected_branch_index != before {
+                    self.preview_selected_branch_commits();
+                }
             }
-            FocusPanel::CommitList => self.state.selection.selected_commit_index = Some(0),
+            FocusPanel::CommitList => {
+                let before = self.state.selection.selected_commit_index;
+                self.state.selection.selected_commit_index = Some(0);
+                self.state.ensure_valid_commit_selection();
+                if self.state.selection.selected_commit_index != before {
+                    self.preview_selected_commit_detail();
+                }
+            }
             FocusPanel::CommitFileList | FocusPanel::FileList => {
                 self.state.selection.selected_file_index = Some(0);
                 if self.state.focus == FocusPanel::FileList {
@@ -1672,13 +1729,20 @@ impl App {
     fn move_end(&mut self) {
         match self.state.focus {
             FocusPanel::BranchList => {
+                let before = self.state.selection.selected_branch_index;
                 self.state.selection.selected_branch_index =
                     self.state.visible_tree_nodes().len().checked_sub(1);
-                self.activate_selected_tree_repository();
+                if self.state.selection.selected_branch_index != before {
+                    self.preview_selected_branch_commits();
+                }
             }
             FocusPanel::CommitList => {
+                let before = self.state.selection.selected_commit_index;
                 self.state.selection.selected_commit_index =
                     self.state.visible_commit_indices().len().checked_sub(1);
+                if self.state.selection.selected_commit_index != before {
+                    self.preview_selected_commit_detail();
+                }
             }
             FocusPanel::CommitFileList | FocusPanel::FileList => {
                 self.state.selection.selected_file_index = self
@@ -1828,10 +1892,94 @@ impl App {
         self.load_active_repository_commits(repository_index);
     }
 
-    fn activate_selected_tree_repository(&mut self) {
-        if let Some(repository_index) = self.state.selected_tree_repository_index() {
-            self.activate_repository(repository_index);
+    fn latest_commits_request_matches(&self, repository_index: usize, branch: &BranchName) -> bool {
+        self.state
+            .latest_commits_job
+            .and_then(|id| self.state.pending_jobs.get(&id))
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    PendingJobKind::Commits {
+                        repository_index: pending_repository,
+                        branch: pending_branch,
+                    } if *pending_repository == repository_index && pending_branch == branch
+                )
+            })
+    }
+
+    /// Selection-driven branch preview. Unlike Enter, this never moves focus
+    /// into the commit list; it only makes the right pane follow the selected
+    /// branch and relies on latest-job-wins for rapid navigation.
+    fn preview_selected_branch_commits(&mut self) {
+        let selected = match self.state.selected_tree_node() {
+            Some(BranchTreeNode::Repository { repository_index }) => {
+                self.activate_repository(repository_index);
+                return;
+            }
+            Some(BranchTreeNode::Branch {
+                repository_index,
+                branch_index,
+            }) => self
+                .state
+                .repositories
+                .get(repository_index)
+                .and_then(|repository| repository.branches.get(branch_index))
+                .map(|branch| {
+                    (
+                        repository_index,
+                        branch.name.clone(),
+                        !branch.head.0.is_empty(),
+                    )
+                }),
+            None => None,
+        };
+        let Some((repository_index, branch, has_commit)) = selected else {
+            return;
+        };
+
+        self.activate_repository(repository_index);
+        if !has_commit {
+            // Invalidate any older in-flight commit-list response before
+            // showing an unborn branch as an empty list.
+            self.state.latest_commits_job = None;
+            if let Some(repository) = self.state.repositories.get_mut(repository_index) {
+                repository.viewing_branch = Some(branch.clone());
+            }
+            self.state.branch_commits_repository_index = Some(repository_index);
+            self.state.branch_commits.viewing_branch = Some(branch);
+            self.state.branch_commits.items.clear();
+            self.state.commit_filter.clear();
+            self.state.selection.selected_commit_index = None;
+            self.state.current_commit_detail = None;
+            self.state.current_file_diff = None;
+            self.state.commit_copy_selection.clear();
+            self.state.commit_copy_selection_repository_index = Some(repository_index);
+            self.state.ensure_valid_commit_selection();
+            return;
         }
+
+        let already_loaded = self.state.branch_commits_repository_index == Some(repository_index)
+            && self.state.branch_commits.viewing_branch.as_ref() == Some(&branch)
+            && self.state.latest_commits_job.is_none();
+        if already_loaded || self.latest_commits_request_matches(repository_index, &branch) {
+            return;
+        }
+
+        // Remove stale right-pane content immediately so the highlighted
+        // branch and the displayed commits can never disagree while loading.
+        if let Some(repository) = self.state.repositories.get_mut(repository_index) {
+            repository.viewing_branch = Some(branch.clone());
+        }
+        self.state.branch_commits_repository_index = Some(repository_index);
+        self.state.branch_commits.viewing_branch = Some(branch.clone());
+        self.state.branch_commits.items.clear();
+        self.state.commit_filter.clear();
+        self.state.selection.selected_commit_index = None;
+        self.state.current_commit_detail = None;
+        self.state.current_file_diff = None;
+        self.state.commit_copy_selection.clear();
+        self.state.commit_copy_selection_repository_index = Some(repository_index);
+        self.submit_commits(repository_index, branch);
     }
 
     fn activate_selected_tree_node(&mut self) {
@@ -1843,33 +1991,9 @@ impl App {
                 }
                 self.state.ensure_valid_branch_selection();
             }
-            Some(BranchTreeNode::Branch {
-                repository_index,
-                branch_index,
-            }) => {
-                let branch = self
-                    .state
-                    .repositories
-                    .get(repository_index)
-                    .and_then(|repository| repository.branches.get(branch_index))
-                    .map(|branch| (branch.name.clone(), !branch.head.0.is_empty()));
-                self.activate_repository(repository_index);
-                if let Some((branch, has_commit)) = branch {
-                    if has_commit {
-                        self.submit_commits(repository_index, branch);
-                    } else {
-                        if let Some(repository) = self.state.repositories.get_mut(repository_index)
-                        {
-                            repository.viewing_branch = Some(branch.clone());
-                        }
-                        self.state.branch_commits_repository_index = Some(repository_index);
-                        self.state.branch_commits.viewing_branch = Some(branch);
-                        self.state.branch_commits.items.clear();
-                        self.state.selection.selected_commit_index = None;
-                        self.state.ensure_valid_commit_selection();
-                    }
-                    self.state.focus = FocusPanel::CommitList;
-                }
+            Some(BranchTreeNode::Branch { .. }) => {
+                self.preview_selected_branch_commits();
+                self.state.focus = FocusPanel::CommitList;
             }
             None => {}
         }
@@ -2417,7 +2541,66 @@ impl App {
         else {
             return;
         };
-        self.submit_commit_detail(repository_index, commit);
+        self.submit_commit_detail(repository_index, commit, true);
+    }
+
+    fn latest_commit_detail_request_matches(
+        &self,
+        repository_index: usize,
+        commit: &CommitHash,
+    ) -> bool {
+        self.state
+            .latest_commit_detail_job
+            .and_then(|id| self.state.pending_jobs.get(&id))
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    PendingJobKind::CommitDetail {
+                        repository_index: pending_repository,
+                        commit: pending_commit,
+                        ..
+                    } if *pending_repository == repository_index && pending_commit == commit
+                )
+            })
+    }
+
+    /// Keep Commit Detail's right pane synchronized with the highlighted
+    /// commit without transferring focus away from the left commit list.
+    fn preview_selected_commit_detail(&mut self) {
+        if self.state.screen != Screen::CommitDetail {
+            return;
+        }
+        let selected = self.state.branch_commits_repository_index.zip(
+            self.state
+                .selected_commit()
+                .map(|commit| commit.hash.clone()),
+        );
+        let Some((repository_index, commit)) = selected else {
+            self.state.latest_commit_detail_job = None;
+            self.state.current_commit_detail = None;
+            self.state.current_file_diff = None;
+            self.state.selection.selected_file_index = None;
+            self.state.expansion.expanded_files.clear();
+            return;
+        };
+
+        let already_loaded = self
+            .state
+            .current_commit_detail
+            .as_ref()
+            .is_some_and(|detail| detail.commit.hash == commit)
+            && self.state.latest_commit_detail_job.is_none();
+        if already_loaded || self.latest_commit_detail_request_matches(repository_index, &commit) {
+            return;
+        }
+
+        // Clear the old commit immediately; while the new request is pending,
+        // the right pane shows an explicit loading state instead of stale data.
+        self.state.current_commit_detail = None;
+        self.state.current_file_diff = None;
+        self.state.selection.selected_file_index = None;
+        self.state.expansion.expanded_files.clear();
+        self.submit_commit_detail(repository_index, commit, false);
     }
 
     fn toggle_file_expanded(&mut self) {

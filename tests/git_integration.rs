@@ -1228,6 +1228,120 @@ fn latest_branch_request_wins_over_stale_worker_responses() {
 }
 
 #[test]
+fn branch_arrow_navigation_automatically_previews_the_selected_branch() {
+    let repo = repository();
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    commit_all(repo.path(), "base");
+    git(repo.path(), &["switch", "-c", "feature"]);
+    fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+    commit_all(repo.path(), "feature tip");
+    git(repo.path(), &["switch", "main"]);
+    fs::write(repo.path().join("main.txt"), "main\n").unwrap();
+    commit_all(repo.path(), "main tip");
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    let main_index = branch_tree_index(&app, 0, "main");
+    let feature_index = branch_tree_index(&app, 0, "feature");
+    assert_eq!(main_index.abs_diff(feature_index), 1);
+
+    app.state.focus = FocusPanel::BranchList;
+    app.dispatch(Action::SelectBranch(main_index));
+    wait_until_idle(&mut app);
+    assert_eq!(
+        app.state.branch_commits.viewing_branch.as_ref().unwrap().0,
+        "main"
+    );
+
+    app.dispatch(if feature_index < main_index {
+        Action::MoveUp
+    } else {
+        Action::MoveDown
+    });
+    assert_eq!(app.state.focus, FocusPanel::BranchList);
+    wait_until_idle(&mut app);
+
+    assert_eq!(app.state.selected_branch().unwrap().name.0, "feature");
+    assert_eq!(
+        app.state.branch_commits.viewing_branch.as_ref().unwrap().0,
+        "feature"
+    );
+    assert_eq!(app.state.selected_commit().unwrap().subject, "feature tip");
+    assert_eq!(app.state.focus, FocusPanel::BranchList);
+}
+
+#[test]
+fn commit_arrow_navigation_automatically_previews_detail_without_stealing_focus() {
+    let repo = repository();
+    fs::write(repo.path().join("first.txt"), "first\n").unwrap();
+    commit_all(repo.path(), "first commit");
+    fs::write(repo.path().join("second.txt"), "second\n").unwrap();
+    commit_all(repo.path(), "second commit");
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    app.state.focus = FocusPanel::CommitList;
+    app.dispatch(Action::OpenCommitDetail);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.screen, Screen::CommitDetail);
+    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+    assert_eq!(
+        app.state
+            .current_commit_detail
+            .as_ref()
+            .unwrap()
+            .commit
+            .subject,
+        "second commit"
+    );
+
+    app.state.focus = FocusPanel::CommitList;
+    app.dispatch(Action::MoveDown);
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert!(app.state.current_commit_detail.is_none());
+    assert!(app.state.latest_commit_detail_job.is_some());
+    wait_until_idle(&mut app);
+
+    let selected = app.state.selected_commit().unwrap().hash.clone();
+    assert_eq!(
+        app.state
+            .current_commit_detail
+            .as_ref()
+            .unwrap()
+            .commit
+            .hash,
+        selected
+    );
+    assert_eq!(
+        app.state
+            .current_commit_detail
+            .as_ref()
+            .unwrap()
+            .commit
+            .subject,
+        "first commit"
+    );
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+
+    // Queue two previews without polling. Only the final selection may update
+    // the right pane when responses arrive.
+    app.dispatch(Action::MoveUp);
+    app.dispatch(Action::MoveDown);
+    wait_until_idle(&mut app);
+    let selected = app.state.selected_commit().unwrap().hash.clone();
+    assert_eq!(
+        app.state
+            .current_commit_detail
+            .as_ref()
+            .unwrap()
+            .commit
+            .hash,
+        selected
+    );
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+}
+
+#[test]
 fn application_confirms_switch_cherry_pick_and_typed_reset_end_to_end() {
     let repo = repository();
     fs::write(repo.path().join("base.txt"), "base\n").unwrap();

@@ -212,10 +212,12 @@ PITUI_LOG=/path/to/pitui.jsonl pitui /repo
 | 仓库节点 | `g` | 查看该仓库 reflog |
 | 仓库/分支节点 | `o` | 打开所属仓库的 Remote 管理界面 |
 | 分支节点 | `Enter` | 浏览所选分支 commits，不切换真实分支 |
+| 仓库/分支树 | `↑` / `k`, `↓` / `j` | 选择分支时自动刷新右侧 commits，焦点保持在左侧 |
 | 分支节点 | `s` | 确认后在所属仓库执行 `git switch` |
 | 分支节点 | `b` | 确认后将当前分支 rebase 到所选分支；冲突自动 abort |
 | 仓库/分支树 | `/` | 按仓库名、路径、分支或 subject 过滤 |
 | Commits | `Enter` | 打开 commit detail |
+| Commit Detail 中的 Commits | `↑` / `k`, `↓` / `j` | 选择 commit 时自动刷新右侧 metadata/files，焦点保持在左侧 |
 | Commits | `Space` | 加入/移出 commit 复制多选集合 |
 | Commits | `Ctrl-C` → `h` | 按当前列表顺序复制所有多选 commit 的完整 hash；无多选时复制当前 hash |
 | Commits | `Ctrl-C` → `i` | 复制当前 commit info（hash、author、date、refs 和 message） |
@@ -298,6 +300,7 @@ Stage 使用 path-limited `git add --all -- <paths>`；unstage 使用 path-limit
 
 | Key | 操作 |
 |---|---|
+| Commits 列 `↑` / `k`, `↓` / `j` | 选择 commit 并自动刷新右侧详情，焦点保持在左侧 Commits |
 | `Space` | 展开或折叠文件 hunk summary |
 | `Enter` / `v` | 打开所选文件 diff |
 | `PageUp` / `PageDown`, `Home` / `End` | 文件列表翻页或跳到首尾 |
