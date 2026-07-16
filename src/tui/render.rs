@@ -10,7 +10,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     app::{
         AppState, BranchTreeNode, ChangeGroup, ChangesTreeNode, ConfirmDialog, DiffViewMode,
-        FilterTarget, FocusPanel, GlobalMode, Screen,
+        FilterTarget, FocusPanel, GlobalMode, RemoteEditKind, RemoteInputField, Screen,
+        ShortcutMenu,
     },
     domain::{DiffCellKind, DiffLineKind, FileDiff, side_by_side_rows},
 };
@@ -53,6 +54,7 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
         Screen::FileDiffDetail => render_file_diff(frame, app, rows[1], area.width),
         Screen::Reflog => render_reflog(frame, app, rows[1]),
         Screen::Changes => render_changes(frame, app, rows[1], area.width),
+        Screen::Remotes => render_remotes(frame, app, rows[1]),
     }
     render_hotkeys(frame, app, rows[2]);
     render_popup(frame, app, area);
@@ -112,16 +114,17 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         Screen::Reflog => app
             .selected_reflog()
             .map_or("—", |entry| entry.short_hash.as_str()),
-        Screen::Changes => "—",
+        Screen::Changes | Screen::Remotes => "—",
         _ => app
             .selected_commit()
             .map_or("—", |commit| commit.short_hash.as_str()),
     };
-    let selected_file = if app.screen == Screen::Changes {
-        app.selected_change()
-            .map_or("—", |(_, change)| change.path.as_str())
-    } else {
-        app.selected_file().map_or("—", |file| file.path.as_str())
+    let selected_file = match app.screen {
+        Screen::Changes => app
+            .selected_change()
+            .map_or("—", |(_, change)| change.path.as_str()),
+        Screen::Remotes => "—",
+        _ => app.selected_file().map_or("—", |file| file.path.as_str()),
     };
     let mode = match app.mode {
         GlobalMode::Normal => "NORMAL",
@@ -129,6 +132,8 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         GlobalMode::Confirming { .. } => "CONFIRM",
         GlobalMode::TypingConfirmation { .. } => "TYPE",
         GlobalMode::EditingCommitMessage { .. } => "COMMIT",
+        GlobalMode::EditingRemote { .. } => "REMOTE",
+        GlobalMode::Shortcut { .. } => "SHORTCUT",
         GlobalMode::Error => "ERROR",
     };
     let spinner = if app.is_loading() {
@@ -145,6 +150,7 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         Screen::FileDiffDetail => "DIFF",
         Screen::Reflog => "REFLOG",
         Screen::Changes => "CHANGES",
+        Screen::Remotes => "REMOTES",
     };
     let focus = match app.focus {
         FocusPanel::BranchList => "BRANCHES",
@@ -155,6 +161,7 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         FocusPanel::ReflogList => "REFLOG",
         FocusPanel::ChangesTree => "CHANGES_TREE",
         FocusPanel::ChangesDiff => "CHANGES_DIFF",
+        FocusPanel::RemoteList => "REMOTES",
         FocusPanel::Popup => "POPUP",
     };
     let line = if area.width < 100 {
@@ -300,6 +307,145 @@ fn render_reflog(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     frame.render_widget(
         Paragraph::new(lines)
             .block(panel_block("Reflog entry", false))
+            .wrap(Wrap { trim: false }),
+        right,
+    );
+}
+
+fn render_remotes(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
+    let [left, right] = columns(area);
+    let items = if app.remotes.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "No remotes configured — press a to add one",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        app.remotes
+            .iter()
+            .map(|remote| {
+                let routing = match (remote.is_upstream, remote.is_push_target) {
+                    (true, true) => "★",
+                    (true, false) => "F",
+                    (false, true) => "P",
+                    (false, false) => " ",
+                };
+                let (policy, policy_style) = if remote.urls_match() {
+                    ("✓", Style::default().fg(Color::Green))
+                } else {
+                    (
+                        "!",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{routing} "), Style::default().fg(Color::Yellow)),
+                    Span::raw(terminal_safe(&remote.name)),
+                    Span::raw("  "),
+                    Span::styled(policy, policy_style),
+                ]))
+            })
+            .collect()
+    };
+    let selected = (!app.remotes.is_empty())
+        .then_some(app.selection.selected_remote_index)
+        .flatten();
+    let list = List::new(items)
+        .block(panel_block(
+            "Remotes  ★ upstream · F fetch · P push · ! blocked",
+            app.focus == FocusPanel::RemoteList,
+        ))
+        .highlight_symbol("▶ ")
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_stateful_widget(list, left, &mut list_state(selected));
+
+    let lines = app.selected_remote().map_or_else(
+        || {
+            vec![
+                Line::styled("No remote selected", Style::default().fg(Color::DarkGray)),
+                Line::raw(""),
+                Line::raw("Press a to add a remote with one URL shared by fetch and push."),
+            ]
+        },
+        |remote| {
+            let branch = app.active_repository().and_then(|repository| {
+                repository
+                    .current_branch
+                    .as_ref()
+                    .map(|branch| branch.0.as_str())
+            });
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled("Remote: ", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        terminal_safe(&remote.name),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Current branch: ", Style::default().fg(Color::Cyan)),
+                    Span::raw(terminal_safe(branch.unwrap_or("detached"))),
+                ]),
+                Line::from(vec![
+                    Span::styled("Routing: ", Style::default().fg(Color::Cyan)),
+                    Span::raw(match (remote.is_upstream, remote.is_push_target) {
+                        (true, true) => "upstream for fetch/pull and push",
+                        (true, false) => "fetch/pull upstream only — blocked until unified",
+                        (false, true) => "push target only — blocked until unified",
+                        (false, false) => "not selected for the current branch",
+                    }),
+                ]),
+                Line::raw(""),
+                Line::styled("Fetch URL(s):", Style::default().fg(Color::Cyan)),
+            ];
+            if remote.fetch_urls.is_empty() {
+                lines.push(Line::styled("  (missing)", Style::default().fg(Color::Red)));
+            } else {
+                lines.extend(
+                    remote
+                        .fetch_urls
+                        .iter()
+                        .map(|url| Line::raw(terminal_safe(&format!("  {url}")))),
+                );
+            }
+            lines.push(Line::styled(
+                "Push URL(s):",
+                Style::default().fg(Color::Cyan),
+            ));
+            if remote.push_urls.is_empty() {
+                lines.push(Line::styled("  (missing)", Style::default().fg(Color::Red)));
+            } else {
+                lines.extend(
+                    remote
+                        .push_urls
+                        .iter()
+                        .map(|url| Line::raw(terminal_safe(&format!("  {url}")))),
+                );
+            }
+            lines.push(Line::raw(""));
+            lines.push(if remote.urls_match() {
+                Line::styled(
+                    "✓ Fetch and push URLs are identical.",
+                    Style::default().fg(Color::Green),
+                )
+            } else {
+                Line::styled(
+                    "! BLOCKED: fetch/pull/push require identical URLs. Press e to repair.",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )
+            });
+            lines
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel_block("Remote details", false))
             .wrap(Wrap { trim: false }),
         right,
     );
@@ -1127,20 +1273,45 @@ fn render_hotkeys(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         GlobalMode::EditingCommitMessage { .. } => {
             " Type commit message | Enter create commit | Esc cancel ".into()
         }
+        GlobalMode::EditingRemote { kind, field, .. } => match kind {
+            RemoteEditKind::Add => format!(
+                " Add remote: editing {} | Tab switch field | Enter continue | Esc cancel ",
+                match field {
+                    RemoteInputField::Name => "name",
+                    RemoteInputField::Url => "shared URL",
+                }
+            ),
+            RemoteEditKind::SetUrl { .. } => {
+                " Set shared fetch/push URL | Enter continue | Esc cancel ".into()
+            }
+        },
+        GlobalMode::Shortcut {
+            menu: ShortcutMenu::CommitCopy,
+        } => " Copy commit: h hash | i info | m message | Esc cancel ".into(),
         GlobalMode::Error => " Enter / Esc dismiss ".into(),
         GlobalMode::Normal => match (app.screen, app.focus) {
             (Screen::BranchOverview, FocusPanel::BranchList) => {
                 let mut keys = vec!["Tab focus"];
                 match app.selected_tree_node() {
                     Some(BranchTreeNode::Repository { .. }) => {
-                        keys.extend(["Enter expand/collapse", "f fetch", "g reflog"]);
+                        keys.extend([
+                            "Enter expand/collapse",
+                            "o remotes",
+                            "f fetch",
+                            "p pull --rebase",
+                            "P push",
+                            "g reflog",
+                        ]);
                     }
                     Some(BranchTreeNode::Branch { .. }) => {
-                        keys.extend(["Enter view commits", "s switch", "b rebase"]);
+                        keys.extend(["Enter view commits", "o remotes", "s switch", "b rebase"]);
                     }
                     None => {}
                 }
-                keys.extend(["/ filter", "r refresh", "q quit"]);
+                if app.selected_commit().is_some() {
+                    keys.push("Ctrl+C copy commit…");
+                }
+                keys.extend(["/ filter", "q quit"]);
                 format!(" {} ", keys.join(" | "))
             }
             (Screen::BranchOverview, FocusPanel::CommitList) => {
@@ -1149,9 +1320,7 @@ fn render_hotkeys(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                     keys.extend([
                         "Enter detail",
                         "Space select",
-                        "c copy hashes",
-                        "i copy info",
-                        "m copy message",
+                        "Ctrl+C copy…",
                         "y queue",
                         "R reset",
                     ]);
@@ -1168,9 +1337,7 @@ fn render_hotkeys(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                     keys.extend([
                         "Enter detail",
                         "Space select",
-                        "c copy hashes",
-                        "i copy info",
-                        "m copy message",
+                        "Ctrl+C copy…",
                         "y queue",
                         "R reset",
                     ]);
@@ -1187,22 +1354,30 @@ fn render_hotkeys(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                     keys.extend(["Space expand", "Enter file diff"]);
                 }
                 if app.selected_commit().is_some() {
-                    keys.extend(["i copy commit info", "m copy message", "y queue"]);
+                    keys.extend(["Ctrl+C copy commit…", "y queue"]);
                 }
-                keys.extend(["Tab focus", "Esc back", "q quit"]);
+                keys.extend([
+                    "Home/End first/last",
+                    "PgUp/PgDn page",
+                    "Tab focus",
+                    "Esc back",
+                    "q quit",
+                ]);
                 format!(" {} ", keys.join(" | "))
             }
             (Screen::FileDiffDetail, _) => {
-                let mut keys = vec![
-                    "v mode",
-                    "Ctrl+C hash",
-                    "Ctrl+Shift+C info",
-                    "m/Ctrl+Alt+C message",
-                ];
+                let mut keys = vec!["v mode", "Ctrl+C copy commit…"];
                 if app.selected_file().is_some() {
                     keys.extend(["n next", "p prev"]);
                 }
-                keys.extend(["w wrap", "Tab focus", "Esc back", "q quit"]);
+                keys.extend([
+                    "w wrap",
+                    "Home/End",
+                    "PgUp/PgDn",
+                    "Tab focus",
+                    "Esc back",
+                    "q quit",
+                ]);
                 format!(" {} ", keys.join(" | "))
             }
             (Screen::Reflog, FocusPanel::ReflogList) => {
@@ -1211,6 +1386,14 @@ fn render_hotkeys(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                     keys.push("R reset");
                 }
                 keys.extend(["Esc back", "q quit"]);
+                format!(" {} ", keys.join(" | "))
+            }
+            (Screen::Remotes, FocusPanel::RemoteList) => {
+                let mut keys = vec!["a add remote"];
+                if app.selected_remote().is_some() {
+                    keys.extend(["e set shared URL", "u set upstream"]);
+                }
+                keys.extend(["Home/End", "PgUp/PgDn", "Esc back", "q quit"]);
                 format!(" {} ", keys.join(" | "))
             }
             (Screen::Changes, FocusPanel::ChangesTree) => {
@@ -1228,22 +1411,23 @@ fn render_hotkeys(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                     "←/→ collapse/expand",
                     "v diff mode",
                     "w wrap",
+                    "Home/End",
+                    "PgUp/PgDn",
                     "Tab focus",
-                    "r refresh",
                     "Esc back",
                     "q quit",
                 ]);
                 format!(" {} ", keys.join(" | "))
             }
             (Screen::Changes, FocusPanel::ChangesDiff) => {
-                " Space select file | s stage | u unstage | c commit | ↑/↓ scroll | v mode | w wrap | Tab tree | r refresh | Esc back "
+                " Space select file | s stage | u unstage | c commit | ↑/↓ scroll | Home/End | PgUp/PgDn | v mode | w wrap | Tab tree | Esc back "
                     .into()
             }
             _ => " q quit ".into(),
         },
     };
     if matches!(app.mode, GlobalMode::Normal) {
-        text = format!(" Ctrl+G changes | {} ", text.trim());
+        text = format!(" Ctrl+G changes | Ctrl+R refresh | {} ", text.trim());
     }
     if let Some(message) = app.last_message.as_ref() {
         text.push_str(&format!(" | ✓ {message} "));
@@ -1303,11 +1487,158 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                             Style::default().fg(Color::Yellow),
                         ),
                         Line::raw(""),
+                        Line::raw("Every remote must use identical fetch and push URLs."),
                         Line::raw("Enter confirm | Esc cancel"),
                     ],
                     46,
                 )
             }
+            ConfirmDialog::PullRebaseRepository {
+                repository_index,
+                branch,
+            } => {
+                let repository = app.repositories.get(*repository_index);
+                (
+                    "Pull with rebase",
+                    vec![
+                        Line::raw("Repository:"),
+                        Line::styled(
+                            terminal_safe(&repository.map_or_else(
+                                || "—".to_string(),
+                                |repository| {
+                                    format!(
+                                        "{}  {}",
+                                        repository.display_name(),
+                                        repository.display_path().display()
+                                    )
+                                },
+                            )),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Line::raw(terminal_safe(&format!("Current branch: {}", branch.0))),
+                        Line::raw(""),
+                        Line::raw("About to run:"),
+                        Line::styled("git pull --rebase", Style::default().fg(Color::Yellow)),
+                        Line::raw(""),
+                        Line::raw("The working tree and index must be clean."),
+                        Line::raw("The upstream remote must use one shared fetch/push URL."),
+                        Line::raw(
+                            "If rebase conflicts occur, Pitui will automatically abort them.",
+                        ),
+                        Line::raw(""),
+                        Line::raw("Enter confirm | Esc cancel"),
+                    ],
+                    58,
+                )
+            }
+            ConfirmDialog::PushRepository {
+                repository_index,
+                branch,
+            } => {
+                let repository = app.repositories.get(*repository_index);
+                (
+                    "Push current branch",
+                    vec![
+                        Line::raw("Repository:"),
+                        Line::styled(
+                            terminal_safe(&repository.map_or_else(
+                                || "—".to_string(),
+                                |repository| {
+                                    format!(
+                                        "{}  {}",
+                                        repository.display_name(),
+                                        repository.display_path().display()
+                                    )
+                                },
+                            )),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Line::raw(terminal_safe(&format!("Current branch: {}", branch.0))),
+                        Line::raw(""),
+                        Line::raw("About to run:"),
+                        Line::styled("git push", Style::default().fg(Color::Yellow)),
+                        Line::raw(""),
+                        Line::raw("The configured upstream/default push target will be used."),
+                        Line::raw("No upstream is created automatically."),
+                        Line::raw(
+                            "Fetch upstream and push target must resolve to the same remote.",
+                        ),
+                        Line::raw(""),
+                        Line::raw("Enter confirm | Esc cancel"),
+                    ],
+                    56,
+                )
+            }
+            ConfirmDialog::AddRemote { name, url, .. } => (
+                "Add remote",
+                vec![
+                    Line::from(vec![
+                        Span::styled("Remote: ", Style::default().fg(Color::Cyan)),
+                        Span::raw(terminal_safe(name)),
+                    ]),
+                    Line::styled(
+                        "The same URL will be used for fetch and push:",
+                        Style::default().fg(Color::Green),
+                    ),
+                    Line::raw(terminal_safe(url)),
+                    Line::raw(""),
+                    Line::raw("About to run:"),
+                    Line::styled(
+                        terminal_safe(&format!("git remote add -- {name} <shared-url>")),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Line::raw(""),
+                    Line::raw("Enter confirm | Esc cancel"),
+                ],
+                48,
+            ),
+            ConfirmDialog::SetRemoteUrl { name, url, .. } => (
+                "Set shared remote URL",
+                vec![
+                    Line::from(vec![
+                        Span::styled("Remote: ", Style::default().fg(Color::Cyan)),
+                        Span::raw(terminal_safe(name)),
+                    ]),
+                    Line::raw("New fetch/push URL:"),
+                    Line::raw(terminal_safe(url)),
+                    Line::raw(""),
+                    Line::styled(
+                        "This replaces all fetch URLs and removes separate push URLs.",
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Line::raw("Pitui then uses this one URL in both directions."),
+                    Line::raw(""),
+                    Line::raw("Enter confirm | Esc cancel"),
+                ],
+                50,
+            ),
+            ConfirmDialog::SetUpstreamRemote { name, branch, .. } => (
+                "Set upstream remote",
+                vec![
+                    Line::from(vec![
+                        Span::styled("Current branch: ", Style::default().fg(Color::Cyan)),
+                        Span::raw(terminal_safe(&branch.0)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Remote: ", Style::default().fg(Color::Cyan)),
+                        Span::raw(terminal_safe(name)),
+                    ]),
+                    Line::raw(""),
+                    Line::raw("Pitui will configure:"),
+                    Line::styled(
+                        terminal_safe(&format!("fetch/pull: {name}/{}", branch.0)),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Line::styled(
+                        terminal_safe(&format!("push:       {name}/{}", branch.0)),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Line::raw(""),
+                    Line::raw("The remote branch may be created by the next push."),
+                    Line::raw("Enter confirm | Esc cancel"),
+                ],
+                54,
+            ),
             ConfirmDialog::SwitchBranch {
                 repository_index,
                 branch,
@@ -1532,6 +1863,63 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             lines.push(Line::raw("Enter create commit | Esc cancel"));
             ("Create commit", lines, 46)
         }
+        GlobalMode::EditingRemote {
+            kind,
+            field,
+            name,
+            url,
+            validation_error,
+        } => {
+            let adding = matches!(kind, RemoteEditKind::Add);
+            let name_active = adding && *field == RemoteInputField::Name;
+            let url_active = *field == RemoteInputField::Url;
+            let mut lines = vec![
+                Line::raw("Remote name:"),
+                Line::styled(
+                    terminal_safe(&format!("> {name}{}", if name_active { "_" } else { "" })),
+                    Style::default().fg(if name_active {
+                        Color::Yellow
+                    } else {
+                        Color::White
+                    }),
+                ),
+                Line::raw(""),
+                Line::raw("Shared fetch/push URL:"),
+                Line::styled(
+                    terminal_safe(&format!("> {url}{}", if url_active { "_" } else { "" })),
+                    Style::default().fg(if url_active {
+                        Color::Yellow
+                    } else {
+                        Color::White
+                    }),
+                ),
+                Line::raw(""),
+                Line::styled(
+                    "Pitui does not allow a separate push URL.",
+                    Style::default().fg(Color::Green),
+                ),
+            ];
+            if let Some(error) = validation_error {
+                lines.push(Line::styled(
+                    terminal_safe(error),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            lines.push(Line::raw(if adding {
+                "Tab switch field | Enter continue | Esc cancel"
+            } else {
+                "Enter continue | Esc cancel"
+            }));
+            (
+                if adding {
+                    "Add remote"
+                } else {
+                    "Set shared remote URL"
+                },
+                lines,
+                54,
+            )
+        }
         GlobalMode::Error => {
             let Some(error) = app.last_error.as_ref() else {
                 return;
@@ -1576,7 +1964,8 @@ mod tests {
     use super::*;
     use crate::domain::{
         ChangedFile, Commit, CommitDetail, CommitHash, DiffHunk, DiffLine, FileChangeKind,
-        FileDiff, GitPath, ReflogEntry, Repository, WorkingTreeChange, WorkingTreeStatus,
+        FileDiff, GitPath, ReflogEntry, RemoteInfo, Repository, WorkingTreeChange,
+        WorkingTreeStatus,
     };
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -1627,6 +2016,34 @@ mod tests {
         assert!(rendered.contains("add reflog view"));
         assert!(rendered.contains("Reflog entry"));
         assert!(rendered.contains("R reset"));
+    }
+
+    #[test]
+    fn renders_remote_routing_and_blocks_split_urls() {
+        let backend = TestBackend::new(160, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            screen: Screen::Remotes,
+            focus: FocusPanel::RemoteList,
+            remotes_repository_index: Some(0),
+            remotes: vec![RemoteInfo {
+                name: "origin".into(),
+                fetch_urls: vec!["ssh://fetch.example/repo.git".into()],
+                push_urls: vec!["ssh://push.example/repo.git".into()],
+                is_upstream: true,
+                is_push_target: false,
+            }],
+            ..AppState::default()
+        };
+        state.ensure_valid_remote_selection();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("Remotes"));
+        assert!(rendered.contains("ssh://fetch.example/repo.git"));
+        assert!(rendered.contains("ssh://push.example/repo.git"));
+        assert!(rendered.contains("BLOCKED"));
+        assert!(rendered.contains("a add remote"));
+        assert!(rendered.contains("u set upstream"));
     }
 
     #[test]

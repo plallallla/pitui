@@ -1,6 +1,6 @@
 use crate::domain::{
-    Branch, BranchName, CommitDetail, CommitHash, FileDiff, GitPath, ReflogEntry, Repository,
-    WorkingTreeChange, WorkingTreeDiff,
+    Branch, BranchName, CommitDetail, CommitHash, FileDiff, GitPath, ReflogEntry, RemoteInfo,
+    Repository, WorkingTreeChange, WorkingTreeDiff,
 };
 
 pub type GitJobId = u64;
@@ -26,6 +26,7 @@ impl ResetMode {
 pub enum GitRequest {
     LoadRepositoryStatus,
     LoadBranches,
+    LoadRemotes,
     LoadCommits {
         branch: BranchName,
         limit: usize,
@@ -62,6 +63,19 @@ pub enum GitRequest {
         message: String,
     },
     Fetch,
+    PullRebase,
+    Push,
+    AddRemote {
+        name: String,
+        url: String,
+    },
+    SetRemoteUrl {
+        name: String,
+        url: String,
+    },
+    SetUpstreamRemote {
+        name: String,
+    },
     SwitchBranch {
         branch: BranchName,
     },
@@ -81,6 +95,7 @@ pub enum GitRequest {
 pub enum GitResponse {
     RepositoryStatusLoaded(Repository),
     BranchesLoaded(Vec<Branch>),
+    RemotesLoaded(Vec<RemoteInfo>),
     CommitsLoaded {
         branch: BranchName,
         commits: Vec<crate::domain::Commit>,

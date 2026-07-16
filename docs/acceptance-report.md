@@ -4,7 +4,7 @@
 
 ## 结论
 
-`docs/git-tui-design.md` 中 Milestone 1–5 及多仓库安全操作扩展已实现。Pitui 可同时打开多个 Git 仓库，以真正分层的仓库/分支树浏览 commit、独立 Changes 三级树、changed files、两种 file diff 和 reflog，并通过仓库隔离的确认流程执行 fetch、switch、cherry-pick、soft/mixed/hard reset 和 safe rebase。Changes 支持文件/分组多选、stage、unstage 和 commit；Commits 支持独立多选后复制完整 hashes、commit info 或完整 message。File Diff 左侧切换文件会刷新右侧内容但不再抢走 focus。所有 Git worker job 另有持久化 JSONL 生命周期日志。
+`docs/git-tui-design.md` 中 Milestone 1–5 及多仓库安全操作扩展已实现。Pitui 可同时打开多个 Git 仓库，以真正分层的仓库/分支树浏览 commit、独立 Changes 三级树、changed files、两种 file diff、reflog 和 Remote Management，并通过仓库隔离的确认流程执行 fetch、pull --rebase、push、switch、cherry-pick、soft/mixed/hard reset 和 safe rebase。Remote Management 可新增 remote、归一 fetch/push URL 并为当前分支设置双向 upstream；worker 在联系网络前强制校验 URL 和分支路由一致。Changes 支持文件/分组多选、stage、unstage 和 commit；Commits 使用 `Ctrl+C` 二级快捷键复制完整 hashes、commit info 或完整 message。定时 Git 状态轮询已移除，任意主界面通过 `Ctrl+R` 手动刷新；Commit Files、File Diff 和 Changes Diff 统一支持 Home/End/PageUp/PageDown。File Diff 左侧切换文件会刷新右侧内容但不再抢走 focus。所有 Git worker job 另有持久化 JSONL 生命周期日志。
 
 ## 里程碑证据
 
@@ -19,9 +19,11 @@
 | 独立 Changes | 全局 `Ctrl+G`；Changes → Staged/Unstaged → File 三级树；进入/返回上下文；按 group 隔离 patch | 真实临时仓库 `MM` 双分组、三类 diff、全局返回上下文 integration test；state/renderer tests |
 | Diff 组件复用 | commit 与 Changes 都使用 `FileDiff`、`render_diff_panel`、unified/side-by-side、wrap 与滚动 | Changes staged 渲染测试、既有宽屏 side-by-side 测试、真实 patch integration test |
 | Changes 写操作 | file/group/root checkbox 多选；tree/diff focus 均可 stage/unstage；commit message validation | 正常/unborn 仓库 stage→unstage→commit 语义测试、controller 多选端到端测试、input/renderer tests |
-| Commit 复制 | Space 独立多选；hash/info/full-message；缺少 detail 时 clipboard-only 后台加载；OSC 52 | selection/input/base64 tests；多行 message 与 screen/focus 保持 integration test |
+| Commit 复制 | Space 独立多选；`Ctrl+C → h/i/m` 二级 palette；hash/info/full-message；OSC 52 | shortcut mode/input/base64 tests；多行 message 与 screen/focus 保持 integration test |
+| 手动刷新 / 文件导航 | 无定时 status polling；主界面全局 `Ctrl+R`；文件列表与两类 diff 的 Home/End/PageUp/PageDown | 等待超过原 2s 周期仍无 job，手动刷新才读取外部修改；15 文件翻页与长 diff 边界 integration test |
 | 树层级 / Unborn | `├─/└─` child connector；status 补全尚不存在 ref 的当前分支 | 空仓库 main 两行树 integration/unit/renderer tests |
-| Fetch / Reflog | job 级 cwd 路由、仓库节点 fetch/reflog、Reflog screen | 本地 bare remote fetch、reflog parser/renderer/真实仓库 integration tests |
+| Remote sync / Reflog | 仓库节点 fetch、pull --rebase、push、reflog；确认及 job 级 cwd 路由 | 本地 bare remote fetch；真实 divergent rebase pull/push；dirty rejection；conflict auto-abort integration tests |
+| Remote Management | `o` 独立界面；add/shared-URL/upstream 确认流程；`fetch/pull/push` 执行时 policy preflight；URL 日志收敛 | 真实 bare remote 新增、无远程分支时设 upstream 并 plain push；split URL 与 split branch routing 均在联系 remote 前拒绝，修复后通过 |
 | Reset 安全分级 | soft/mixed/hard mode chooser；hard warning + hash 两阶段确认 | 三种真实 reset 语义、reflog target reset、hard controller end-to-end tests |
 | Safe Rebase | controller + worker 双重前置检查、确认、冲突检测、仅自动 abort 本次操作 | clean success、dirty rejection、真实冲突恢复、既存 rebase 不被 abort integration tests |
 | 后台日志 | 平台默认路径与 `PITUI_LOG`；queued/started/completed JSONL；5 MiB 轮转；敏感 payload 收敛 | JSON escaping、commit message redaction、rotation unit tests；success/failure lifecycle integration test |
@@ -53,8 +55,8 @@ cargo test --doc
 测试结果：
 
 ```text
-unit tests:        37 passed
-integration tests: 25 passed
+unit tests:        41 passed
+integration tests: 32 passed
 doc tests:          0 failed
 ```
 
@@ -65,15 +67,20 @@ doc tests:          0 failed
 - branch、commit、root commit、rename、binary file；
 - commit detail、numstat、hunk 和 file diff；
 - File Diff 左侧上下切换双文件时响应刷新右侧但 focus 持续保持 FileList；
+- Commit Files、File Diff 左侧文件列表、File Diff 右侧内容和 Changes Diff 对 Home/End/PageUp/PageDown 的首尾/翻页语义；文件列表翻页只产生一个最终 diff job；
+- 超过原 2 秒轮询间隔后 Tick 仍不提交 Git 请求，只有 `Ctrl+R`/`RefreshRepository` 才读取外部工作区变化；
 - 异步 controller 主浏览三视图状态转移；
 - 快速切换分支时的 stale response 丢弃；
 - 非 Git 目录错误显示与关闭；
 - switch、cherry-pick、reset 写操作；
 - 多仓库树加载、折叠、切换及所有请求的仓库隔离；
 - 选中仓库通过本地 bare remote 执行 fetch 并刷新 remote tracking branch；
+- repository 节点确认执行 `git pull --rebase` 后重放本地 commit、plain push 到已配置 upstream、dirty pull 前置拒绝及 pull conflict 自动 abort；
+- Remote Management 从空配置新增共享 URL remote、设置当前分支 fetch/push upstream，并使用尚不存在的远程分支完成 plain push；
+- 显式 `pushurl` 与 fetch URL 不同时 fetch/pull/push 均被本地 preflight 拒绝；`e`/SetRemoteUrl 移除拆分 URL，分支 fetch remote 与 push remote 不同时同样拒绝，`u`/SetUpstreamRemote 修复后可推送；
 - staged、unstaged、untracked 文件发现、Changes 三级树、`MM` 跨组双节点和按边界加载 diff，以及空仓库 `main` 子节点补全；
 - Changes file/group 多选、tree/diff focus 下 stage/unstage、正常与 unborn repository 安全 unstage、commit message validation 和真实 commit；
-- 从 file diff 全局进入 Changes 后恢复原 screen/focus；commit 多选 hashes、当前 commit info 与完整多行 message clipboard payload；
+- 从 file diff 全局进入 Changes 后恢复原 screen/focus；`Ctrl+C → h/i/m` 二级选择、commit 多选 hashes、当前 commit info 与完整多行 message clipboard payload；
 - reflog 加载、渲染、返回时 stale response 丢弃及以 reflog entry 为 reset target；
 - soft/mixed/hard reset 语义和 hard 双阶段确认；
 - safe rebase 成功、worker 执行时脏工作区拒绝、真实冲突提示与自动 `git rebase --abort` 恢复；既存 rebase 会被拒绝且保持不变。

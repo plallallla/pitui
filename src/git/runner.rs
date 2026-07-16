@@ -6,7 +6,8 @@ use std::{
 };
 
 use crate::domain::{
-    BranchName, CommitHash, GitPath, WorkingTreeDiff, WorkingTreeDiffKind, WorkingTreeDiffSection,
+    BranchName, CommitHash, GitPath, RemoteInfo, WorkingTreeDiff, WorkingTreeDiffKind,
+    WorkingTreeDiffSection,
 };
 
 use super::{
@@ -137,6 +138,168 @@ fn load_branches(cwd: &Path) -> Result<GitResponse, GitFailure> {
         ],
     )?;
     Ok(GitResponse::BranchesLoaded(parse_branches(&output.stdout)))
+}
+
+fn config_values(cwd: &Path, key: &str) -> Result<Vec<String>, GitFailure> {
+    let output = run_git_with_exit_codes(
+        cwd,
+        ["config", "--local", "--null", "--get-all", key],
+        &[0, 1, 5],
+    )?;
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|value| !value.is_empty())
+        .map(|value| String::from_utf8_lossy(value).into_owned())
+        .collect())
+}
+
+fn first_config_value(cwd: &Path, key: &str) -> Result<Option<String>, GitFailure> {
+    Ok(config_values(cwd, key)?.into_iter().next())
+}
+
+fn current_branch_name(cwd: &Path, command: &str) -> Result<String, GitFailure> {
+    let output = run_git(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"]).map_err(|_| {
+        GitFailure {
+            command: command.to_string(),
+            stderr: "This operation requires an attached current branch; detached HEAD is not supported."
+                .into(),
+        }
+    })?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn effective_remote_urls(cwd: &Path, name: &str, push: bool) -> Vec<String> {
+    let mut args = vec![OsString::from("remote"), OsString::from("get-url")];
+    if push {
+        args.push(OsString::from("--push"));
+    }
+    args.extend([OsString::from("--all"), OsString::from(name)]);
+    run_git(cwd, args).map_or_else(
+        |_| Vec::new(),
+        |output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|url| url.trim_end_matches('\r').to_string())
+                .filter(|url| !url.is_empty())
+                .collect()
+        },
+    )
+}
+
+struct RemoteConfiguration {
+    remotes: Vec<RemoteInfo>,
+    upstream_remote: Option<String>,
+    push_remote: Option<String>,
+}
+
+fn remote_configuration(cwd: &Path) -> Result<RemoteConfiguration, GitFailure> {
+    let output = run_git(cwd, ["remote"])?;
+    let mut names = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+
+    let branch = run_git(cwd, ["branch", "--show-current"])?;
+    let branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
+    let upstream_remote = if branch.is_empty() {
+        None
+    } else {
+        first_config_value(cwd, &format!("branch.{branch}.remote"))?
+    };
+    let push_remote = if branch.is_empty() {
+        None
+    } else {
+        first_config_value(cwd, &format!("branch.{branch}.pushRemote"))?
+            .or(first_config_value(cwd, "remote.pushDefault")?)
+            .or_else(|| upstream_remote.clone())
+            .or_else(|| names.iter().find(|name| name.as_str() == "origin").cloned())
+            .or_else(|| (names.len() == 1).then(|| names[0].clone()))
+    };
+
+    let mut remotes = Vec::with_capacity(names.len());
+    for name in names {
+        let fetch_urls = effective_remote_urls(cwd, &name, false);
+        let push_urls = effective_remote_urls(cwd, &name, true);
+        remotes.push(RemoteInfo {
+            is_upstream: upstream_remote.as_ref() == Some(&name),
+            is_push_target: push_remote.as_ref() == Some(&name),
+            name,
+            fetch_urls,
+            push_urls,
+        });
+    }
+
+    Ok(RemoteConfiguration {
+        remotes,
+        upstream_remote,
+        push_remote,
+    })
+}
+
+fn load_remotes(cwd: &Path) -> Result<GitResponse, GitFailure> {
+    Ok(GitResponse::RemotesLoaded(
+        remote_configuration(cwd)?.remotes,
+    ))
+}
+
+fn validate_remote_policy(cwd: &Path, command: &str) -> Result<(), GitFailure> {
+    let RemoteConfiguration {
+        remotes,
+        upstream_remote,
+        push_remote,
+    } = remote_configuration(cwd)?;
+    if let Some(remote) = remotes.iter().find(|remote| !remote.urls_match()) {
+        return Err(GitFailure {
+            command: command.to_string(),
+            stderr: format!(
+                "Pitui requires identical fetch and push URLs for every remote. Remote `{}` violates this policy. Open Remote Management with `o`, select it, and press `e` to set one shared URL.",
+                remote.name
+            ),
+        });
+    }
+
+    if let Some(upstream) = upstream_remote
+        .as_ref()
+        .filter(|remote| remote.as_str() != ".")
+        && !remotes.iter().any(|remote| &remote.name == upstream)
+    {
+        return Err(GitFailure {
+            command: command.to_string(),
+            stderr: format!(
+                "The current branch references missing upstream remote `{upstream}`. Open Remote Management with `o` and choose an existing remote with `u`."
+            ),
+        });
+    }
+
+    if let Some(push) = push_remote.as_ref()
+        && !remotes.iter().any(|remote| &remote.name == push)
+    {
+        return Err(GitFailure {
+            command: command.to_string(),
+            stderr: format!(
+                "The current branch references missing push remote `{push}`. Open Remote Management with `o` and choose an existing remote with `u`."
+            ),
+        });
+    }
+
+    if let (Some(upstream), Some(push)) = (&upstream_remote, &push_remote)
+        && upstream != "."
+        && upstream != push
+    {
+        return Err(GitFailure {
+            command: command.to_string(),
+            stderr: format!(
+                "The current branch fetches from `{upstream}` but pushes to `{push}`. Pitui requires one upstream remote for both directions. Open Remote Management with `o` and press `u` on the desired remote."
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 fn load_commits(cwd: &Path, branch: BranchName, limit: usize) -> Result<GitResponse, GitFailure> {
@@ -440,6 +603,193 @@ fn create_commit(cwd: &Path, message: String) -> Result<GitResponse, GitFailure>
     })
 }
 
+fn validate_remote_name(name: &str, command: &str) -> Result<(), GitFailure> {
+    if name.is_empty()
+        || name.trim() != name
+        || name.starts_with('-')
+        || name
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(GitFailure {
+            command: command.to_string(),
+            stderr: "Remote name must be non-empty, cannot start with `-`, and cannot contain whitespace or control characters."
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_remote_url(url: &str, command: &str) -> Result<(), GitFailure> {
+    if url.is_empty() || url.trim() != url || url.chars().any(|character| character.is_control()) {
+        return Err(GitFailure {
+            command: command.to_string(),
+            stderr: "Remote URL must be non-empty and cannot contain leading/trailing whitespace or control characters."
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+fn add_remote(cwd: &Path, name: String, url: String) -> Result<GitResponse, GitFailure> {
+    let command = format!("git remote add -- {name} <url>");
+    validate_remote_name(&name, &command)?;
+    validate_remote_url(&url, &command)?;
+    run_git(
+        cwd,
+        [
+            OsString::from("remote"),
+            OsString::from("add"),
+            OsString::from("--"),
+            OsString::from(&name),
+            OsString::from(url),
+        ],
+    )
+    .map_err(|failure| GitFailure {
+        command,
+        stderr: failure.stderr,
+    })?;
+    Ok(GitResponse::CommandSucceeded {
+        message: format!("Remote `{name}` added with one shared fetch/push URL"),
+    })
+}
+
+fn write_config_values(cwd: &Path, key: &str, values: &[String]) -> Result<(), GitFailure> {
+    run_git_with_exit_codes(cwd, ["config", "--local", "--unset-all", key], &[0, 1, 5])?;
+    for value in values {
+        run_git(
+            cwd,
+            [
+                OsString::from("config"),
+                OsString::from("--local"),
+                OsString::from("--add"),
+                OsString::from("--"),
+                OsString::from(key),
+                OsString::from(value),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn update_config_transaction(
+    cwd: &Path,
+    command: &str,
+    updates: Vec<(String, Vec<String>)>,
+) -> Result<(), GitFailure> {
+    let snapshots = updates
+        .iter()
+        .map(|(key, _)| Ok((key.clone(), config_values(cwd, key)?)))
+        .collect::<Result<Vec<_>, GitFailure>>()?;
+
+    for (key, values) in &updates {
+        if let Err(failure) = write_config_values(cwd, key, values) {
+            let rollback_failures = snapshots
+                .iter()
+                .filter_map(|(snapshot_key, snapshot_values)| {
+                    write_config_values(cwd, snapshot_key, snapshot_values)
+                        .err()
+                        .map(|rollback| rollback.stderr)
+                })
+                .collect::<Vec<_>>();
+            let rollback = if rollback_failures.is_empty() {
+                "Pitui restored the previous Git configuration.".to_string()
+            } else {
+                format!(
+                    "Git configuration rollback also failed: {}",
+                    rollback_failures.join("; ")
+                )
+            };
+            return Err(GitFailure {
+                command: command.to_string(),
+                stderr: format!("{}\n\n{rollback}", failure.stderr),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn set_remote_url(cwd: &Path, name: String, url: String) -> Result<GitResponse, GitFailure> {
+    let command = format!("git remote set-url {name} <shared-url>");
+    validate_remote_name(&name, &command)?;
+    validate_remote_url(&url, &command)?;
+    let remotes = remote_configuration(cwd)?.remotes;
+    if !remotes.iter().any(|remote| remote.name == name) {
+        return Err(GitFailure {
+            command,
+            stderr: format!("Remote `{name}` does not exist."),
+        });
+    }
+
+    update_config_transaction(
+        cwd,
+        &command,
+        vec![
+            (format!("remote.{name}.url"), vec![url]),
+            (format!("remote.{name}.pushurl"), Vec::new()),
+        ],
+    )?;
+    Ok(GitResponse::CommandSucceeded {
+        message: format!("Remote `{name}` now uses one shared fetch/push URL"),
+    })
+}
+
+fn set_upstream_remote(cwd: &Path, name: String) -> Result<GitResponse, GitFailure> {
+    let command = format!("git config branch.<current>.remote {name}");
+    validate_remote_name(&name, &command)?;
+    let remotes = remote_configuration(cwd)?.remotes;
+    let Some(remote) = remotes.iter().find(|remote| remote.name == name) else {
+        return Err(GitFailure {
+            command,
+            stderr: format!("Remote `{name}` does not exist."),
+        });
+    };
+    if !remote.urls_match() {
+        return Err(GitFailure {
+            command,
+            stderr: format!(
+                "Remote `{name}` has different fetch and push URLs. Set one shared URL before selecting it as upstream."
+            ),
+        });
+    }
+
+    let branch = current_branch_name(cwd, &command)?;
+    update_config_transaction(
+        cwd,
+        &command,
+        vec![
+            (format!("branch.{branch}.remote"), vec![name.clone()]),
+            (
+                format!("branch.{branch}.merge"),
+                vec![format!("refs/heads/{branch}")],
+            ),
+            (format!("branch.{branch}.pushRemote"), vec![name.clone()]),
+        ],
+    )?;
+    Ok(GitResponse::CommandSucceeded {
+        message: format!(
+            "Remote `{name}` is now upstream for `{branch}` in both fetch and push directions"
+        ),
+    })
+}
+
+fn fetch_safely(cwd: &Path) -> Result<GitResponse, GitFailure> {
+    let command = display_command(&[
+        OsString::from("fetch"),
+        OsString::from("--all"),
+        OsString::from("--prune"),
+    ]);
+    validate_remote_policy(cwd, &command)?;
+    run_git(cwd, ["fetch", "--all", "--prune"])
+        .map(|output| command_succeeded(output, "Fetch completed"))
+}
+
+fn push_safely(cwd: &Path) -> Result<GitResponse, GitFailure> {
+    let command = display_command(&[OsString::from("push")]);
+    validate_remote_policy(cwd, &command)?;
+    run_git(cwd, ["push"]).map(|output| command_succeeded(output, "Push completed"))
+}
+
 fn command_succeeded(output: Output, fallback: &str) -> GitResponse {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     GitResponse::CommandSucceeded {
@@ -470,11 +820,14 @@ fn rebase_command(upstream: &BranchName) -> String {
     display_command(&[OsString::from("rebase"), OsString::from(&upstream.0)])
 }
 
-fn rebase_preflight(cwd: &Path, upstream: &BranchName) -> Result<(), GitFailure> {
-    let command = rebase_command(upstream);
+fn rebase_preflight(
+    cwd: &Path,
+    command: &str,
+    operation_label: &str,
+) -> Result<String, GitFailure> {
     if rebase_in_progress(cwd)? {
         return Err(GitFailure {
-            command,
+            command: command.to_string(),
             stderr: "A rebase was already in progress before Pitui's request; Pitui left it untouched. Finish or abort it explicitly before starting another rebase."
                 .into(),
         });
@@ -482,37 +835,34 @@ fn rebase_preflight(cwd: &Path, upstream: &BranchName) -> Result<(), GitFailure>
 
     let current_branch =
         run_git(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"]).map_err(|_| GitFailure {
-            command: command.clone(),
-            stderr:
-                "Safe rebase requires an attached current branch; detached HEAD is not supported."
-                    .into(),
+            command: command.to_string(),
+            stderr: format!(
+                "{operation_label} requires an attached current branch; detached HEAD is not supported."
+            ),
         })?;
     let current_branch = String::from_utf8_lossy(&current_branch.stdout)
         .trim()
         .to_string();
-    if current_branch == upstream.0 {
-        return Err(GitFailure {
-            command,
-            stderr: "The selected upstream is already the current branch.".into(),
-        });
-    }
 
     let status = run_git(cwd, ["status", "--porcelain=v1", "-z"])?;
     if !status.stdout.is_empty() {
         return Err(GitFailure {
-            command,
-            stderr: "Safe rebase requires a clean working tree and index. Commit, stash, or discard all changes first."
-                .into(),
+            command: command.to_string(),
+            stderr: format!(
+                "{operation_label} requires a clean working tree and index. Commit, stash, or discard all changes first."
+            ),
         });
     }
-    Ok(())
+    Ok(current_branch)
 }
 
-fn rebase_safely(cwd: &Path, upstream: BranchName) -> Result<GitResponse, GitFailure> {
-    rebase_preflight(cwd, &upstream)?;
-    let result = run_git(cwd, [OsString::from("rebase"), OsString::from(upstream.0)]);
+fn finish_rebase_capable_operation(
+    cwd: &Path,
+    result: Result<Output, GitFailure>,
+    success_message: &str,
+) -> Result<GitResponse, GitFailure> {
     match result {
-        Ok(output) => Ok(command_succeeded(output, "Rebase completed")),
+        Ok(output) => Ok(command_succeeded(output, success_message)),
         Err(failure) => {
             // Only abort state created by this request. The preflight above
             // rejects an existing rebase, so this cannot destroy a user's
@@ -542,12 +892,34 @@ fn rebase_safely(cwd: &Path, upstream: BranchName) -> Result<GitResponse, GitFai
     }
 }
 
+fn rebase_safely(cwd: &Path, upstream: BranchName) -> Result<GitResponse, GitFailure> {
+    let command = rebase_command(&upstream);
+    let current_branch = rebase_preflight(cwd, &command, "Safe rebase")?;
+    if current_branch == upstream.0 {
+        return Err(GitFailure {
+            command,
+            stderr: "The selected upstream is already the current branch.".into(),
+        });
+    }
+    let result = run_git(cwd, [OsString::from("rebase"), OsString::from(upstream.0)]);
+    finish_rebase_capable_operation(cwd, result, "Rebase completed")
+}
+
+fn pull_rebase_safely(cwd: &Path) -> Result<GitResponse, GitFailure> {
+    let command = display_command(&[OsString::from("pull"), OsString::from("--rebase")]);
+    rebase_preflight(cwd, &command, "Pull --rebase")?;
+    validate_remote_policy(cwd, &command)?;
+    let result = run_git(cwd, ["pull", "--rebase"]);
+    finish_rebase_capable_operation(cwd, result, "Pull --rebase completed")
+}
+
 /// Executes one request. This is the only production function that invokes
 /// Git, and it deliberately uses argv rather than a shell command string.
 pub fn execute_request(cwd: &Path, request: GitRequest) -> GitResponse {
     let result = match request {
         GitRequest::LoadRepositoryStatus => load_repository(cwd),
         GitRequest::LoadBranches => load_branches(cwd),
+        GitRequest::LoadRemotes => load_remotes(cwd),
         GitRequest::LoadCommits { branch, limit } => load_commits(cwd, branch, limit),
         GitRequest::LoadCommitDetail { commit } => load_commit_detail(cwd, commit),
         GitRequest::LoadCommitMessage { commit } => load_commit_message(cwd, commit),
@@ -575,8 +947,12 @@ pub fn execute_request(cwd: &Path, request: GitRequest) -> GitResponse {
         GitRequest::StagePaths { paths } => stage_paths(cwd, paths),
         GitRequest::UnstagePaths { paths } => unstage_paths(cwd, paths),
         GitRequest::Commit { message } => create_commit(cwd, message),
-        GitRequest::Fetch => run_git(cwd, ["fetch", "--all", "--prune"])
-            .map(|output| command_succeeded(output, "Fetch completed")),
+        GitRequest::Fetch => fetch_safely(cwd),
+        GitRequest::PullRebase => pull_rebase_safely(cwd),
+        GitRequest::Push => push_safely(cwd),
+        GitRequest::AddRemote { name, url } => add_remote(cwd, name, url),
+        GitRequest::SetRemoteUrl { name, url } => set_remote_url(cwd, name, url),
+        GitRequest::SetUpstreamRemote { name } => set_upstream_remote(cwd, name),
         GitRequest::SwitchBranch { branch } => {
             run_git(cwd, [OsString::from("switch"), OsString::from(branch.0)])
                 .map(|output| command_succeeded(output, "Branch switched"))

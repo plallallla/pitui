@@ -108,6 +108,27 @@ pub struct Repository {
     pub status: WorkingTreeStatus,
 }
 
+/// A configured Git remote. `push_urls` contains Git's effective push URLs:
+/// when no explicit `remote.<name>.pushurl` exists it is identical to
+/// `fetch_urls`. Pitui intentionally exposes both sides so a split fetch/push
+/// configuration can be detected and repaired before any network operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteInfo {
+    pub name: String,
+    pub fetch_urls: Vec<String>,
+    pub push_urls: Vec<String>,
+    /// The current branch reads/pulls from this remote.
+    pub is_upstream: bool,
+    /// A plain `git push` resolves to this remote for the current branch.
+    pub is_push_target: bool,
+}
+
+impl RemoteInfo {
+    pub fn urls_match(&self) -> bool {
+        !self.fetch_urls.is_empty() && self.fetch_urls == self.push_urls
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BranchKind {
     Local,

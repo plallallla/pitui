@@ -12,7 +12,10 @@ use pitui::{
         Action, App, BranchTreeNode, ChangeGroup, ChangesTreeNode, DiffViewMode, FocusPanel,
         GlobalMode, Screen,
     },
-    domain::{BranchName, CommitHash, FileChangeKind, GitPath, WorkingTreeDiffKind},
+    domain::{
+        BranchName, CommitHash, DiffHunk, DiffLine, DiffLineKind, FileChangeKind, FileDiff,
+        GitPath, WorkingTreeDiffKind,
+    },
     git::{GitCommandBus, GitRequest, GitResponse, ResetMode, execute_request},
 };
 use tempfile::TempDir;
@@ -918,7 +921,15 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
     app.dispatch(Action::MoveDown);
     app.dispatch(Action::ToggleCommitCopySelection);
     assert_eq!(app.state.commit_copy_selection.len(), 2);
+    app.dispatch(Action::OpenCommitCopyShortcuts);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::Shortcut {
+            menu: pitui::app::ShortcutMenu::CommitCopy
+        }
+    ));
     app.dispatch(Action::CopySelectedCommitHashes);
+    assert_eq!(app.state.mode, GlobalMode::Normal);
     let expected_hashes = app
         .state
         .branch_commits
@@ -931,6 +942,7 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
         app.take_clipboard_request().as_deref(),
         Some(expected_hashes.as_str())
     );
+    app.dispatch(Action::OpenCommitCopyShortcuts);
     app.dispatch(Action::CopyCurrentCommitInfo);
     let info = app.take_clipboard_request().unwrap();
     assert!(info.contains(&app.state.selected_commit().unwrap().hash.0));
@@ -967,6 +979,142 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
 }
 
 #[test]
+fn repository_status_waits_for_manual_refresh_instead_of_polling_on_tick() {
+    let repo = repository();
+    fs::write(repo.path().join("tracked.txt"), "clean\n").unwrap();
+    commit_all(repo.path(), "initial");
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    assert!(app.state.active_repository().unwrap().status.is_clean());
+
+    fs::write(repo.path().join("tracked.txt"), "changed outside pitui\n").unwrap();
+    thread::sleep(Duration::from_millis(2_100));
+
+    let tick_before = app.state.tick_count;
+    app.dispatch(Action::Tick);
+    assert_eq!(app.state.tick_count, tick_before + 1);
+    assert!(app.state.pending_jobs.is_empty());
+    assert!(app.state.active_repository().unwrap().status.is_clean());
+
+    app.dispatch(Action::RefreshRepository);
+    assert!(!app.state.pending_jobs.is_empty());
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.active_repository().unwrap().status.modified, 1);
+}
+
+#[test]
+fn every_file_detail_panel_supports_home_end_and_page_navigation() {
+    let repo = repository();
+    for index in 0..15 {
+        fs::write(
+            repo.path().join(format!("file-{index:02}.txt")),
+            format!("line {index}\n"),
+        )
+        .unwrap();
+    }
+    commit_all(repo.path(), "add many files");
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    app.dispatch(Action::FocusNext);
+    app.dispatch(Action::OpenCommitDetail);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+    assert_eq!(
+        app.state
+            .current_commit_detail
+            .as_ref()
+            .unwrap()
+            .files
+            .len(),
+        15
+    );
+
+    app.dispatch(Action::PageDown);
+    assert_eq!(app.state.selection.selected_file_index, Some(10));
+    app.dispatch(Action::PageUp);
+    assert_eq!(app.state.selection.selected_file_index, Some(0));
+    app.dispatch(Action::End);
+    assert_eq!(app.state.selection.selected_file_index, Some(14));
+    app.dispatch(Action::Home);
+    assert_eq!(app.state.selection.selected_file_index, Some(0));
+
+    app.dispatch(Action::OpenSelectedFileDiff);
+    wait_until_idle(&mut app);
+    app.dispatch(Action::FocusNext);
+    assert_eq!(app.state.focus, FocusPanel::FileList);
+    app.dispatch(Action::PageDown);
+    assert_eq!(app.state.selection.selected_file_index, Some(10));
+    assert_eq!(
+        app.state.pending_jobs.len(),
+        1,
+        "paging the file list must load only the final file diff"
+    );
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.focus, FocusPanel::FileList);
+    app.dispatch(Action::PageUp);
+    assert_eq!(app.state.selection.selected_file_index, Some(0));
+    wait_until_idle(&mut app);
+    app.dispatch(Action::End);
+    assert_eq!(app.state.selection.selected_file_index, Some(14));
+    wait_until_idle(&mut app);
+    app.dispatch(Action::Home);
+    assert_eq!(app.state.selection.selected_file_index, Some(0));
+    wait_until_idle(&mut app);
+
+    let long_diff = FileDiff {
+        commit: CommitHash("synthetic".into()),
+        path: GitPath::from("file.txt"),
+        old_path: None,
+        header: vec!["diff --git a/file.txt b/file.txt".into()],
+        hunks: vec![DiffHunk {
+            header: "@@ -1,40 +1,40 @@".into(),
+            old_start: 1,
+            old_count: 40,
+            new_start: 1,
+            new_count: 40,
+            lines: (1..=40)
+                .map(|line| DiffLine {
+                    old_line_no: Some(line),
+                    new_line_no: Some(line),
+                    kind: DiffLineKind::Context,
+                    text: format!("line {line}"),
+                })
+                .collect(),
+        }],
+        is_binary: false,
+    };
+    let last_line = 41;
+
+    app.state.current_file_diff = Some(long_diff.clone());
+    app.state.screen = Screen::FileDiffDetail;
+    app.state.focus = FocusPanel::DiffView;
+    app.state.selection.diff_scroll = 0;
+    app.dispatch(Action::PageDown);
+    assert_eq!(app.state.selection.diff_scroll, 10);
+    app.dispatch(Action::End);
+    assert_eq!(app.state.selection.diff_scroll, last_line);
+    app.dispatch(Action::PageUp);
+    assert_eq!(app.state.selection.diff_scroll, last_line - 10);
+    app.dispatch(Action::Home);
+    assert_eq!(app.state.selection.diff_scroll, 0);
+
+    app.state.current_changes_diff = Some(long_diff);
+    app.state.screen = Screen::Changes;
+    app.state.focus = FocusPanel::ChangesDiff;
+    app.state.selection.changes_diff_scroll = 0;
+    app.dispatch(Action::PageDown);
+    assert_eq!(app.state.selection.changes_diff_scroll, 10);
+    app.dispatch(Action::End);
+    assert_eq!(app.state.selection.changes_diff_scroll, last_line);
+    app.dispatch(Action::PageUp);
+    assert_eq!(app.state.selection.changes_diff_scroll, last_line - 10);
+    app.dispatch(Action::Home);
+    assert_eq!(app.state.selection.changes_diff_scroll, 0);
+}
+
+#[test]
 fn file_diff_navigation_keeps_file_list_focus_and_copies_full_commit_message() {
     let repo = repository();
     fs::write(repo.path().join("alpha.txt"), "alpha\n").unwrap();
@@ -991,6 +1139,7 @@ fn file_diff_navigation_keeps_file_list_focus_and_copies_full_commit_message() {
 
     // Overview only has the subject, so message copying loads the full body
     // without navigating away from the current screen or focus.
+    app.dispatch(Action::OpenCommitCopyShortcuts);
     app.dispatch(Action::CopyCurrentCommitMessage);
     wait_until_idle(&mut app);
     assert_eq!(app.state.screen, Screen::BranchOverview);
@@ -1269,6 +1418,354 @@ fn selected_repository_fetches_its_remote_and_refreshes_tree() {
             .iter()
             .any(|branch| branch.name.0 == "origin/main" && branch.head.0 == new_head)
     );
+}
+
+#[test]
+fn remote_management_adds_a_shared_url_and_sets_branch_upstream() {
+    let repo = repository();
+    fs::write(repo.path().join("tracked.txt"), "content\n").unwrap();
+    let local_head = commit_all(repo.path(), "initial");
+
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare", "-b", "main"]);
+    let remote_url = remote.path().to_string_lossy().into_owned();
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    app.dispatch(Action::OpenRemotes);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.screen, Screen::Remotes);
+    assert_eq!(app.state.focus, FocusPanel::RemoteList);
+    assert!(app.state.remotes.is_empty());
+
+    app.dispatch(Action::OpenAddRemoteEditor);
+    app.dispatch(Action::UpdateRemoteName("origin".into()));
+    app.dispatch(Action::SubmitRemoteEditor);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::EditingRemote {
+            field: pitui::app::RemoteInputField::Url,
+            ..
+        }
+    ));
+    app.dispatch(Action::UpdateRemoteUrl(remote_url.clone()));
+    app.dispatch(Action::SubmitRemoteEditor);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::Confirming {
+            dialog: pitui::app::ConfirmDialog::AddRemote {
+                ref name,
+                ref url,
+                ..
+            }
+        } if name == "origin" && url == &remote_url
+    ));
+    app.dispatch(Action::Confirm);
+    wait_until_idle(&mut app);
+
+    assert_eq!(app.state.remotes.len(), 1);
+    let origin = &app.state.remotes[0];
+    assert_eq!(origin.name, "origin");
+    assert_eq!(origin.fetch_urls, vec![remote_url.clone()]);
+    assert_eq!(origin.push_urls, origin.fetch_urls);
+    assert!(origin.urls_match());
+    assert!(!origin.is_upstream);
+
+    app.dispatch(Action::OpenSetUpstreamRemoteDialog);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::Confirming {
+            dialog: pitui::app::ConfirmDialog::SetUpstreamRemote {
+                ref name,
+                ref branch,
+                ..
+            }
+        } if name == "origin" && branch.0 == "main"
+    ));
+    app.dispatch(Action::Confirm);
+    wait_until_idle(&mut app);
+
+    let origin = &app.state.remotes[0];
+    assert!(origin.is_upstream);
+    assert!(origin.is_push_target);
+    assert_eq!(
+        git(repo.path(), &["config", "--get", "branch.main.remote"]),
+        "origin"
+    );
+    assert_eq!(
+        git(repo.path(), &["config", "--get", "branch.main.pushRemote"]),
+        "origin"
+    );
+    assert_eq!(
+        git(repo.path(), &["config", "--get", "branch.main.merge"]),
+        "refs/heads/main"
+    );
+
+    app.dispatch(Action::Back);
+    app.dispatch(Action::OpenPushDialog);
+    app.dispatch(Action::Confirm);
+    wait_until_idle(&mut app);
+    assert_eq!(
+        git(remote.path(), &["rev-parse", "refs/heads/main"]),
+        local_head
+    );
+}
+
+#[test]
+fn remote_policy_blocks_split_urls_and_split_branch_routing_until_repaired() {
+    let repo = repository();
+    fs::write(repo.path().join("tracked.txt"), "content\n").unwrap();
+    let local_head = commit_all(repo.path(), "initial");
+
+    let fetch_remote = tempfile::tempdir().unwrap();
+    git(fetch_remote.path(), &["init", "--bare", "-b", "main"]);
+    let push_remote = tempfile::tempdir().unwrap();
+    git(push_remote.path(), &["init", "--bare", "-b", "main"]);
+    let fetch_url = fetch_remote.path().to_string_lossy().into_owned();
+    let push_url = push_remote.path().to_string_lossy().into_owned();
+    git(repo.path(), &["remote", "add", "origin", &fetch_url]);
+    git(
+        repo.path(),
+        &["config", "--add", "remote.origin.pushurl", &push_url],
+    );
+
+    let loaded = execute_request(repo.path(), GitRequest::LoadRemotes);
+    let GitResponse::RemotesLoaded(remotes) = loaded else {
+        panic!("unexpected remote response: {loaded:?}");
+    };
+    assert_eq!(remotes.len(), 1);
+    assert_eq!(remotes[0].fetch_urls, vec![fetch_url.clone()]);
+    assert_eq!(remotes[0].push_urls, vec![push_url]);
+    assert!(!remotes[0].urls_match());
+
+    for request in [GitRequest::Fetch, GitRequest::PullRebase, GitRequest::Push] {
+        match execute_request(repo.path(), request) {
+            GitResponse::CommandFailed { stderr, .. } => {
+                assert!(stderr.contains("identical fetch and push URLs"));
+            }
+            response => panic!("split URL operation should be blocked, got {response:?}"),
+        }
+    }
+    assert!(!git_may_fail(
+        push_remote.path(),
+        &["rev-parse", "refs/heads/main"]
+    ));
+
+    assert!(matches!(
+        execute_request(
+            repo.path(),
+            GitRequest::SetRemoteUrl {
+                name: "origin".into(),
+                url: fetch_url.clone(),
+            }
+        ),
+        GitResponse::CommandSucceeded { .. }
+    ));
+    assert!(!git_may_fail(
+        repo.path(),
+        &["config", "--get-all", "remote.origin.pushurl"]
+    ));
+    let GitResponse::RemotesLoaded(remotes) = execute_request(repo.path(), GitRequest::LoadRemotes)
+    else {
+        panic!("repaired remote should load");
+    };
+    assert!(remotes[0].urls_match());
+
+    git(repo.path(), &["remote", "add", "mirror", &fetch_url]);
+    git(repo.path(), &["config", "branch.main.remote", "origin"]);
+    git(
+        repo.path(),
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+    git(repo.path(), &["config", "branch.main.pushRemote", "mirror"]);
+    match execute_request(repo.path(), GitRequest::Push) {
+        GitResponse::CommandFailed { stderr, .. } => {
+            assert!(stderr.contains("fetches from `origin` but pushes to `mirror`"));
+        }
+        response => panic!("split branch routing should be blocked, got {response:?}"),
+    }
+
+    assert!(matches!(
+        execute_request(
+            repo.path(),
+            GitRequest::SetUpstreamRemote {
+                name: "origin".into(),
+            }
+        ),
+        GitResponse::CommandSucceeded { .. }
+    ));
+    assert!(matches!(
+        execute_request(repo.path(), GitRequest::Push),
+        GitResponse::CommandSucceeded { .. }
+    ));
+    assert_eq!(
+        git(fetch_remote.path(), &["rev-parse", "refs/heads/main"]),
+        local_head
+    );
+}
+
+#[test]
+fn repository_pull_rebases_local_commits_and_pushes_current_branch() {
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare", "-b", "main"]);
+    let remote_path = remote.path().to_string_lossy().into_owned();
+
+    let source = repository();
+    fs::write(source.path().join("base.txt"), "base\n").unwrap();
+    commit_all(source.path(), "remote base");
+    git(source.path(), &["remote", "add", "origin", &remote_path]);
+    git(source.path(), &["push", "-u", "origin", "main"]);
+
+    let clone_parent = tempfile::tempdir().unwrap();
+    git(clone_parent.path(), &["clone", &remote_path, "sync-target"]);
+    let target = clone_parent.path().join("sync-target");
+    git(&target, &["config", "user.name", "Pitui Test"]);
+    git(&target, &["config", "user.email", "pitui@example.invalid"]);
+
+    fs::write(target.join("local.txt"), "local\n").unwrap();
+    let local_before_rebase = commit_all(&target, "local ahead");
+    fs::write(source.path().join("remote.txt"), "remote\n").unwrap();
+    let remote_head = commit_all(source.path(), "remote ahead");
+    git(source.path(), &["push", "origin", "main"]);
+
+    let mut app = app_for(&[&target]);
+    wait_until_idle(&mut app);
+    app.dispatch(Action::OpenPullRebaseDialog);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::Confirming {
+            dialog: pitui::app::ConfirmDialog::PullRebaseRepository {
+                repository_index: 0,
+                ref branch,
+            }
+        } if branch.0 == "main"
+    ));
+    app.dispatch(Action::Confirm);
+    wait_until_idle(&mut app);
+
+    let rebased_head = git(&target, &["rev-parse", "HEAD"]);
+    assert_ne!(rebased_head, local_before_rebase);
+    assert_eq!(git(&target, &["rev-parse", "HEAD^"]), remote_head);
+    assert_eq!(git(&target, &["log", "-1", "--format=%s"]), "local ahead");
+    assert!(
+        git(
+            &target,
+            &["rev-list", "--merges", &format!("{remote_head}..HEAD")]
+        )
+        .is_empty()
+    );
+    assert_eq!(app.state.mode, GlobalMode::Normal);
+
+    let repository_index = repository_tree_index(&app, 0);
+    app.dispatch(Action::SelectBranch(repository_index));
+    app.dispatch(Action::OpenPushDialog);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::Confirming {
+            dialog: pitui::app::ConfirmDialog::PushRepository {
+                repository_index: 0,
+                ref branch,
+            }
+        } if branch.0 == "main"
+    ));
+    app.dispatch(Action::Confirm);
+    wait_until_idle(&mut app);
+
+    assert_eq!(
+        git(remote.path(), &["rev-parse", "refs/heads/main"]),
+        rebased_head
+    );
+    assert_eq!(app.state.last_message.as_deref(), Some("Push completed"));
+}
+
+#[test]
+fn pull_rebase_refuses_dirty_state_before_contacting_a_remote() {
+    let repo = repository();
+    fs::write(repo.path().join("tracked.txt"), "base\n").unwrap();
+    let head = commit_all(repo.path(), "base");
+    fs::write(repo.path().join("tracked.txt"), "dirty\n").unwrap();
+
+    match execute_request(repo.path(), GitRequest::PullRebase) {
+        GitResponse::CommandFailed { command, stderr } => {
+            assert_eq!(command, "git pull --rebase");
+            assert!(stderr.contains("clean working tree"));
+        }
+        response => panic!("dirty pull --rebase should be rejected, got {response:?}"),
+    }
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    app.dispatch(Action::OpenPullRebaseDialog);
+    assert!(matches!(app.state.mode, GlobalMode::Error));
+    assert!(
+        app.state
+            .last_error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("clean working tree")
+    );
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+        "dirty\n"
+    );
+}
+
+#[test]
+fn pull_rebase_conflict_is_reported_and_automatically_aborted() {
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare", "-b", "main"]);
+    let remote_path = remote.path().to_string_lossy().into_owned();
+
+    let source = repository();
+    fs::write(source.path().join("conflict.txt"), "base\n").unwrap();
+    commit_all(source.path(), "remote base");
+    git(source.path(), &["remote", "add", "origin", &remote_path]);
+    git(source.path(), &["push", "-u", "origin", "main"]);
+
+    let clone_parent = tempfile::tempdir().unwrap();
+    git(
+        clone_parent.path(),
+        &["clone", &remote_path, "conflict-target"],
+    );
+    let target = clone_parent.path().join("conflict-target");
+    git(&target, &["config", "user.name", "Pitui Test"]);
+    git(&target, &["config", "user.email", "pitui@example.invalid"]);
+
+    fs::write(target.join("conflict.txt"), "local\n").unwrap();
+    let local_head = commit_all(&target, "local conflict");
+    fs::write(source.path().join("conflict.txt"), "remote\n").unwrap();
+    let remote_head = commit_all(source.path(), "remote conflict");
+    git(source.path(), &["push", "origin", "main"]);
+
+    let mut app = app_for(&[&target]);
+    wait_until_idle(&mut app);
+    app.dispatch(Action::OpenPullRebaseDialog);
+    app.dispatch(Action::Confirm);
+    wait_until_idle(&mut app);
+
+    assert!(matches!(app.state.mode, GlobalMode::Error));
+    let error = app.state.last_error.as_ref().unwrap();
+    assert_eq!(error.command, "git pull --rebase");
+    assert!(error.message.contains("Pull --rebase stopped"));
+    assert!(
+        error
+            .message
+            .contains("automatically ran `git rebase --abort`")
+    );
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), local_head);
+    assert_eq!(
+        fs::read_to_string(target.join("conflict.txt")).unwrap(),
+        "local\n"
+    );
+    assert!(git(&target, &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        git(&target, &["rev-parse", "refs/remotes/origin/main"]),
+        remote_head
+    );
+    assert!(!target.join(".git/rebase-merge").exists());
+    assert!(!target.join(".git/rebase-apply").exists());
 }
 
 #[test]

@@ -317,6 +317,7 @@ pub(crate) fn operation_log(request: &GitRequest) -> OperationLog {
     let (name, details) = match request {
         GitRequest::LoadRepositoryStatus => ("load_repository_status", String::new()),
         GitRequest::LoadBranches => ("load_branches", String::new()),
+        GitRequest::LoadRemotes => ("load_remotes", String::new()),
         GitRequest::LoadCommits { branch, limit } => {
             ("load_commits", format!("branch={} limit={limit}", branch.0))
         }
@@ -364,6 +365,11 @@ pub(crate) fn operation_log(request: &GitRequest) -> OperationLog {
         GitRequest::UnstagePaths { paths } => ("unstage_paths", path_list(paths)),
         GitRequest::Commit { message } => ("commit", format!("message_bytes={}", message.len())),
         GitRequest::Fetch => ("fetch", String::new()),
+        GitRequest::PullRebase => ("pull_rebase", String::from("strategy=rebase")),
+        GitRequest::Push => ("push", String::new()),
+        GitRequest::AddRemote { name, .. } => ("add_remote", format!("remote={name}")),
+        GitRequest::SetRemoteUrl { name, .. } => ("set_remote_url", format!("remote={name}")),
+        GitRequest::SetUpstreamRemote { name } => ("set_upstream_remote", format!("remote={name}")),
         GitRequest::SwitchBranch { branch } => ("switch_branch", format!("branch={}", branch.0)),
         GitRequest::CherryPick { commits } => (
             "cherry_pick",
@@ -405,6 +411,19 @@ fn response_log(response: &GitResponse, operation: &str) -> (&'static str, &'sta
         GitResponse::BranchesLoaded(branches) => {
             ("INFO", "success", format!("branches={}", branches.len()))
         }
+        GitResponse::RemotesLoaded(remotes) => (
+            "INFO",
+            "success",
+            format!(
+                "remotes={} inconsistent={} upstream={}",
+                remotes.len(),
+                remotes.iter().filter(|remote| !remote.urls_match()).count(),
+                remotes
+                    .iter()
+                    .find(|remote| remote.is_upstream)
+                    .map_or("none", |remote| remote.name.as_str())
+            ),
+        ),
         GitResponse::CommitsLoaded { branch, commits } => (
             "INFO",
             "success",
@@ -447,10 +466,11 @@ fn response_log(response: &GitResponse, operation: &str) -> (&'static str, &'sta
         ),
         GitResponse::CommandSucceeded { .. } => ("INFO", "success", String::new()),
         GitResponse::CommandFailed { command, stderr } => {
-            let command = if operation == "commit" {
-                "git commit <redacted>"
-            } else {
-                command
+            let command = match operation {
+                "commit" => "git commit <redacted>",
+                "add_remote" => "git remote add <name> <redacted-url>",
+                "set_remote_url" => "git remote set-url <name> <redacted-url>",
+                _ => command,
             };
             (
                 "ERROR",
@@ -603,6 +623,17 @@ mod tests {
             GitRequest::Commit {
                 message: "do not log me".into(),
             },
+            GitRequest::AddRemote {
+                name: "origin".into(),
+                url: "https://user:secret@example.invalid/repo.git".into(),
+            },
+            GitRequest::SetRemoteUrl {
+                name: "origin".into(),
+                url: "ssh://secret.example.invalid/repo.git".into(),
+            },
+            GitRequest::SetUpstreamRemote {
+                name: "origin".into(),
+            },
         ];
         let logs = requests.iter().map(operation_log).collect::<Vec<_>>();
         assert_eq!(logs[0].name, "stage_paths");
@@ -610,5 +641,9 @@ mod tests {
         assert_eq!(logs[2].name, "commit");
         assert_eq!(logs[2].details, "message_bytes=13");
         assert!(!logs[2].details.contains("do not log me"));
+        assert_eq!(logs[3].details, "remote=origin");
+        assert_eq!(logs[4].details, "remote=origin");
+        assert_eq!(logs[5].details, "remote=origin");
+        assert!(logs.iter().all(|log| !log.details.contains("secret")));
     }
 }

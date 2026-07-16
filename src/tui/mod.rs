@@ -104,7 +104,11 @@ pub fn run(mut app: App) -> Result<(), Box<dyn Error>> {
     while !app.should_quit() {
         app.poll_git();
         if last_tick.elapsed() >= TICK_RATE {
-            app.dispatch(Action::Tick);
+            // Tick only animates an operation that is already pending. It must
+            // never act as a repository polling timer.
+            if app.state.is_loading() {
+                app.dispatch(Action::Tick);
+            }
             last_tick = Instant::now();
         }
 

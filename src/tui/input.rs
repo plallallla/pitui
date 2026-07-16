@@ -1,6 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::app::{Action, AppState, FocusPanel, GlobalMode, Screen};
+use crate::app::{
+    Action, AppState, FocusPanel, GlobalMode, RemoteEditKind, RemoteInputField, Screen,
+    ShortcutMenu,
+};
 
 pub fn map_key(app: &AppState, event: KeyEvent) -> Option<Action> {
     if !matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -13,8 +16,17 @@ pub fn map_key(app: &AppState, event: KeyEvent) -> Option<Action> {
         return Some(Action::ToggleChanges);
     }
     if event.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(event.code, KeyCode::Char('r') | KeyCode::Char('R'))
+        && matches!(app.mode, GlobalMode::Normal)
+    {
+        return Some(Action::RefreshRepository);
+    }
+    if event.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(event.code, KeyCode::Char('c') | KeyCode::Char('C'))
     {
+        if matches!(app.mode, GlobalMode::Shortcut { .. }) {
+            return Some(Action::Cancel);
+        }
         let can_copy_commit = matches!(app.mode, GlobalMode::Normal)
             && app.selected_commit().is_some()
             && matches!(
@@ -22,15 +34,7 @@ pub fn map_key(app: &AppState, event: KeyEvent) -> Option<Action> {
                 Screen::BranchOverview | Screen::CommitDetail | Screen::FileDiffDetail
             );
         if can_copy_commit {
-            return Some(if event.modifiers.contains(KeyModifiers::ALT) {
-                Action::CopyCurrentCommitMessage
-            } else if event.modifiers.contains(KeyModifiers::SHIFT)
-                || matches!(event.code, KeyCode::Char('C'))
-            {
-                Action::CopyCurrentCommitInfo
-            } else {
-                Action::CopySelectedCommitHashes
-            });
+            return Some(Action::OpenCommitCopyShortcuts);
         }
         return Some(Action::Quit);
     }
@@ -53,11 +57,80 @@ pub fn map_key(app: &AppState, event: KeyEvent) -> Option<Action> {
         },
         GlobalMode::TypingConfirmation { input, .. } => map_typed_confirmation(event, input),
         GlobalMode::EditingCommitMessage { input, .. } => map_commit_message(event, input),
+        GlobalMode::EditingRemote {
+            kind,
+            field,
+            name,
+            url,
+            ..
+        } => map_remote_editor(event, kind, *field, name, url),
+        GlobalMode::Shortcut {
+            menu: ShortcutMenu::CommitCopy,
+        } => map_commit_copy_shortcut(event),
         GlobalMode::Error => match event.code {
             KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => Some(Action::DismissError),
             _ => None,
         },
         GlobalMode::Normal => map_normal(event, app),
+    }
+}
+
+fn map_remote_editor(
+    event: KeyEvent,
+    kind: &RemoteEditKind,
+    field: RemoteInputField,
+    name: &str,
+    url: &str,
+) -> Option<Action> {
+    match event.code {
+        KeyCode::Char(character)
+            if !event
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            match field {
+                RemoteInputField::Name if matches!(kind, RemoteEditKind::Add) => {
+                    let mut input = name.to_string();
+                    input.push(character);
+                    Some(Action::UpdateRemoteName(input))
+                }
+                RemoteInputField::Url => {
+                    let mut input = url.to_string();
+                    input.push(character);
+                    Some(Action::UpdateRemoteUrl(input))
+                }
+                RemoteInputField::Name => None,
+            }
+        }
+        KeyCode::Backspace => match field {
+            RemoteInputField::Name if matches!(kind, RemoteEditKind::Add) => {
+                let mut input = name.to_string();
+                input.pop();
+                Some(Action::UpdateRemoteName(input))
+            }
+            RemoteInputField::Url => {
+                let mut input = url.to_string();
+                input.pop();
+                Some(Action::UpdateRemoteUrl(input))
+            }
+            RemoteInputField::Name => None,
+        },
+        KeyCode::Tab | KeyCode::BackTab if matches!(kind, RemoteEditKind::Add) => {
+            Some(Action::FocusNextRemoteField)
+        }
+        KeyCode::Enter => Some(Action::SubmitRemoteEditor),
+        KeyCode::Esc => Some(Action::Cancel),
+        _ => None,
+    }
+}
+
+fn map_commit_copy_shortcut(event: KeyEvent) -> Option<Action> {
+    match event.code {
+        KeyCode::Char('h' | 'H') => Some(Action::CopySelectedCommitHashes),
+        KeyCode::Char('i' | 'I') => Some(Action::CopyCurrentCommitInfo),
+        KeyCode::Char('m' | 'M') => Some(Action::CopyCurrentCommitMessage),
+        KeyCode::Esc | KeyCode::Char('q' | 'Q') => Some(Action::Cancel),
+        _ => None,
     }
 }
 
@@ -133,7 +206,6 @@ fn map_normal(event: KeyEvent, app: &AppState) -> Option<Action> {
         KeyCode::Tab => Some(Action::FocusNext),
         KeyCode::BackTab => Some(Action::FocusPrev),
         KeyCode::Esc => Some(Action::Back),
-        KeyCode::Char('r') => Some(Action::RefreshRepository),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::MoveUp),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::MoveDown),
         KeyCode::Left | KeyCode::Char('h') => Some(Action::MoveLeft),
@@ -157,10 +229,23 @@ fn map_normal(event: KeyEvent, app: &AppState) -> Option<Action> {
         {
             Some(Action::OpenFetchRepositoryDialog)
         }
+        (Screen::BranchOverview, FocusPanel::BranchList, KeyCode::Char('p'))
+            if app.selected_repository_node_index().is_some() =>
+        {
+            Some(Action::OpenPullRebaseDialog)
+        }
+        (Screen::BranchOverview, FocusPanel::BranchList, KeyCode::Char('P'))
+            if app.selected_repository_node_index().is_some() =>
+        {
+            Some(Action::OpenPushDialog)
+        }
         (Screen::BranchOverview, FocusPanel::BranchList, KeyCode::Char('g'))
             if app.selected_repository_node_index().is_some() =>
         {
             Some(Action::OpenReflog)
+        }
+        (Screen::BranchOverview, FocusPanel::BranchList, KeyCode::Char('o')) => {
+            Some(Action::OpenRemotes)
         }
         (Screen::BranchOverview, FocusPanel::BranchList, KeyCode::Char('s')) => {
             Some(Action::OpenSwitchBranchDialog)
@@ -178,18 +263,6 @@ fn map_normal(event: KeyEvent, app: &AppState) -> Option<Action> {
         (Screen::BranchOverview, FocusPanel::CommitList, KeyCode::Char(' '))
         | (Screen::CommitDetail, FocusPanel::CommitList, KeyCode::Char(' ')) => {
             Some(Action::ToggleCommitCopySelection)
-        }
-        (Screen::BranchOverview, FocusPanel::CommitList, KeyCode::Char('c'))
-        | (Screen::CommitDetail, FocusPanel::CommitList, KeyCode::Char('c')) => {
-            Some(Action::CopySelectedCommitHashes)
-        }
-        (Screen::BranchOverview, FocusPanel::CommitList, KeyCode::Char('i'))
-        | (Screen::CommitDetail, FocusPanel::CommitList, KeyCode::Char('i')) => {
-            Some(Action::CopyCurrentCommitInfo)
-        }
-        (Screen::BranchOverview, FocusPanel::CommitList, KeyCode::Char('m'))
-        | (Screen::CommitDetail, FocusPanel::CommitList, KeyCode::Char('m')) => {
-            Some(Action::CopyCurrentCommitMessage)
         }
         (Screen::BranchOverview, FocusPanel::CommitList, KeyCode::Char('/')) => {
             Some(Action::StartFilter)
@@ -213,12 +286,6 @@ fn map_normal(event: KeyEvent, app: &AppState) -> Option<Action> {
         (Screen::CommitDetail, FocusPanel::CommitFileList, KeyCode::Char(' ')) => {
             Some(Action::ToggleFileExpanded)
         }
-        (Screen::CommitDetail, FocusPanel::CommitFileList, KeyCode::Char('i')) => {
-            Some(Action::CopyCurrentCommitInfo)
-        }
-        (Screen::CommitDetail, FocusPanel::CommitFileList, KeyCode::Char('m')) => {
-            Some(Action::CopyCurrentCommitMessage)
-        }
         (Screen::CommitDetail, FocusPanel::CommitFileList, KeyCode::Enter)
         | (Screen::CommitDetail, FocusPanel::CommitFileList, KeyCode::Char('v'))
         | (Screen::FileDiffDetail, FocusPanel::FileList, KeyCode::Enter) => {
@@ -228,7 +295,6 @@ fn map_normal(event: KeyEvent, app: &AppState) -> Option<Action> {
         (Screen::FileDiffDetail, _, KeyCode::Char('p')) => Some(Action::PrevFile),
         (Screen::FileDiffDetail, _, KeyCode::Char('v')) => Some(Action::ToggleDiffMode),
         (Screen::FileDiffDetail, _, KeyCode::Char('w')) => Some(Action::ToggleWrap),
-        (Screen::FileDiffDetail, _, KeyCode::Char('m')) => Some(Action::CopyCurrentCommitMessage),
         (Screen::Reflog, FocusPanel::ReflogList, KeyCode::Char('R')) => {
             Some(Action::OpenResetDialog)
         }
@@ -241,6 +307,19 @@ fn map_normal(event: KeyEvent, app: &AppState) -> Option<Action> {
         (Screen::Changes, _, KeyCode::Char('c')) => Some(Action::OpenCommitDialog),
         (Screen::Changes, _, KeyCode::Char('v')) => Some(Action::ToggleDiffMode),
         (Screen::Changes, _, KeyCode::Char('w')) => Some(Action::ToggleWrap),
+        (Screen::Remotes, FocusPanel::RemoteList, KeyCode::Char('a')) => {
+            Some(Action::OpenAddRemoteEditor)
+        }
+        (Screen::Remotes, FocusPanel::RemoteList, KeyCode::Char('e'))
+            if app.selected_remote().is_some() =>
+        {
+            Some(Action::OpenSetRemoteUrlEditor)
+        }
+        (Screen::Remotes, FocusPanel::RemoteList, KeyCode::Char('u'))
+            if app.selected_remote().is_some() =>
+        {
+            Some(Action::OpenSetUpstreamRemoteDialog)
+        }
         _ => None,
     }
 }
@@ -254,7 +333,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_global_exit_and_refresh() {
+    fn maps_global_exit() {
         let state = AppState::default();
         assert_eq!(
             map_key(
@@ -263,13 +342,66 @@ mod tests {
             ),
             Some(Action::Quit)
         );
-        assert_eq!(
-            map_key(
-                &state,
-                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)
-            ),
-            Some(Action::RefreshRepository)
-        );
+    }
+
+    #[test]
+    fn ctrl_r_refreshes_from_every_normal_screen_but_plain_r_is_unbound() {
+        for screen in [
+            Screen::BranchOverview,
+            Screen::CommitDetail,
+            Screen::FileDiffDetail,
+            Screen::Reflog,
+            Screen::Changes,
+            Screen::Remotes,
+        ] {
+            let state = AppState {
+                screen,
+                ..AppState::default()
+            };
+            assert_eq!(
+                map_key(
+                    &state,
+                    KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)
+                ),
+                Some(Action::RefreshRepository)
+            );
+            assert_eq!(
+                map_key(
+                    &state,
+                    KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn file_detail_panels_map_home_end_and_page_navigation() {
+        for (screen, focus) in [
+            (Screen::CommitDetail, FocusPanel::CommitFileList),
+            (Screen::FileDiffDetail, FocusPanel::FileList),
+            (Screen::FileDiffDetail, FocusPanel::DiffView),
+            (Screen::Changes, FocusPanel::ChangesTree),
+            (Screen::Changes, FocusPanel::ChangesDiff),
+        ] {
+            let state = AppState {
+                screen,
+                focus,
+                ..AppState::default()
+            };
+            for (key, action) in [
+                (KeyCode::Home, Action::Home),
+                (KeyCode::End, Action::End),
+                (KeyCode::PageUp, Action::PageUp),
+                (KeyCode::PageDown, Action::PageDown),
+            ] {
+                assert_eq!(
+                    map_key(&state, KeyEvent::new(key, KeyModifiers::NONE)),
+                    Some(action),
+                    "missing {key:?} mapping for {screen:?}/{focus:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -311,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_node_maps_fetch_and_reflog() {
+    fn repository_node_maps_fetch_pull_push_reflog_and_remotes() {
         let state = AppState::with_repository_paths(vec![PathBuf::from("/repo")]);
         assert_eq!(
             map_key(
@@ -323,9 +455,30 @@ mod tests {
         assert_eq!(
             map_key(
                 &state,
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)
+            ),
+            Some(Action::OpenPullRebaseDialog)
+        );
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT)
+            ),
+            Some(Action::OpenPushDialog)
+        );
+        assert_eq!(
+            map_key(
+                &state,
                 KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)
             ),
             Some(Action::OpenReflog)
+        );
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)
+            ),
+            Some(Action::OpenRemotes)
         );
     }
 
@@ -337,6 +490,7 @@ mod tests {
             Screen::FileDiffDetail,
             Screen::Reflog,
             Screen::Changes,
+            Screen::Remotes,
         ] {
             let state = AppState {
                 screen,
@@ -350,6 +504,67 @@ mod tests {
                 Some(Action::ToggleChanges)
             );
         }
+    }
+
+    #[test]
+    fn remote_management_maps_add_edit_upstream_and_two_field_input() {
+        let mut state = AppState {
+            screen: Screen::Remotes,
+            focus: FocusPanel::RemoteList,
+            remotes: vec![crate::domain::RemoteInfo {
+                name: "origin".into(),
+                fetch_urls: vec!["ssh://example/repo.git".into()],
+                push_urls: vec!["ssh://example/repo.git".into()],
+                is_upstream: false,
+                is_push_target: false,
+            }],
+            ..AppState::default()
+        };
+        state.ensure_valid_remote_selection();
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)
+            ),
+            Some(Action::OpenAddRemoteEditor)
+        );
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)
+            ),
+            Some(Action::OpenSetRemoteUrlEditor)
+        );
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)
+            ),
+            Some(Action::OpenSetUpstreamRemoteDialog)
+        );
+
+        state.mode = GlobalMode::EditingRemote {
+            kind: RemoteEditKind::Add,
+            field: RemoteInputField::Name,
+            name: "origi".into(),
+            url: String::new(),
+            validation_error: None,
+        };
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)
+            ),
+            Some(Action::UpdateRemoteName("origin".into()))
+        );
+        assert_eq!(
+            map_key(&state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(Action::FocusNextRemoteField)
+        );
+        assert_eq!(
+            map_key(&state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::SubmitRemoteEditor)
+        );
     }
 
     #[test]
@@ -380,15 +595,30 @@ mod tests {
                 &state,
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
             ),
+            Some(Action::OpenCommitCopyShortcuts)
+        );
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)
+            ),
+            None
+        );
+
+        state.mode = GlobalMode::Shortcut {
+            menu: ShortcutMenu::CommitCopy,
+        };
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)
+            ),
             Some(Action::CopySelectedCommitHashes)
         );
         assert_eq!(
             map_key(
                 &state,
-                KeyEvent::new(
-                    KeyCode::Char('C'),
-                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
-                )
+                KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)
             ),
             Some(Action::CopyCurrentCommitInfo)
         );
@@ -402,12 +632,9 @@ mod tests {
         assert_eq!(
             map_key(
                 &state,
-                KeyEvent::new(
-                    KeyCode::Char('c'),
-                    KeyModifiers::CONTROL | KeyModifiers::ALT
-                )
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
             ),
-            Some(Action::CopyCurrentCommitMessage)
+            Some(Action::Cancel)
         );
     }
 

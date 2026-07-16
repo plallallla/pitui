@@ -2,7 +2,6 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::mpsc::TryRecvError,
-    time::{Duration, Instant},
 };
 
 use crate::{
@@ -16,7 +15,7 @@ use crate::{
 use super::{
     Action, AppError, AppState, BranchTreeNode, ChangeGroup, ChangeSelection, ChangesTreeNode,
     CommandKind, ConfirmDialog, DiffViewMode, FilterTarget, FocusPanel, GlobalMode, PendingJobKind,
-    Screen,
+    RemoteEditKind, RemoteInputField, Screen, ShortcutMenu,
 };
 
 const PAGE_SIZE: usize = 10;
@@ -27,8 +26,6 @@ pub struct App {
     pub state: AppState,
     bus: GitCommandBus,
     should_quit: bool,
-    last_status_refresh: Instant,
-    status_refresh_interval: Duration,
 }
 
 impl App {
@@ -44,8 +41,6 @@ impl App {
             state,
             bus,
             should_quit: false,
-            last_status_refresh: Instant::now(),
-            status_refresh_interval: Duration::from_secs(2),
         };
         app.refresh_all_repositories();
         app
@@ -129,7 +124,6 @@ impl App {
         {
             repository.latest_status_job = Some(id);
         }
-        self.last_status_refresh = Instant::now();
     }
 
     fn refresh_repository(&mut self, repository_index: usize) {
@@ -150,6 +144,16 @@ impl App {
         ) && let Some(repository) = self.state.repositories.get_mut(repository_index)
         {
             repository.latest_branches_job = Some(id);
+        }
+    }
+
+    fn submit_remotes(&mut self, repository_index: usize) {
+        if let Some(id) = self.submit(
+            repository_index,
+            GitRequest::LoadRemotes,
+            PendingJobKind::Remotes { repository_index },
+        ) {
+            self.state.latest_remotes_job = Some(id);
         }
     }
 
@@ -303,6 +307,12 @@ impl App {
                 .repositories
                 .get(repository_index)
                 .is_none_or(|repository| repository.latest_branches_job != Some(id)),
+            PendingJobKind::Remotes { .. } => {
+                self.state.latest_remotes_job != Some(id)
+                    || self.state.active_repository_index != Some(repository_index)
+                    || self.state.remotes_repository_index != Some(repository_index)
+                    || self.state.screen != Screen::Remotes
+            }
             PendingJobKind::Commits { .. } => {
                 self.state.latest_commits_job != Some(id)
                     || self.state.active_repository_index != Some(repository_index)
@@ -365,6 +375,9 @@ impl App {
                 {
                     repository.latest_branches_job = None;
                 }
+            }
+            PendingJobKind::Remotes { .. } if self.state.latest_remotes_job == Some(id) => {
+                self.state.latest_remotes_job = None;
             }
             PendingJobKind::Commits { .. } if self.state.latest_commits_job == Some(id) => {
                 self.state.latest_commits_job = None;
@@ -518,7 +531,6 @@ impl App {
                     state.ensure_current_branch_visible();
                 }
                 self.restore_tree_selection(identity);
-                self.last_status_refresh = Instant::now();
                 if full_refresh {
                     self.submit_branches(repository_index);
                     self.load_active_repository_commits(repository_index);
@@ -532,6 +544,28 @@ impl App {
                     repository.ensure_current_branch_visible();
                 }
                 self.restore_tree_selection(identity);
+            }
+            GitResponse::RemotesLoaded(remotes) => {
+                let selected_name = self
+                    .state
+                    .selected_remote()
+                    .map(|remote| remote.name.clone());
+                self.state.remotes_repository_index = Some(repository_index);
+                self.state.remotes = remotes;
+                self.state.selection.selected_remote_index = selected_name.and_then(|name| {
+                    self.state
+                        .remotes
+                        .iter()
+                        .position(|remote| remote.name == name)
+                });
+                self.state.ensure_valid_remote_selection();
+                self.state.screen = Screen::Remotes;
+                if self.state.focus != FocusPanel::Popup {
+                    self.state.focus = FocusPanel::RemoteList;
+                }
+                if let Some(repository) = self.state.repositories.get_mut(repository_index) {
+                    repository.last_error = None;
+                }
             }
             GitResponse::CommitsLoaded { branch, commits } => {
                 let available_hashes = commits
@@ -706,7 +740,10 @@ impl App {
                     self.state.cherry_pick_queue.clear();
                     self.state.cherry_pick_queue_repository_index = None;
                 }
-                if matches!(command_kind, Some(CommandKind::Reset | CommandKind::Rebase)) {
+                if matches!(
+                    command_kind,
+                    Some(CommandKind::Reset | CommandKind::Rebase | CommandKind::PullRebase)
+                ) {
                     self.state.cherry_pick_queue.clear();
                     self.state.cherry_pick_queue_repository_index = None;
                 }
@@ -724,6 +761,14 @@ impl App {
                     self.state.current_changes_diff = None;
                     self.state.current_changes_diff_group = None;
                 }
+                let remote_command = matches!(
+                    command_kind,
+                    Some(
+                        CommandKind::AddRemote
+                            | CommandKind::SetRemoteUrl
+                            | CommandKind::SetUpstreamRemote
+                    )
+                );
                 if let Some(repository) = self.state.repositories.get_mut(repository_index) {
                     repository.last_error = None;
                 }
@@ -735,12 +780,29 @@ impl App {
                 {
                     self.submit_changes(repository_index);
                 }
+                if remote_command
+                    && self.state.screen == Screen::Remotes
+                    && self.state.remotes_repository_index == Some(repository_index)
+                {
+                    self.submit_remotes(repository_index);
+                }
             }
             GitResponse::RebaseConflictAborted { command, stderr } => {
+                let operation = if matches!(
+                    kind,
+                    PendingJobKind::Command {
+                        kind: CommandKind::PullRebase,
+                        ..
+                    }
+                ) {
+                    "Pull --rebase"
+                } else {
+                    "Rebase"
+                };
                 self.state.set_error(
                     command,
                     format!(
-                        "Rebase stopped because of conflicts. Pitui automatically ran `git rebase --abort`; the original branch and working tree were restored.\n\n{stderr}"
+                        "{operation} stopped because of conflicts. Pitui automatically ran `git rebase --abort`; the original branch and working tree were restored.\n\n{stderr}"
                     ),
                 );
                 self.refresh_repository(repository_index);
@@ -780,6 +842,8 @@ impl App {
                 self.dispatch_dialog(action)
             }
             GlobalMode::EditingCommitMessage { .. } => self.dispatch_commit_message(action),
+            GlobalMode::EditingRemote { .. } => self.dispatch_remote_editor(action),
+            GlobalMode::Shortcut { .. } => self.dispatch_shortcut_menu(action),
             GlobalMode::Error => match action {
                 Action::DismissError | Action::Cancel | Action::Back | Action::Confirm => {
                     self.state.dismiss_error();
@@ -792,15 +856,6 @@ impl App {
 
     fn on_tick(&mut self) {
         self.state.tick_count = self.state.tick_count.wrapping_add(1);
-        let Some(repository_index) = self.state.active_repository_index else {
-            return;
-        };
-        if self.state.repository(repository_index).is_some()
-            && self.last_status_refresh.elapsed() >= self.status_refresh_interval
-            && !self.state.has_pending_status(repository_index)
-        {
-            self.submit_status(repository_index, false);
-        }
     }
 
     fn dispatch_filtering(&mut self, action: Action) {
@@ -873,6 +928,150 @@ impl App {
             }
             Action::SubmitCommit | Action::Confirm => self.submit_commit_message(),
             Action::Cancel | Action::Back => self.state.close_popup(),
+            _ => {}
+        }
+    }
+
+    fn dispatch_remote_editor(&mut self, action: Action) {
+        match action {
+            Action::UpdateRemoteName(input) => {
+                if let GlobalMode::EditingRemote {
+                    kind: RemoteEditKind::Add,
+                    name,
+                    validation_error,
+                    ..
+                } = &mut self.state.mode
+                {
+                    *name = input;
+                    *validation_error = None;
+                }
+            }
+            Action::UpdateRemoteUrl(input) => {
+                if let GlobalMode::EditingRemote {
+                    url,
+                    validation_error,
+                    ..
+                } = &mut self.state.mode
+                {
+                    *url = input;
+                    *validation_error = None;
+                }
+            }
+            Action::FocusNextRemoteField => {
+                if let GlobalMode::EditingRemote {
+                    kind: RemoteEditKind::Add,
+                    field,
+                    ..
+                } = &mut self.state.mode
+                {
+                    *field = match field {
+                        RemoteInputField::Name => RemoteInputField::Url,
+                        RemoteInputField::Url => RemoteInputField::Name,
+                    };
+                }
+            }
+            Action::SubmitRemoteEditor | Action::Confirm => self.submit_remote_editor(),
+            Action::Cancel | Action::Back => self.state.close_popup(),
+            _ => {}
+        }
+    }
+
+    fn submit_remote_editor(&mut self) {
+        let GlobalMode::EditingRemote {
+            kind,
+            field,
+            name,
+            url,
+            ..
+        } = self.state.mode.clone()
+        else {
+            return;
+        };
+        let Some(repository_index) = self.state.remotes_repository_index else {
+            self.state.close_popup();
+            return;
+        };
+
+        if matches!(kind, RemoteEditKind::Add) && field == RemoteInputField::Name {
+            if let Some(error) = Self::remote_name_error(name.trim()) {
+                if let GlobalMode::EditingRemote {
+                    validation_error, ..
+                } = &mut self.state.mode
+                {
+                    *validation_error = Some(error);
+                }
+            } else if let GlobalMode::EditingRemote { field, .. } = &mut self.state.mode {
+                *field = RemoteInputField::Url;
+            }
+            return;
+        }
+
+        let name = name.trim().to_string();
+        let url = url.trim().to_string();
+        let error = Self::remote_name_error(&name).or_else(|| Self::remote_url_error(&url));
+        if let Some(error) = error {
+            if let GlobalMode::EditingRemote {
+                validation_error, ..
+            } = &mut self.state.mode
+            {
+                *validation_error = Some(error);
+            }
+            return;
+        }
+        if matches!(kind, RemoteEditKind::Add)
+            && self.state.remotes.iter().any(|remote| remote.name == name)
+        {
+            if let GlobalMode::EditingRemote {
+                validation_error, ..
+            } = &mut self.state.mode
+            {
+                *validation_error = Some(format!("Remote `{name}` already exists"));
+            }
+            return;
+        }
+
+        self.state.mode = GlobalMode::Confirming {
+            dialog: match kind {
+                RemoteEditKind::Add => ConfirmDialog::AddRemote {
+                    repository_index,
+                    name,
+                    url,
+                },
+                RemoteEditKind::SetUrl { .. } => ConfirmDialog::SetRemoteUrl {
+                    repository_index,
+                    name,
+                    url,
+                },
+            },
+        };
+    }
+
+    fn remote_name_error(name: &str) -> Option<String> {
+        (name.is_empty()
+            || name.starts_with('-')
+            || name
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace()))
+        .then(|| {
+            "Remote name cannot be empty, start with `-`, or contain whitespace/control characters"
+                .into()
+        })
+    }
+
+    fn remote_url_error(url: &str) -> Option<String> {
+        (url.is_empty() || url.chars().any(|character| character.is_control()))
+            .then(|| "Remote URL cannot be empty or contain control characters".into())
+    }
+
+    fn dispatch_shortcut_menu(&mut self, action: Action) {
+        match action {
+            Action::CopySelectedCommitHashes
+            | Action::CopyCurrentCommitInfo
+            | Action::CopyCurrentCommitMessage => {
+                self.state.mode = GlobalMode::Normal;
+                self.dispatch_normal(action);
+            }
+            Action::Cancel | Action::Back => self.state.mode = GlobalMode::Normal,
             _ => {}
         }
     }
@@ -968,6 +1167,72 @@ impl App {
                             PendingJobKind::Command {
                                 repository_index,
                                 kind: CommandKind::Fetch,
+                            },
+                        );
+                    }
+                    ConfirmDialog::PullRebaseRepository {
+                        repository_index, ..
+                    } => {
+                        self.submit(
+                            repository_index,
+                            GitRequest::PullRebase,
+                            PendingJobKind::Command {
+                                repository_index,
+                                kind: CommandKind::PullRebase,
+                            },
+                        );
+                    }
+                    ConfirmDialog::PushRepository {
+                        repository_index, ..
+                    } => {
+                        self.submit(
+                            repository_index,
+                            GitRequest::Push,
+                            PendingJobKind::Command {
+                                repository_index,
+                                kind: CommandKind::Push,
+                            },
+                        );
+                    }
+                    ConfirmDialog::AddRemote {
+                        repository_index,
+                        name,
+                        url,
+                    } => {
+                        self.submit(
+                            repository_index,
+                            GitRequest::AddRemote { name, url },
+                            PendingJobKind::Command {
+                                repository_index,
+                                kind: CommandKind::AddRemote,
+                            },
+                        );
+                    }
+                    ConfirmDialog::SetRemoteUrl {
+                        repository_index,
+                        name,
+                        url,
+                    } => {
+                        self.submit(
+                            repository_index,
+                            GitRequest::SetRemoteUrl { name, url },
+                            PendingJobKind::Command {
+                                repository_index,
+                                kind: CommandKind::SetRemoteUrl,
+                            },
+                        );
+                    }
+                    ConfirmDialog::SetUpstreamRemote {
+                        repository_index,
+                        name,
+                        ..
+                    } => {
+                        self.submit(
+                            repository_index,
+                            GitRequest::SetUpstreamRemote { name },
+                            PendingJobKind::Command {
+                                repository_index,
+                                kind: CommandKind::SetUpstreamRemote,
                             },
                         );
                     }
@@ -1097,6 +1362,11 @@ impl App {
                 {
                     self.submit_changes(repository_index);
                 }
+                if self.state.screen == Screen::Remotes
+                    && let Some(repository_index) = self.state.remotes_repository_index
+                {
+                    self.submit_remotes(repository_index);
+                }
             }
             Action::StartFilter => self.start_filter(),
             Action::SelectBranch(index) => {
@@ -1106,6 +1376,12 @@ impl App {
             }
             Action::LoadCommitsForSelectedBranch => self.activate_selected_tree_node(),
             Action::OpenFetchRepositoryDialog => self.open_fetch_dialog(),
+            Action::OpenPullRebaseDialog => self.open_pull_rebase_dialog(),
+            Action::OpenPushDialog => self.open_push_dialog(),
+            Action::OpenRemotes => self.open_remotes(),
+            Action::OpenAddRemoteEditor => self.open_add_remote_editor(),
+            Action::OpenSetRemoteUrlEditor => self.open_set_remote_url_editor(),
+            Action::OpenSetUpstreamRemoteDialog => self.open_set_upstream_remote_dialog(),
             Action::OpenReflog => self.open_reflog(),
             Action::ToggleChanges => self.toggle_changes(),
             Action::ActivateSelectedChange => self.activate_selected_change(),
@@ -1137,6 +1413,7 @@ impl App {
             Action::PrevFile => self.move_file(-1),
             Action::ToggleWrap => self.state.wrap_diff = !self.state.wrap_diff,
             Action::ToggleCommitCopySelection => self.toggle_commit_copy_selection(),
+            Action::OpenCommitCopyShortcuts => self.open_commit_copy_shortcuts(),
             Action::CopySelectedCommitHashes => self.copy_selected_commit_hashes(),
             Action::CopyCurrentCommitInfo => self.copy_current_commit_info(),
             Action::CopyCurrentCommitMessage => self.copy_current_commit_message(),
@@ -1156,6 +1433,10 @@ impl App {
             | Action::ConfirmReset
             | Action::UpdateCommitMessage(_)
             | Action::SubmitCommit
+            | Action::UpdateRemoteName(_)
+            | Action::UpdateRemoteUrl(_)
+            | Action::FocusNextRemoteField
+            | Action::SubmitRemoteEditor
             | Action::Tick
             | Action::Quit => {}
         }
@@ -1199,6 +1480,11 @@ impl App {
                 self.state.reflog_entries.len(),
                 -1,
             ),
+            FocusPanel::RemoteList => Self::move_selection(
+                &mut self.state.selection.selected_remote_index,
+                self.state.remotes.len(),
+                -1,
+            ),
             FocusPanel::ChangesTree => self.move_change_node(-1),
             FocusPanel::ChangesDiff => {
                 self.state.selection.changes_diff_scroll =
@@ -1229,7 +1515,7 @@ impl App {
             ),
             FocusPanel::FileList => self.move_file(1),
             FocusPanel::DiffView => {
-                let maximum = self.state.diff_line_count().saturating_sub(1) as u16;
+                let maximum = Self::maximum_scroll(self.state.diff_line_count());
                 self.state.selection.diff_scroll = self
                     .state
                     .selection
@@ -1242,9 +1528,14 @@ impl App {
                 self.state.reflog_entries.len(),
                 1,
             ),
+            FocusPanel::RemoteList => Self::move_selection(
+                &mut self.state.selection.selected_remote_index,
+                self.state.remotes.len(),
+                1,
+            ),
             FocusPanel::ChangesTree => self.move_change_node(1),
             FocusPanel::ChangesDiff => {
-                let maximum = self.state.changes_diff_line_count().saturating_sub(1) as u16;
+                let maximum = Self::maximum_scroll(self.state.changes_diff_line_count());
                 self.state.selection.changes_diff_scroll = self
                     .state
                     .selection
@@ -1258,6 +1549,15 @@ impl App {
 
     fn page_up(&mut self) {
         match self.state.focus {
+            FocusPanel::CommitFileList => Self::move_selection(
+                &mut self.state.selection.selected_file_index,
+                self.state
+                    .current_commit_detail
+                    .as_ref()
+                    .map_or(0, |detail| detail.files.len()),
+                -(PAGE_SIZE as isize),
+            ),
+            FocusPanel::FileList => self.move_file(-(PAGE_SIZE as isize)),
             FocusPanel::DiffView => {
                 self.state.selection.diff_scroll = self
                     .state
@@ -1272,6 +1572,7 @@ impl App {
                     .changes_diff_scroll
                     .saturating_sub(PAGE_SIZE as u16);
             }
+            FocusPanel::ChangesTree => self.move_change_node(-(PAGE_SIZE as isize)),
             _ => {
                 for _ in 0..PAGE_SIZE {
                     self.move_up();
@@ -1282,8 +1583,17 @@ impl App {
 
     fn page_down(&mut self) {
         match self.state.focus {
+            FocusPanel::CommitFileList => Self::move_selection(
+                &mut self.state.selection.selected_file_index,
+                self.state
+                    .current_commit_detail
+                    .as_ref()
+                    .map_or(0, |detail| detail.files.len()),
+                PAGE_SIZE as isize,
+            ),
+            FocusPanel::FileList => self.move_file(PAGE_SIZE as isize),
             FocusPanel::DiffView => {
-                let maximum = self.state.diff_line_count().saturating_sub(1) as u16;
+                let maximum = Self::maximum_scroll(self.state.diff_line_count());
                 self.state.selection.diff_scroll = self
                     .state
                     .selection
@@ -1292,7 +1602,7 @@ impl App {
                     .min(maximum);
             }
             FocusPanel::ChangesDiff => {
-                let maximum = self.state.changes_diff_line_count().saturating_sub(1) as u16;
+                let maximum = Self::maximum_scroll(self.state.changes_diff_line_count());
                 self.state.selection.changes_diff_scroll = self
                     .state
                     .selection
@@ -1300,6 +1610,7 @@ impl App {
                     .saturating_add(PAGE_SIZE as u16)
                     .min(maximum);
             }
+            FocusPanel::ChangesTree => self.move_change_node(PAGE_SIZE as isize),
             _ => {
                 for _ in 0..PAGE_SIZE {
                     self.move_down();
@@ -1324,6 +1635,7 @@ impl App {
             }
             FocusPanel::DiffView => self.state.selection.diff_scroll = 0,
             FocusPanel::ReflogList => self.state.selection.selected_reflog_index = Some(0),
+            FocusPanel::RemoteList => self.state.selection.selected_remote_index = Some(0),
             FocusPanel::ChangesTree => {
                 self.state.selection.selected_changes_index = Some(0);
                 self.state.ensure_valid_changes_selection();
@@ -1335,6 +1647,7 @@ impl App {
         self.state.ensure_valid_commit_selection();
         self.state.ensure_valid_file_selection();
         self.state.ensure_valid_reflog_selection();
+        self.state.ensure_valid_remote_selection();
         self.state.ensure_valid_changes_selection();
     }
 
@@ -1361,11 +1674,15 @@ impl App {
             }
             FocusPanel::DiffView => {
                 self.state.selection.diff_scroll =
-                    self.state.diff_line_count().saturating_sub(1) as u16;
+                    Self::maximum_scroll(self.state.diff_line_count());
             }
             FocusPanel::ReflogList => {
                 self.state.selection.selected_reflog_index =
                     self.state.reflog_entries.len().checked_sub(1);
+            }
+            FocusPanel::RemoteList => {
+                self.state.selection.selected_remote_index =
+                    self.state.remotes.len().checked_sub(1);
             }
             FocusPanel::ChangesTree => {
                 self.state.selection.selected_changes_index =
@@ -1374,10 +1691,14 @@ impl App {
             }
             FocusPanel::ChangesDiff => {
                 self.state.selection.changes_diff_scroll =
-                    self.state.changes_diff_line_count().saturating_sub(1) as u16;
+                    Self::maximum_scroll(self.state.changes_diff_line_count());
             }
             FocusPanel::Popup => {}
         }
+    }
+
+    fn maximum_scroll(line_count: usize) -> u16 {
+        u16::try_from(line_count.saturating_sub(1)).unwrap_or(u16::MAX)
     }
 
     fn focus_next(&mut self) {
@@ -1389,6 +1710,7 @@ impl App {
             (Screen::FileDiffDetail, FocusPanel::FileList) => FocusPanel::DiffView,
             (Screen::FileDiffDetail, _) => FocusPanel::FileList,
             (Screen::Reflog, _) => FocusPanel::ReflogList,
+            (Screen::Remotes, _) => FocusPanel::RemoteList,
             (Screen::Changes, FocusPanel::ChangesTree) => FocusPanel::ChangesDiff,
             (Screen::Changes, _) => FocusPanel::ChangesTree,
         };
@@ -1410,6 +1732,10 @@ impl App {
                 self.state.focus = FocusPanel::CommitFileList;
             }
             Screen::Reflog => {
+                self.state.screen = Screen::BranchOverview;
+                self.state.focus = FocusPanel::BranchList;
+            }
+            Screen::Remotes => {
                 self.state.screen = Screen::BranchOverview;
                 self.state.focus = FocusPanel::BranchList;
             }
@@ -1447,6 +1773,8 @@ impl App {
         self.state.current_file_diff = None;
         self.state.reflog_repository_index = None;
         self.state.reflog_entries.clear();
+        self.state.remotes_repository_index = None;
+        self.state.remotes.clear();
         self.state.changes_repository_index = None;
         self.state.changes.clear();
         self.state.current_changes_diff = None;
@@ -1455,14 +1783,17 @@ impl App {
         self.state.changes_return_context = None;
         self.state.latest_commits_job = None;
         self.state.latest_commit_detail_job = None;
+        self.state.latest_commit_message_job = None;
         self.state.latest_file_diff_job = None;
         self.state.latest_reflog_job = None;
+        self.state.latest_remotes_job = None;
         self.state.latest_changes_job = None;
         self.state.latest_changes_diff_job = None;
         self.state.commit_filter.clear();
         self.state.selection.selected_commit_index = None;
         self.state.selection.selected_file_index = None;
         self.state.selection.selected_reflog_index = None;
+        self.state.selection.selected_remote_index = None;
         self.state.selection.selected_changes_index = None;
         self.state.screen = Screen::BranchOverview;
         if self.state.focus != FocusPanel::BranchList {
@@ -1534,6 +1865,177 @@ impl App {
         self.state.open_popup();
         self.state.mode = GlobalMode::Confirming {
             dialog: ConfirmDialog::FetchRepository { repository_index },
+        };
+    }
+
+    fn open_remotes(&mut self) {
+        let Some(repository_index) = self.state.selected_tree_repository_index() else {
+            return;
+        };
+        self.activate_repository(repository_index);
+        self.state.remotes_repository_index = Some(repository_index);
+        self.state.screen = Screen::Remotes;
+        self.state.focus = FocusPanel::RemoteList;
+        self.state.ensure_valid_remote_selection();
+        self.submit_remotes(repository_index);
+    }
+
+    fn open_add_remote_editor(&mut self) {
+        let Some(repository_index) = self.state.remotes_repository_index else {
+            return;
+        };
+        if self.has_pending_repository_command(repository_index) {
+            self.state.last_message = Some("Another Git operation is still running".into());
+            return;
+        }
+        self.state.open_popup();
+        self.state.mode = GlobalMode::EditingRemote {
+            kind: RemoteEditKind::Add,
+            field: RemoteInputField::Name,
+            name: String::new(),
+            url: String::new(),
+            validation_error: None,
+        };
+    }
+
+    fn open_set_remote_url_editor(&mut self) {
+        let Some(repository_index) = self.state.remotes_repository_index else {
+            return;
+        };
+        if self.has_pending_repository_command(repository_index) {
+            self.state.last_message = Some("Another Git operation is still running".into());
+            return;
+        }
+        let Some(remote) = self.state.selected_remote() else {
+            return;
+        };
+        let name = remote.name.clone();
+        let url = remote.fetch_urls.first().cloned().unwrap_or_default();
+        self.state.open_popup();
+        self.state.mode = GlobalMode::EditingRemote {
+            kind: RemoteEditKind::SetUrl {
+                remote_name: name.clone(),
+            },
+            field: RemoteInputField::Url,
+            name,
+            url,
+            validation_error: None,
+        };
+    }
+
+    fn open_set_upstream_remote_dialog(&mut self) {
+        let Some(repository_index) = self.state.remotes_repository_index else {
+            return;
+        };
+        if self.has_pending_repository_command(repository_index) {
+            self.state.last_message = Some("Another Git operation is still running".into());
+            return;
+        }
+        let Some(remote) = self.state.selected_remote() else {
+            return;
+        };
+        if !remote.urls_match() {
+            self.state.set_error(
+                "set upstream remote".into(),
+                format!(
+                    "Remote `{}` has different fetch and push URLs. Press `e` in Remote Management to set one shared URL first.",
+                    remote.name
+                ),
+            );
+            return;
+        }
+        let Some(branch) = self
+            .state
+            .repository(repository_index)
+            .and_then(|repository| repository.current_branch.clone())
+        else {
+            self.state.set_error(
+                "set upstream remote".into(),
+                "Setting upstream requires an attached current branch; detached HEAD is not supported."
+                    .into(),
+            );
+            return;
+        };
+        let name = remote.name.clone();
+        if remote.is_upstream && remote.is_push_target {
+            self.state.last_message = Some(format!(
+                "Remote `{name}` is already upstream for both fetch and push"
+            ));
+            return;
+        }
+        self.state.open_popup();
+        self.state.mode = GlobalMode::Confirming {
+            dialog: ConfirmDialog::SetUpstreamRemote {
+                repository_index,
+                name,
+                branch,
+            },
+        };
+    }
+
+    fn open_pull_rebase_dialog(&mut self) {
+        let Some(repository_index) = self.state.selected_repository_node_index() else {
+            return;
+        };
+        self.activate_repository(repository_index);
+        if self.has_pending_repository_command(repository_index) {
+            self.state.last_message = Some("Another Git operation is still running".into());
+            return;
+        }
+        let Some(repository) = self.state.repository(repository_index) else {
+            return;
+        };
+        let Some(branch) = repository.current_branch.clone() else {
+            self.state.set_error(
+                "git pull --rebase".into(),
+                "Pull --rebase requires an attached current branch; detached HEAD is not supported."
+                    .into(),
+            );
+            return;
+        };
+        if !repository.status.is_clean() {
+            self.state.set_error(
+                "git pull --rebase".into(),
+                "Pull --rebase requires a clean working tree and index. Commit, stash, or discard all changes first."
+                    .into(),
+            );
+            return;
+        }
+        self.state.open_popup();
+        self.state.mode = GlobalMode::Confirming {
+            dialog: ConfirmDialog::PullRebaseRepository {
+                repository_index,
+                branch,
+            },
+        };
+    }
+
+    fn open_push_dialog(&mut self) {
+        let Some(repository_index) = self.state.selected_repository_node_index() else {
+            return;
+        };
+        self.activate_repository(repository_index);
+        if self.has_pending_repository_command(repository_index) {
+            self.state.last_message = Some("Another Git operation is still running".into());
+            return;
+        }
+        let Some(branch) = self
+            .state
+            .repository(repository_index)
+            .and_then(|repository| repository.current_branch.clone())
+        else {
+            self.state.set_error(
+                "git push".into(),
+                "Push requires an attached current branch; detached HEAD is not supported.".into(),
+            );
+            return;
+        };
+        self.state.open_popup();
+        self.state.mode = GlobalMode::Confirming {
+            dialog: ConfirmDialog::PushRepository {
+                repository_index,
+                branch,
+            },
         };
     }
 
@@ -1954,6 +2456,19 @@ impl App {
         }
         if !self.state.commit_copy_selection.remove(&hash) {
             self.state.commit_copy_selection.insert(hash);
+        }
+    }
+
+    fn open_commit_copy_shortcuts(&mut self) {
+        if self.state.selected_commit().is_some()
+            && matches!(
+                self.state.screen,
+                Screen::BranchOverview | Screen::CommitDetail | Screen::FileDiffDetail
+            )
+        {
+            self.state.mode = GlobalMode::Shortcut {
+                menu: ShortcutMenu::CommitCopy,
+            };
         }
     }
 

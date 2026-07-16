@@ -6,7 +6,7 @@ use std::{
 use crate::{
     domain::{
         Branch, BranchName, Commit, CommitDetail, CommitHash, CommitList, FileDiff, GitPath,
-        ReflogEntry, Repository, WorkingTreeChange,
+        ReflogEntry, RemoteInfo, Repository, WorkingTreeChange,
     },
     git::{GitJobId, ResetMode},
 };
@@ -19,6 +19,7 @@ pub enum Screen {
     FileDiffDetail,
     Reflog,
     Changes,
+    Remotes,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -32,6 +33,7 @@ pub enum FocusPanel {
     ReflogList,
     ChangesTree,
     ChangesDiff,
+    RemoteList,
     Popup,
 }
 
@@ -84,10 +86,53 @@ pub enum FilterTarget {
     Commits,
 }
 
+/// Extensible second-level shortcut palette. Prefix keys enter a palette;
+/// the following key chooses one related operation without consuming more
+/// single-key bindings in normal navigation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShortcutMenu {
+    CommitCopy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RemoteEditKind {
+    Add,
+    SetUrl { remote_name: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteInputField {
+    Name,
+    Url,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConfirmDialog {
     FetchRepository {
         repository_index: usize,
+    },
+    PullRebaseRepository {
+        repository_index: usize,
+        branch: BranchName,
+    },
+    PushRepository {
+        repository_index: usize,
+        branch: BranchName,
+    },
+    AddRemote {
+        repository_index: usize,
+        name: String,
+        url: String,
+    },
+    SetRemoteUrl {
+        repository_index: usize,
+        name: String,
+        url: String,
+    },
+    SetUpstreamRemote {
+        repository_index: usize,
+        name: String,
+        branch: BranchName,
     },
     SwitchBranch {
         repository_index: usize,
@@ -140,6 +185,16 @@ pub enum GlobalMode {
         input: String,
         validation_error: Option<String>,
     },
+    EditingRemote {
+        kind: RemoteEditKind,
+        field: RemoteInputField,
+        name: String,
+        url: String,
+        validation_error: Option<String>,
+    },
+    Shortcut {
+        menu: ShortcutMenu,
+    },
     Error,
 }
 
@@ -151,6 +206,7 @@ pub struct SelectionState {
     pub selected_commit_index: Option<usize>,
     pub selected_file_index: Option<usize>,
     pub selected_reflog_index: Option<usize>,
+    pub selected_remote_index: Option<usize>,
     /// Index into the flattened three-level Changes tree.
     pub selected_changes_index: Option<usize>,
     pub diff_scroll: u16,
@@ -188,6 +244,8 @@ pub struct AppError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandKind {
     Fetch,
+    PullRebase,
+    Push,
     SwitchBranch,
     CherryPick,
     Reset,
@@ -195,6 +253,9 @@ pub enum CommandKind {
     Stage,
     Unstage,
     Commit,
+    AddRemote,
+    SetRemoteUrl,
+    SetUpstreamRemote,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,6 +265,9 @@ pub enum PendingJobKind {
         full_refresh: bool,
     },
     Branches {
+        repository_index: usize,
+    },
+    Remotes {
         repository_index: usize,
     },
     Commits {
@@ -250,6 +314,7 @@ impl PendingJobKind {
                 repository_index, ..
             }
             | Self::Branches { repository_index }
+            | Self::Remotes { repository_index }
             | Self::Commits {
                 repository_index, ..
             }
@@ -420,6 +485,8 @@ pub struct AppState {
     pub branch_commits: CommitList,
     pub reflog_repository_index: Option<usize>,
     pub reflog_entries: Vec<ReflogEntry>,
+    pub remotes_repository_index: Option<usize>,
+    pub remotes: Vec<RemoteInfo>,
     pub changes_repository_index: Option<usize>,
     pub changes: Vec<WorkingTreeChange>,
     pub current_changes_diff: Option<FileDiff>,
@@ -455,6 +522,7 @@ pub struct AppState {
     pub latest_commit_message_job: Option<GitJobId>,
     pub latest_file_diff_job: Option<GitJobId>,
     pub latest_reflog_job: Option<GitJobId>,
+    pub latest_remotes_job: Option<GitJobId>,
     pub latest_changes_job: Option<GitJobId>,
     pub latest_changes_diff_job: Option<GitJobId>,
     pub last_error: Option<AppError>,
@@ -486,6 +554,8 @@ impl AppState {
             branch_commits: CommitList::empty(),
             reflog_repository_index: None,
             reflog_entries: Vec::new(),
+            remotes_repository_index: None,
+            remotes: Vec::new(),
             changes_repository_index: None,
             changes: Vec::new(),
             current_changes_diff: None,
@@ -516,6 +586,7 @@ impl AppState {
             latest_commit_message_job: None,
             latest_file_diff_job: None,
             latest_reflog_job: None,
+            latest_remotes_job: None,
             latest_changes_job: None,
             latest_changes_diff_job: None,
             last_error: None,
@@ -528,18 +599,6 @@ impl AppState {
 
     pub fn is_loading(&self) -> bool {
         !self.pending_jobs.is_empty()
-    }
-
-    pub fn has_pending_status(&self, repository_index: usize) -> bool {
-        self.pending_jobs.values().any(|job| {
-            matches!(
-                job,
-                PendingJobKind::RepositoryStatus {
-                    repository_index: index,
-                    ..
-                } if *index == repository_index
-            )
-        })
     }
 
     pub fn active_repository_state(&self) -> Option<&RepositoryState> {
@@ -708,6 +767,10 @@ impl AppState {
     pub fn selected_reflog(&self) -> Option<&ReflogEntry> {
         self.reflog_entries
             .get(self.selection.selected_reflog_index?)
+    }
+
+    pub fn selected_remote(&self) -> Option<&RemoteInfo> {
+        self.remotes.get(self.selection.selected_remote_index?)
     }
 
     pub fn change_belongs_to_group(change: &WorkingTreeChange, group: ChangeGroup) -> bool {
@@ -891,6 +954,13 @@ impl AppState {
         );
     }
 
+    pub fn ensure_valid_remote_selection(&mut self) {
+        ensure_index(
+            &mut self.selection.selected_remote_index,
+            self.remotes.len(),
+        );
+    }
+
     pub fn ensure_valid_changes_selection(&mut self) {
         let nodes = self.visible_changes_nodes();
         if nodes.is_empty() {
@@ -916,6 +986,7 @@ impl AppState {
             Screen::FileDiffDetail => FocusPanel::DiffView,
             Screen::Reflog => FocusPanel::ReflogList,
             Screen::Changes => FocusPanel::ChangesTree,
+            Screen::Remotes => FocusPanel::RemoteList,
         }
     }
 
