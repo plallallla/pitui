@@ -3,6 +3,7 @@
 //! worker is allowed to invoke `git`.
 
 pub mod app;
+pub mod config;
 pub mod domain;
 pub mod git;
 pub mod tui;
@@ -13,6 +14,7 @@ use std::{
     error::Error,
     ffi::OsString,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 /// Resolves positional repository arguments while preserving their order.
@@ -42,8 +44,9 @@ pub fn repository_paths_from_args(
 }
 
 pub fn run_with_repository_paths(paths: Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
-    let bus = git::GitCommandBus::spawn();
-    let app = app::App::new(bus, paths);
+    let config = Arc::new(config::ResolvedConfig::default());
+    let bus = git::GitCommandBus::spawn_with_logging_config(&config.logging)?;
+    let app = app::App::new_with_config(bus, paths, config);
     tui::run(app)
 }
 
@@ -52,14 +55,64 @@ pub fn run_with_repository_paths(paths: Vec<PathBuf>) -> Result<(), Box<dyn Erro
 pub fn run() -> Result<(), Box<dyn Error>> {
     let cwd = env::current_dir()?;
     let args = env::args_os().skip(1).collect::<Vec<_>>();
-    if args.len() == 1 && matches!(args[0].to_str(), Some("-h" | "--help")) {
+    let (repository_args, cli) = config::repository_args_without_config_flags(args)?;
+    if cli.help {
         println!(
-            "Usage: pitui [REPOSITORY ...]\n\nDefaults to the current directory.\nBackend log: {}\nOverride the log path with PITUI_LOG.",
-            git::default_backend_log_path().display()
+            "Usage: pitui [OPTIONS] [REPOSITORY ...]\n\n\
+             Defaults to the current directory.\n\n\
+             Options:\n  \
+               --config <PATH>          Use an explicit global config\n  \
+               --no-config              Ignore the global config file\n  \
+               --check-config           Validate config without starting the TUI\n  \
+               --print-config-path      Print the selected config path\n  \
+               --print-effective-config Print merged, normalized configuration\n  \
+               -h, --help               Show this help\n\n\
+             Default config: {}\n\
+             Default backend log: {}\n\
+             Environment: PITUI_CONFIG, PITUI_LOG",
+            config::default_config_path().display(),
+            config::default_backend_log_path().display()
         );
         return Ok(());
     }
-    run_with_repository_paths(repository_paths_from_args(&cwd, args))
+
+    let mut load_options = config::ConfigLoadOptions::from_environment();
+    if cli.path.is_some() {
+        load_options.path = cli.path.clone();
+    }
+    load_options.no_config = cli.no_config;
+    if cli.print_path {
+        let path = config::selected_config_path(&load_options)?.map_or_else(
+            || String::from("<disabled>"),
+            |path| path.display().to_string(),
+        );
+        println!("{path}");
+        if !cli.check && !cli.print_effective {
+            return Ok(());
+        }
+    }
+
+    let resolved = Arc::new(config::load(&load_options)?);
+    if cli.check {
+        println!(
+            "configuration valid: {}",
+            resolved.source_path.as_ref().map_or_else(
+                || "built-in defaults".into(),
+                |path| path.display().to_string()
+            )
+        );
+    }
+    if cli.print_effective {
+        print!("{}", resolved.effective_toml());
+    }
+    if cli.check || cli.print_effective {
+        return Ok(());
+    }
+
+    let paths = repository_paths_from_args(&cwd, repository_args);
+    let bus = git::GitCommandBus::spawn_with_logging_config(&resolved.logging)?;
+    let app = app::App::new_with_config(bus, paths, resolved);
+    tui::run(app)
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@ Any main view -- Ctrl+G --> Changes -> Staged / Unstaged -> Files + Diff
 - 按仓库浏览最近 300 条 reflog，并从 commit 或 reflog 条目选择 reset 目标。
 - 独立 Changes 界面使用“Changes → Staged/Unstaged → 文件”三级树展示当前修改。
 - Changes 与 commit file diff 复用 unified / side-by-side diff 组件。
+- unified / side-by-side 的启动默认模式可通过全局配置设置；窄终端仍安全降级为 unified。
 - Changes 支持文件/分组多选，可在文件树或 diff 焦点下 stage、unstage，并通过消息弹窗创建 commit。
 - Git worker 的每个后台 job 都写入持久化 JSONL 操作日志，包含排队、开始、完成、耗时与失败结果。
 - 不执行 checkout/switch 即可查看任意分支最近 300 个 commits。
@@ -76,6 +77,86 @@ cargo build --release
 cargo run --manifest-path /path/to/pitui/Cargo.toml -- /repo/frontend /repo/backend
 ```
 
+## 全局配置
+
+Pitui 在进入 terminal raw mode 前读取并严格校验一个版本化 TOML 配置。默认文件不存在是
+正常情况，此时使用内置默认值；不会读取仓库内配置，也不会自动轮询配置文件。修改配置后
+需要重启 Pitui。
+
+| 平台 | 默认配置文件 |
+|---|---|
+| macOS | `~/Library/Application Support/pitui/config.toml` |
+| Linux / Unix | `${XDG_CONFIG_HOME:-~/.config}/pitui/config.toml` |
+| Windows | `%APPDATA%\pitui\config.toml` |
+
+配置文件查找优先级为 `--config <path>`、`PITUI_CONFIG`、平台默认路径；
+`--no-config` 可跳过文件。相对日志路径以配置文件所在目录为基准。可用以下命令先诊断，
+它们不会启动 TUI 或 Git worker：
+
+```bash
+pitui --check-config --config /path/to/config.toml
+pitui --print-config-path
+pitui --print-effective-config
+```
+
+最小配置必须声明 schema 版本。下面把共享 diff 组件的默认模式改为 side-by-side：
+
+```toml
+schema_version = 1
+
+[diff]
+default_mode = "side-by-side" # unified | side-by-side
+```
+
+该默认值同时初始化 Commit File Diff 和 Changes Diff。终端宽度小于 140 列时只在渲染时
+临时回退为 unified，不会修改配置或当前 session mode；按 `v` 切换只影响当前运行。
+
+同一个配置层还支持命令绑定、分级快捷键、底部提示和日志策略。例如：
+
+```toml
+schema_version = 1
+
+[ui.footer]
+mode = "contextual"            # contextual | compact | hidden
+max_rows = 2                    # 1..3
+default_visibility = "registry" # registry | all | allowlist
+show_alternative_bindings = false
+
+[ui.footer.groups."commit.copy"]
+visible = true
+label = "copy…"
+
+[keybindings]
+chord_timeout_ms = 0
+
+[keybindings.commands."app.refresh"]
+bindings = ["Ctrl+R"]
+
+[keybindings.commands."commit.copy.hash"]
+bindings = ["Ctrl+C h"]
+
+[logging]
+enabled = true
+level = "info"
+path = "logs/pitui.jsonl"
+flush_interval_ms = 0
+buffer_capacity = 1024
+max_detail_chars = 4096
+fail_on_open_error = false
+
+[logging.rotation]
+enabled = true
+max_size = "5 MiB"
+keep_files = 3
+rotate_on_start = false
+```
+
+未出现的 command 继承默认绑定，`bindings = []` 才会解除绑定。隐藏 footer 提示不会解除
+按键；确认弹窗、hard reset 二次确认和文本编辑按键属于安全保留交互，不能通过配置绕过。
+完整字段和示例见 [`docs/config.example.toml`](docs/config.example.toml)，全部稳定 command id
+可通过 `--print-effective-config` 查看；设计与约束见
+[`docs/global-configuration-design.md`](docs/global-configuration-design.md)。
+
 ## 后台操作日志
 
 Pitui 会记录所有提交到 Git worker 的后台操作。每个 job 都至少包含 `queued`、`started`、`completed` 三条 JSONL 记录，以及 `job_id`、仓库 `cwd`、操作名、结果、耗时和错误摘要。后台 channel 意外断开也会写入错误记录。
@@ -94,11 +175,18 @@ Pitui 会记录所有提交到 Git worker 的后台操作。每个 job 都至少
 PITUI_LOG=/path/to/pitui.jsonl pitui /repo
 ```
 
-日志达到 5 MiB 时轮转为 `pitui.jsonl.1`，保留当前文件和一份备份。若默认位置无法创建，Pitui 会回退到临时目录并在状态栏显示实际路径；`pitui --help` 也会输出当前默认路径。
+默认日志达到 5 MiB 时轮转为 `pitui.jsonl.1`，保留当前文件和一份备份。全局配置可修改
+日志开关、路径、level、flush interval、writer buffer、详情长度、轮转大小和 `.1` 到 `.N`
+的保留数量。若配置位置无法创建且 `fail_on_open_error=false`，Pitui 会回退到临时目录并在
+底部消息中显示实际路径；`pitui --help` 也会输出当前默认路径。
 
 日志记录操作元数据、仓库路径、所选文件路径和 Git 错误，因此分享前应检查并脱敏。为避免无意泄露，diff/文件内容不会写入日志，commit message 只记录字节数，详情和错误字段最长保留 4096 个字符。
 
 ## 快捷键
+
+下表是内置默认绑定。底部提示和输入解析共享同一份有效 keymap，只显示当前状态下按下后
+确实会有动作的“下一键”；二级/三级快捷键只在按下当前前缀后逐级显示后续键。绑定、提示
+是否可见、label、priority、行数和 overflow 均可由全局配置独立控制。
 
 ### 全局
 
@@ -139,7 +227,9 @@ PITUI_LOG=/path/to/pitui.jsonl pitui /repo
 
 Pull 只使用 rebase 策略，不读取 `pull.rebase` 配置来决定是否 merge。执行前 Controller 与 Git worker 都会检查 attached branch、干净的 working tree/index 和既存 rebase；发生冲突时自动执行 `git rebase --abort`。Push 使用 Git 已配置的 upstream/default push target；Pitui 不会在 push 时隐式创建 upstream，但可在 Remote 管理中由用户显式设置。
 
-复制操作采用二级快捷键，避免 hash/info/message 各自长期占用普通模式按键。按下 `Ctrl-C` 后状态栏会显示 `h hash | i info | m message`；`Esc`、`q` 或再次按 `Ctrl-C` 取消，且整个过程不会改变当前 focus。
+复制操作采用二级快捷键，避免 hash/info/message 各自长期占用普通模式按键。按下 `Ctrl-C`
+后底部才显示 `h hash | i info | m message`；`Esc`、`q` 或再次按 `Ctrl-C` 取消，且整个
+过程不会改变当前 focus。
 
 Pitui 不会每隔固定时间轮询仓库。启动时会完成一次初始加载，Pitui 自己完成 Git 写操作后会刷新受影响的数据；外部命令或编辑器造成的变化由用户在任意主界面按 `Ctrl-R` 主动同步。
 

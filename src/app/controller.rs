@@ -1,10 +1,12 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::mpsc::TryRecvError,
+    sync::{Arc, mpsc::TryRecvError},
+    time::Instant,
 };
 
 use crate::{
+    config::ResolvedConfig,
     domain::{BranchName, CommitHash, GitPath, WorkingTreeDiffKind},
     git::{
         GitCommandBus, GitJobId, GitRequest, GitResponse, GitResponseEnvelope, ResetMode,
@@ -15,7 +17,7 @@ use crate::{
 use super::{
     Action, AppError, AppState, BranchTreeNode, ChangeGroup, ChangeSelection, ChangesTreeNode,
     CommandKind, ConfirmDialog, DiffViewMode, FilterTarget, FocusPanel, GlobalMode, PendingJobKind,
-    RemoteEditKind, RemoteInputField, Screen, ShortcutMenu,
+    RemoteEditKind, RemoteInputField, Screen,
 };
 
 const PAGE_SIZE: usize = 10;
@@ -30,9 +32,17 @@ pub struct App {
 
 impl App {
     pub fn new(bus: GitCommandBus, repository_paths: Vec<PathBuf>) -> Self {
+        Self::new_with_config(bus, repository_paths, ResolvedConfig::shared_default())
+    }
+
+    pub fn new_with_config(
+        bus: GitCommandBus,
+        repository_paths: Vec<PathBuf>,
+        config: Arc<ResolvedConfig>,
+    ) -> Self {
         let backend_log_path = bus.log_path().map(Path::to_path_buf);
         let backend_logging_warning = bus.logging_warning().map(str::to_string);
-        let mut state = AppState::with_repository_paths(repository_paths);
+        let mut state = AppState::with_config(repository_paths, config);
         state.backend_log_path = backend_log_path.clone();
         state.backend_logging_warning = backend_logging_warning.clone();
         state.last_message = backend_logging_warning
@@ -843,7 +853,7 @@ impl App {
             }
             GlobalMode::EditingCommitMessage { .. } => self.dispatch_commit_message(action),
             GlobalMode::EditingRemote { .. } => self.dispatch_remote_editor(action),
-            GlobalMode::Shortcut { .. } => self.dispatch_shortcut_menu(action),
+            GlobalMode::Chord { .. } => self.dispatch_chord(action),
             GlobalMode::Error => match action {
                 Action::DismissError | Action::Cancel | Action::Back | Action::Confirm => {
                     self.state.dismiss_error();
@@ -1063,16 +1073,19 @@ impl App {
             .then(|| "Remote URL cannot be empty or contain control characters".into())
     }
 
-    fn dispatch_shortcut_menu(&mut self, action: Action) {
+    fn dispatch_chord(&mut self, action: Action) {
         match action {
-            Action::CopySelectedCommitHashes
-            | Action::CopyCurrentCommitInfo
-            | Action::CopyCurrentCommitMessage => {
+            Action::BeginChord(prefix) => {
+                self.state.mode = GlobalMode::Chord {
+                    prefix,
+                    started_at: Instant::now(),
+                };
+            }
+            Action::Cancel | Action::Back => self.state.mode = GlobalMode::Normal,
+            action => {
                 self.state.mode = GlobalMode::Normal;
                 self.dispatch_normal(action);
             }
-            Action::Cancel | Action::Back => self.state.mode = GlobalMode::Normal,
-            _ => {}
         }
     }
 
@@ -1413,7 +1426,12 @@ impl App {
             Action::PrevFile => self.move_file(-1),
             Action::ToggleWrap => self.state.wrap_diff = !self.state.wrap_diff,
             Action::ToggleCommitCopySelection => self.toggle_commit_copy_selection(),
-            Action::OpenCommitCopyShortcuts => self.open_commit_copy_shortcuts(),
+            Action::BeginChord(prefix) => {
+                self.state.mode = GlobalMode::Chord {
+                    prefix,
+                    started_at: Instant::now(),
+                };
+            }
             Action::CopySelectedCommitHashes => self.copy_selected_commit_hashes(),
             Action::CopyCurrentCommitInfo => self.copy_current_commit_info(),
             Action::CopyCurrentCommitMessage => self.copy_current_commit_message(),
@@ -2456,19 +2474,6 @@ impl App {
         }
         if !self.state.commit_copy_selection.remove(&hash) {
             self.state.commit_copy_selection.insert(hash);
-        }
-    }
-
-    fn open_commit_copy_shortcuts(&mut self) {
-        if self.state.selected_commit().is_some()
-            && matches!(
-                self.state.screen,
-                Screen::BranchOverview | Screen::CommitDetail | Screen::FileDiffDetail
-            )
-        {
-            self.state.mode = GlobalMode::Shortcut {
-                menu: ShortcutMenu::CommitCopy,
-            };
         }
     }
 

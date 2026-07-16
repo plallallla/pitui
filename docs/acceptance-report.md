@@ -4,7 +4,7 @@
 
 ## 结论
 
-`docs/git-tui-design.md` 中 Milestone 1–5 及多仓库安全操作扩展已实现。Pitui 可同时打开多个 Git 仓库，以真正分层的仓库/分支树浏览 commit、独立 Changes 三级树、changed files、两种 file diff、reflog 和 Remote Management，并通过仓库隔离的确认流程执行 fetch、pull --rebase、push、switch、cherry-pick、soft/mixed/hard reset 和 safe rebase。Remote Management 可新增 remote、归一 fetch/push URL 并为当前分支设置双向 upstream；worker 在联系网络前强制校验 URL 和分支路由一致。Changes 支持文件/分组多选、stage、unstage 和 commit；Commits 使用 `Ctrl+C` 二级快捷键复制完整 hashes、commit info 或完整 message。定时 Git 状态轮询已移除，任意主界面通过 `Ctrl+R` 手动刷新；Commit Files、File Diff 和 Changes Diff 统一支持 Home/End/PageUp/PageDown。File Diff 左侧切换文件会刷新右侧内容但不再抢走 focus。所有 Git worker job 另有持久化 JSONL 生命周期日志。
+`docs/git-tui-design.md` 中 Milestone 1–5 及多仓库安全操作扩展已实现。Pitui 可同时打开多个 Git 仓库，以真正分层的仓库/分支树浏览 commit、独立 Changes 三级树、changed files、两种 file diff、reflog 和 Remote Management，并通过仓库隔离的确认流程执行 fetch、pull --rebase、push、switch、cherry-pick、soft/mixed/hard reset 和 safe rebase。Remote Management 可新增 remote、归一 fetch/push URL 并为当前分支设置双向 upstream；worker 在联系网络前强制校验 URL 和分支路由一致。Changes 支持文件/分组多选、stage、unstage 和 commit；Commits 使用 `Ctrl+C` 二级快捷键复制完整 hashes、commit info 或完整 message。定时 Git 状态轮询已移除，任意主界面通过 `Ctrl+R` 手动刷新；Commit Files、File Diff 和 Changes Diff 统一支持 Home/End/PageUp/PageDown。File Diff 左侧切换文件会刷新右侧内容但不再抢走 focus。版本化全局 TOML 配置已接管 command bindings、逐级 chord、action-only footer、共享 diff 默认模式和后台日志策略，并在进入 terminal 前严格校验。所有 Git worker job 另有可配置的持久化 JSONL 生命周期日志。
 
 ## 里程碑证据
 
@@ -26,7 +26,9 @@
 | Remote Management | `o` 独立界面；add/shared-URL/upstream 确认流程；`fetch/pull/push` 执行时 policy preflight；URL 日志收敛 | 真实 bare remote 新增、无远程分支时设 upstream 并 plain push；split URL 与 split branch routing 均在联系 remote 前拒绝，修复后通过 |
 | Reset 安全分级 | soft/mixed/hard mode chooser；hard warning + hash 两阶段确认 | 三种真实 reset 语义、reflog target reset、hard controller end-to-end tests |
 | Safe Rebase | controller + worker 双重前置检查、确认、冲突检测、仅自动 abort 本次操作 | clean success、dirty rejection、真实冲突恢复、既存 rebase 不被 abort integration tests |
-| 后台日志 | 平台默认路径与 `PITUI_LOG`；queued/started/completed JSONL；5 MiB 轮转；敏感 payload 收敛 | JSON escaping、commit message redaction、rotation unit tests；success/failure lifecycle integration test |
+| 全局配置 / Diff 默认模式 | `src/config.rs` 严格 TOML、CLI/env/path 优先级和诊断命令；`[diff].default_mode` 初始化共享 session mode | 合法/非法模式、effective config、CLI exit code、两个 diff 入口初始化 tests |
+| Command Registry / Footer | `src/app/command.rs` 统一 actionability、绑定和 presentation；通用三段 chord；footer 只显示当前可执行下一键 | registry 完整性、binding/footer 一致、逐级 chord、action-only、窄终端/多行 footer render tests |
+| 后台日志 | 平台默认路径与 `PITUI_LOG`；配置开关/level/target/flush/writer buffer/rotation/retention；queued/started/completed JSONL；敏感 payload 收敛 | JSON escaping、commit message redaction、level、定时 flush、rotate-on-start、多备份和 strict-open tests；success/failure lifecycle integration test |
 | GitHub / License | MIT License、跨平台 CI、Dependabot、Issue Forms、PR template、贡献与安全策略 | Cargo license metadata、GitHub YAML 静态检查、完整质量门禁 |
 
 ## 架构约束
@@ -34,6 +36,7 @@
 - `std::process::Command::new("git")` 只存在于 `src/git/runner.rs`。
 - Renderer 的入口和子函数只接收 `&AppState`，不保存或修改业务状态。
 - Input Mapper 只生成 `Action`。
+- Normal/Chord 输入与底部提示读取同一个 `CommandId` registry 和同一份 `Arc<ResolvedConfig>`；Renderer 不再手写普通模式绑定。
 - Clipboard payload 由 Application 生成，TUI 只负责 OSC 52 编码与终端写入；复制集合与 cherry-pick queue 隔离。
 - Git Worker 通过 request/response channel 通信，不依赖 TUI；每个 job 显式携带 cwd，不存在全局单仓库路径。
 - GitCommandBus 在发送和执行边界记录每个 job 的 queued/started/completed；响应发布前 flush completion，channel 断开也有错误记录。
@@ -55,9 +58,10 @@ cargo test --doc
 测试结果：
 
 ```text
-unit tests:        41 passed
-integration tests: 32 passed
-doc tests:          0 failed
+unit tests:             63 passed
+config CLI tests:        3 passed
+Git integration tests:  32 passed
+doc tests:               0 failed
 ```
 
 集成测试使用真实 Git 和独立临时仓库，覆盖：
@@ -85,6 +89,11 @@ doc tests:          0 failed
 - soft/mixed/hard reset 语义和 hard 双阶段确认；
 - safe rebase 成功、worker 执行时脏工作区拒绝、真实冲突提示与自动 `git rebase --abort` 恢复；既存 rebase 会被拒绝且保持不变。
 - 后台 JSONL 对成功/失败 job 的完整生命周期、cwd/operation/status/duration 记录，以及日志轮转和 commit message redaction。
+
+配置专项测试另覆盖严格 schema/未知字段、非法 command 与按键冲突、配置相对日志路径、
+默认 unified 与 side-by-side 初始化、input/footer actionability 一致、chord 逐级提示、footer
+多行布局、日志 level/flush/rotation/retention，以及 `--check-config` / `--print-effective-config`
+不会进入 alternate screen；非法配置以退出码 `2` 结束。
 
 仓库发布配套包括 MIT `LICENSE`、README vibe-coding 声明、Linux/macOS/Windows CI、Cargo/GitHub Actions Dependabot、结构化 Bug/Feature Issue Forms、PR 模板、贡献指南和私密漏洞报告策略。
 

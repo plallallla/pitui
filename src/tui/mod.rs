@@ -103,6 +103,9 @@ pub fn run(mut app: App) -> Result<(), Box<dyn Error>> {
 
     while !app.should_quit() {
         app.poll_git();
+        if app.state.chord_expired(Instant::now()) {
+            app.dispatch(Action::Cancel);
+        }
         if last_tick.elapsed() >= TICK_RATE {
             // Tick only animates an operation that is already pending. It must
             // never act as a repository polling timer.

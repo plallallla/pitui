@@ -12,6 +12,7 @@ use pitui::{
         Action, App, BranchTreeNode, ChangeGroup, ChangesTreeNode, DiffViewMode, FocusPanel,
         GlobalMode, Screen,
     },
+    config::KeyStroke,
     domain::{
         BranchName, CommitHash, DiffHunk, DiffLine, DiffLineKind, FileChangeKind, FileDiff,
         GitPath, WorkingTreeDiffKind,
@@ -91,6 +92,12 @@ fn app_for(paths: &[&Path]) -> App {
         GitCommandBus::spawn_with_log_path(log_path).unwrap(),
         paths.iter().map(|path| path.to_path_buf()).collect(),
     )
+}
+
+fn open_commit_copy_chord(app: &mut App) {
+    app.dispatch(Action::BeginChord(vec![
+        KeyStroke::parse("Ctrl+C").unwrap(),
+    ]));
 }
 
 fn branch_tree_index(app: &App, repository_index: usize, name: &str) -> usize {
@@ -921,13 +928,8 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
     app.dispatch(Action::MoveDown);
     app.dispatch(Action::ToggleCommitCopySelection);
     assert_eq!(app.state.commit_copy_selection.len(), 2);
-    app.dispatch(Action::OpenCommitCopyShortcuts);
-    assert!(matches!(
-        app.state.mode,
-        GlobalMode::Shortcut {
-            menu: pitui::app::ShortcutMenu::CommitCopy
-        }
-    ));
+    open_commit_copy_chord(&mut app);
+    assert!(matches!(app.state.mode, GlobalMode::Chord { .. }));
     app.dispatch(Action::CopySelectedCommitHashes);
     assert_eq!(app.state.mode, GlobalMode::Normal);
     let expected_hashes = app
@@ -942,7 +944,7 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
         app.take_clipboard_request().as_deref(),
         Some(expected_hashes.as_str())
     );
-    app.dispatch(Action::OpenCommitCopyShortcuts);
+    open_commit_copy_chord(&mut app);
     app.dispatch(Action::CopyCurrentCommitInfo);
     let info = app.take_clipboard_request().unwrap();
     assert!(info.contains(&app.state.selected_commit().unwrap().hash.0));
@@ -1139,7 +1141,7 @@ fn file_diff_navigation_keeps_file_list_focus_and_copies_full_commit_message() {
 
     // Overview only has the subject, so message copying loads the full body
     // without navigating away from the current screen or focus.
-    app.dispatch(Action::OpenCommitCopyShortcuts);
+    open_commit_copy_chord(&mut app);
     app.dispatch(Action::CopyCurrentCommitMessage);
     wait_until_idle(&mut app);
     assert_eq!(app.state.screen, Screen::BranchOverview);

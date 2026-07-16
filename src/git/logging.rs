@@ -1,19 +1,20 @@
 use std::{
-    env,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use crate::config::{LogLevel, ResolvedLoggingConfig};
 
 use super::{GitJobId, GitRequest, GitResponse};
 
+#[cfg(test)]
 const DEFAULT_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
-const MAX_DETAIL_CHARS: usize = 4_096;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,17 +28,24 @@ pub(crate) struct BackendLogger {
     inner: Arc<Mutex<LogFile>>,
     session_id: Arc<str>,
     path: Arc<PathBuf>,
+    level: LogLevel,
+    max_detail_chars: usize,
 }
 
 struct LogFile {
     path: PathBuf,
-    file: Option<File>,
+    file: Option<BufWriter<File>>,
     bytes_written: u64,
     max_bytes: u64,
+    rotation_enabled: bool,
+    keep_files: usize,
+    flush_interval: Duration,
+    last_flush: Instant,
+    buffer_capacity: usize,
 }
 
 struct LogEvent<'a> {
-    level: &'a str,
+    level: LogLevel,
     event: &'a str,
     job_id: Option<GitJobId>,
     cwd: Option<&'a Path>,
@@ -47,11 +55,34 @@ struct LogEvent<'a> {
 }
 
 impl BackendLogger {
+    #[cfg(test)]
     pub(crate) fn open(path: PathBuf) -> io::Result<Self> {
         Self::open_with_limit(path, DEFAULT_MAX_LOG_BYTES)
     }
 
+    #[cfg(test)]
     fn open_with_limit(path: PathBuf, max_bytes: u64) -> io::Result<Self> {
+        let config = ResolvedLoggingConfig {
+            enabled: true,
+            level: LogLevel::Info,
+            path,
+            flush_interval: Duration::ZERO,
+            buffer_capacity: 1024,
+            max_detail_chars: 4096,
+            fail_on_open_error: false,
+            rotation: crate::config::LogRotationConfig {
+                enabled: true,
+                max_bytes: max_bytes.max(1),
+                keep_files: 1,
+                rotate_on_start: false,
+            },
+            targets: Default::default(),
+        };
+        Self::open_config(&config)
+    }
+
+    pub(crate) fn open_config(config: &ResolvedLoggingConfig) -> io::Result<Self> {
+        let path = config.path.clone();
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -67,15 +98,25 @@ impl BackendLogger {
         let logger = Self {
             inner: Arc::new(Mutex::new(LogFile {
                 path,
-                file: Some(file),
+                file: Some(BufWriter::with_capacity(config.buffer_capacity, file)),
                 bytes_written,
-                max_bytes: max_bytes.max(1),
+                max_bytes: config.rotation.max_bytes.max(1),
+                rotation_enabled: config.rotation.enabled,
+                keep_files: config.rotation.keep_files,
+                flush_interval: config.flush_interval,
+                last_flush: Instant::now(),
+                buffer_capacity: config.buffer_capacity,
             })),
             session_id: Arc::from(format!("{}-{started_at}-{sequence}", std::process::id())),
             path: shared_path,
+            level: config.target_level("git_worker"),
+            max_detail_chars: config.max_detail_chars,
         };
+        if config.rotation.enabled && config.rotation.rotate_on_start && bytes_written > 0 {
+            logger.with_file(LogFile::rotate)?;
+        }
         logger.write_event(LogEvent {
-            level: "INFO",
+            level: LogLevel::Info,
             event: "session_started",
             job_id: None,
             cwd: None,
@@ -83,7 +124,7 @@ impl BackendLogger {
             summary: Some(&format!(
                 "version={} log_format=jsonl rotation_bytes={}",
                 env!("CARGO_PKG_VERSION"),
-                max_bytes.max(1)
+                config.rotation.max_bytes.max(1)
             )),
             outcome: None,
         });
@@ -96,7 +137,7 @@ impl BackendLogger {
 
     pub(crate) fn queued(&self, id: GitJobId, cwd: &Path, operation: &OperationLog) {
         self.write_event(LogEvent {
-            level: "INFO",
+            level: LogLevel::Info,
             event: "queued",
             job_id: Some(id),
             cwd: Some(cwd),
@@ -108,7 +149,7 @@ impl BackendLogger {
 
     pub(crate) fn started(&self, id: GitJobId, cwd: &Path, operation: &OperationLog) {
         self.write_event(LogEvent {
-            level: "INFO",
+            level: LogLevel::Info,
             event: "started",
             job_id: Some(id),
             cwd: Some(cwd),
@@ -146,7 +187,7 @@ impl BackendLogger {
         channel: &str,
     ) {
         self.write_event(LogEvent {
-            level: "ERROR",
+            level: LogLevel::Error,
             event: "channel_closed",
             job_id: Some(id),
             cwd: Some(cwd),
@@ -157,10 +198,13 @@ impl BackendLogger {
     }
 
     fn write_event(&self, event: LogEvent<'_>) {
+        if event.level > self.level {
+            return;
+        }
         let mut line = format!(
             "{{\"ts_unix_ms\":{},\"level\":\"{}\",\"component\":\"git-worker\",\"session_id\":\"{}\",\"event\":\"{}\"",
             unix_millis(),
-            json_escape(event.level),
+            event.level.as_str().to_ascii_uppercase(),
             json_escape(&self.session_id),
             json_escape(event.event)
         );
@@ -181,14 +225,14 @@ impl BackendLogger {
             if !operation.details.is_empty() {
                 line.push_str(&format!(
                     ",\"details\":\"{}\"",
-                    json_escape(&truncate(&operation.details, MAX_DETAIL_CHARS))
+                    json_escape(&truncate(&operation.details, self.max_detail_chars))
                 ));
             }
         }
         if let Some(summary) = event.summary.filter(|summary| !summary.is_empty()) {
             line.push_str(&format!(
                 ",\"summary\":\"{}\"",
-                json_escape(&truncate(summary, MAX_DETAIL_CHARS))
+                json_escape(&truncate(summary, self.max_detail_chars))
             ));
         }
         if let Some((status, duration_ms)) = event.outcome {
@@ -212,11 +256,24 @@ impl BackendLogger {
             Err(poisoned) => callback(&mut poisoned.into_inner()),
         }
     }
+
+    pub(crate) fn flush_due(&self) {
+        self.with_file(|file| {
+            let _ = file.flush_due();
+        });
+    }
+
+    pub(crate) fn flush(&self) {
+        self.with_file(|file| {
+            let _ = file.flush();
+        });
+    }
 }
 
 impl LogFile {
     fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
-        if self.bytes_written > 0
+        if self.rotation_enabled
+            && self.bytes_written > 0
             && self.bytes_written.saturating_add(line.len() as u64) > self.max_bytes
         {
             self.rotate()?;
@@ -226,8 +283,25 @@ impl LogFile {
             .as_mut()
             .ok_or_else(|| io::Error::other("backend log file is closed"))?;
         file.write_all(line)?;
-        file.flush()?;
         self.bytes_written = self.bytes_written.saturating_add(line.len() as u64);
+        if self.flush_interval.is_zero() || self.last_flush.elapsed() >= self.flush_interval {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush_due(&mut self) -> io::Result<()> {
+        if !self.flush_interval.is_zero() && self.last_flush.elapsed() >= self.flush_interval {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(file) = self.file.as_mut() {
+            file.flush()?;
+            self.last_flush = Instant::now();
+        }
         Ok(())
     }
 
@@ -236,25 +310,34 @@ impl LogFile {
             file.flush()?;
         }
 
-        let backup = rotated_path(&self.path);
-        let rotate_result = (|| -> io::Result<File> {
-            match fs::remove_file(&backup) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
+        let rotate_result = (|| -> io::Result<BufWriter<File>> {
+            if self.keep_files == 0 {
+                remove_if_exists(&self.path)?;
+            } else {
+                remove_if_exists(&rotated_path(&self.path, self.keep_files))?;
+                for index in (2..=self.keep_files).rev() {
+                    let previous = rotated_path(&self.path, index - 1);
+                    if previous.exists() {
+                        fs::rename(previous, rotated_path(&self.path, index))?;
+                    }
+                }
+                if self.path.exists() {
+                    fs::rename(&self.path, rotated_path(&self.path, 1))?;
+                }
             }
-            fs::rename(&self.path, &backup)?;
-            OpenOptions::new()
+            let file = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(&self.path)
+                .open(&self.path)?;
+            Ok(BufWriter::with_capacity(self.buffer_capacity, file))
         })();
 
         match rotate_result {
             Ok(file) => {
                 self.file = Some(file);
                 self.bytes_written = 0;
+                self.last_flush = Instant::now();
                 Ok(())
             }
             Err(error) => {
@@ -264,7 +347,8 @@ impl LogFile {
                     .create(true)
                     .append(true)
                     .open(&self.path)
-                    .ok();
+                    .ok()
+                    .map(|file| BufWriter::with_capacity(self.buffer_capacity, file));
                 self.bytes_written = fs::metadata(&self.path).map_or(0, |metadata| metadata.len());
                 Err(error)
             }
@@ -272,45 +356,14 @@ impl LogFile {
     }
 }
 
+impl Drop for LogFile {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
 pub fn default_backend_log_path() -> PathBuf {
-    if let Some(path) = env::var_os("PITUI_LOG")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-    {
-        return path;
-    }
-
-    #[cfg(target_os = "macos")]
-    if let Some(home) = env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join("Library")
-            .join("Logs")
-            .join("pitui")
-            .join("pitui.jsonl");
-    }
-
-    #[cfg(windows)]
-    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(local_app_data)
-            .join("pitui")
-            .join("pitui.jsonl");
-    }
-
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        if let Some(state_home) = env::var_os("XDG_STATE_HOME") {
-            return PathBuf::from(state_home).join("pitui").join("pitui.jsonl");
-        }
-        if let Some(home) = env::var_os("HOME") {
-            return PathBuf::from(home)
-                .join(".local")
-                .join("state")
-                .join("pitui")
-                .join("pitui.jsonl");
-        }
-    }
-
-    env::temp_dir().join("pitui").join("pitui.jsonl")
+    crate::config::default_backend_log_path()
 }
 
 pub(crate) fn operation_log(request: &GitRequest) -> OperationLog {
@@ -390,10 +443,10 @@ pub(crate) fn operation_log(request: &GitRequest) -> OperationLog {
     OperationLog { name, details }
 }
 
-fn response_log(response: &GitResponse, operation: &str) -> (&'static str, &'static str, String) {
+fn response_log(response: &GitResponse, operation: &str) -> (LogLevel, &'static str, String) {
     match response {
         GitResponse::RepositoryStatusLoaded(repository) => (
-            "INFO",
+            LogLevel::Info,
             "success",
             format!(
                 "branch={} head={} staged={} modified={} untracked={} conflicted={}",
@@ -408,11 +461,13 @@ fn response_log(response: &GitResponse, operation: &str) -> (&'static str, &'sta
                 repository.status.conflicted
             ),
         ),
-        GitResponse::BranchesLoaded(branches) => {
-            ("INFO", "success", format!("branches={}", branches.len()))
-        }
+        GitResponse::BranchesLoaded(branches) => (
+            LogLevel::Info,
+            "success",
+            format!("branches={}", branches.len()),
+        ),
         GitResponse::RemotesLoaded(remotes) => (
-            "INFO",
+            LogLevel::Info,
             "success",
             format!(
                 "remotes={} inconsistent={} upstream={}",
@@ -425,12 +480,12 @@ fn response_log(response: &GitResponse, operation: &str) -> (&'static str, &'sta
             ),
         ),
         GitResponse::CommitsLoaded { branch, commits } => (
-            "INFO",
+            LogLevel::Info,
             "success",
             format!("branch={} commits={}", branch.0, commits.len()),
         ),
         GitResponse::CommitDetailLoaded(detail) => (
-            "INFO",
+            LogLevel::Info,
             "success",
             format!(
                 "commit={} files={}",
@@ -439,12 +494,12 @@ fn response_log(response: &GitResponse, operation: &str) -> (&'static str, &'sta
             ),
         ),
         GitResponse::CommitMessageLoaded { commit, message } => (
-            "INFO",
+            LogLevel::Info,
             "success",
             format!("commit={} message_bytes={}", commit.0, message.len()),
         ),
         GitResponse::FileDiffLoaded(diff) => (
-            "INFO",
+            LogLevel::Info,
             "success",
             format!(
                 "path={} hunks={} binary={}",
@@ -453,18 +508,22 @@ fn response_log(response: &GitResponse, operation: &str) -> (&'static str, &'sta
                 diff.is_binary
             ),
         ),
-        GitResponse::ReflogLoaded(entries) => {
-            ("INFO", "success", format!("entries={}", entries.len()))
-        }
-        GitResponse::WorkingTreeLoaded(changes) => {
-            ("INFO", "success", format!("changes={}", changes.len()))
-        }
+        GitResponse::ReflogLoaded(entries) => (
+            LogLevel::Info,
+            "success",
+            format!("entries={}", entries.len()),
+        ),
+        GitResponse::WorkingTreeLoaded(changes) => (
+            LogLevel::Info,
+            "success",
+            format!("changes={}", changes.len()),
+        ),
         GitResponse::WorkingTreeDiffLoaded(diff) => (
-            "INFO",
+            LogLevel::Info,
             "success",
             format!("path={} sections={}", diff.path, diff.sections.len()),
         ),
-        GitResponse::CommandSucceeded { .. } => ("INFO", "success", String::new()),
+        GitResponse::CommandSucceeded { .. } => (LogLevel::Info, "success", String::new()),
         GitResponse::CommandFailed { command, stderr } => {
             let command = match operation {
                 "commit" => "git commit <redacted>",
@@ -473,15 +532,23 @@ fn response_log(response: &GitResponse, operation: &str) -> (&'static str, &'sta
                 _ => command,
             };
             (
-                "ERROR",
+                LogLevel::Error,
                 "failure",
-                format!("command={command} stderr={stderr}"),
+                format!(
+                    "command={} stderr={}",
+                    redact_url_tokens(command),
+                    redact_url_tokens(stderr)
+                ),
             )
         }
         GitResponse::RebaseConflictAborted { command, stderr } => (
-            "WARN",
+            LogLevel::Warn,
             "conflict_aborted",
-            format!("command={command} stderr={stderr}"),
+            format!(
+                "command={} stderr={}",
+                redact_url_tokens(command),
+                redact_url_tokens(stderr)
+            ),
         ),
     }
 }
@@ -517,6 +584,25 @@ fn truncate(value: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn redact_url_tokens(value: &str) -> String {
+    value
+        .split_inclusive(char::is_whitespace)
+        .map(|segment| {
+            let content_len = segment.trim_end_matches(char::is_whitespace).len();
+            let (content, whitespace) = segment.split_at(content_len);
+            let lower = content.to_ascii_lowercase();
+            let looks_like_url = lower.contains("://")
+                || lower.starts_with("git@")
+                || (lower.contains('@') && lower.contains(':'));
+            if looks_like_url {
+                format!("<redacted-url>{whitespace}")
+            } else {
+                segment.to_string()
+            }
+        })
+        .collect()
+}
+
 fn json_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -537,16 +623,26 @@ fn json_escape(value: &str) -> String {
     escaped
 }
 
-fn rotated_path(path: &Path) -> PathBuf {
+fn rotated_path(path: &Path, index: usize) -> PathBuf {
     let mut name = path
         .file_name()
         .map_or_else(|| "pitui.jsonl".into(), |name| name.to_os_string());
-    name.push(".1");
+    name.push(format!(".{index}"));
     path.with_file_name(name)
+}
+
+fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
     use crate::{
         domain::GitPath,
@@ -606,9 +702,112 @@ mod tests {
         }
 
         assert!(path.exists());
-        assert!(rotated_path(&path).exists());
+        assert!(rotated_path(&path, 1).exists());
         assert!(!fs::read_to_string(&path).unwrap().is_empty());
-        assert!(!fs::read_to_string(rotated_path(&path)).unwrap().is_empty());
+        assert!(
+            !fs::read_to_string(rotated_path(&path, 1))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn honors_level_flush_interval_and_multiple_retained_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("backend.jsonl");
+        let mut config = ResolvedLoggingConfig {
+            enabled: true,
+            level: LogLevel::Error,
+            path: path.clone(),
+            flush_interval: Duration::from_millis(50),
+            buffer_capacity: 1024,
+            max_detail_chars: 4096,
+            fail_on_open_error: true,
+            rotation: crate::config::LogRotationConfig {
+                enabled: true,
+                max_bytes: 350,
+                keep_files: 3,
+                rotate_on_start: false,
+            },
+            targets: Default::default(),
+        };
+        let logger = BackendLogger::open_config(&config).unwrap();
+        let request = GitRequest::StagePaths {
+            paths: vec![GitPath::from("a-file-with-a-long-name.txt")],
+        };
+        let operation = operation_log(&request);
+        logger.queued(1, directory.path(), &operation);
+        logger.flush();
+        assert!(fs::read_to_string(&path).unwrap().is_empty());
+
+        logger.completed(
+            1,
+            directory.path(),
+            &operation,
+            &GitResponse::CommandFailed {
+                command: "git add -- file".into(),
+                stderr: "failed".into(),
+            },
+            Duration::from_millis(1),
+        );
+        thread::sleep(Duration::from_millis(60));
+        logger.flush_due();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"level\":\"ERROR\"")
+        );
+
+        config.level = LogLevel::Info;
+        let rotation_path = directory.path().join("rotation.jsonl");
+        config.path = rotation_path.clone();
+        let rotating = BackendLogger::open_config(&config).unwrap();
+        for id in 1..=30 {
+            rotating.queued(id, directory.path(), &operation);
+            rotating.flush();
+        }
+        assert!(rotated_path(&rotation_path, 1).exists());
+        assert!(rotated_path(&rotation_path, 2).exists());
+        assert!(rotated_path(&rotation_path, 3).exists());
+        assert!(!rotated_path(&rotation_path, 4).exists());
+    }
+
+    #[test]
+    fn target_level_override_and_rotate_on_start_are_applied() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("backend.jsonl");
+        fs::write(&path, "{\"event\":\"previous-session\"}\n").unwrap();
+        let mut config = ResolvedLoggingConfig {
+            enabled: true,
+            level: LogLevel::Error,
+            path: path.clone(),
+            flush_interval: Duration::ZERO,
+            buffer_capacity: 1024,
+            max_detail_chars: 4096,
+            fail_on_open_error: true,
+            rotation: crate::config::LogRotationConfig {
+                enabled: true,
+                max_bytes: 1024 * 1024,
+                keep_files: 2,
+                rotate_on_start: true,
+            },
+            targets: Default::default(),
+        };
+        config.targets.insert("git_worker".into(), LogLevel::Info);
+
+        let logger = BackendLogger::open_config(&config).unwrap();
+        let operation = operation_log(&GitRequest::LoadBranches);
+        logger.queued(1, directory.path(), &operation);
+        logger.flush();
+
+        assert!(
+            fs::read_to_string(rotated_path(&path, 1))
+                .unwrap()
+                .contains("previous-session")
+        );
+        let current = fs::read_to_string(path).unwrap();
+        assert!(current.contains("session_started"));
+        assert!(current.contains("\"event\":\"queued\""));
     }
 
     #[test]
@@ -645,5 +844,18 @@ mod tests {
         assert_eq!(logs[4].details, "remote=origin");
         assert_eq!(logs[5].details, "remote=origin");
         assert!(logs.iter().all(|log| !log.details.contains("secret")));
+
+        let (_, _, summary) = response_log(
+            &GitResponse::CommandFailed {
+                command: "git push https://user:secret@example.invalid/repo.git".into(),
+                stderr:
+                    "fatal: unable to access 'https://user:secret@example.invalid/repo.git': denied"
+                        .into(),
+            },
+            "push",
+        );
+        assert!(summary.contains("<redacted-url>"));
+        assert!(!summary.contains("secret"));
+        assert!(!summary.contains("example.invalid"));
     }
 }

@@ -30,6 +30,10 @@ cargo test --all-targets
 - Remote write 测试只能使用临时 bare repository；pull 行为必须显式保持 `--rebase`，push 不得猜测或自动创建 upstream。
 - Remote Management 必须在联系 remote 前拒绝拆分的 fetch/push URL 和分支路由；测试 URL 只能指向临时本地仓库，后台 operation metadata 不得记录 URL。
 - Git 元信息、路径和 diff 在进入终端前必须经过控制字符清理。
+- Normal/Chord 快捷键必须注册为稳定的 `CommandId`；输入和 action-only footer 必须共同读取
+  有效 keymap，禁止在 renderer 再手写同一绑定。确认、文本编辑和 hard reset 安全键保持保留交互。
+- 新增全局配置字段时必须保持 `schema_version`、严格未知字段检查、`--print-effective-config`
+  和 `docs/config.example.toml` 同步；配置错误必须发生在 terminal 初始化前。
 - parser、controller 状态转移和真实临时仓库行为都应有针对性测试。
 
 ## Pull Request

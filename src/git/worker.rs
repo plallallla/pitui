@@ -1,14 +1,16 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
+
+use crate::config::{ResolvedConfig, ResolvedLoggingConfig};
 
 use super::{
     GitJobId, GitRequest, GitResponseEnvelope, execute_request,
-    logging::{BackendLogger, default_backend_log_path, operation_log},
+    logging::{BackendLogger, operation_log},
 };
 
 #[derive(Debug)]
@@ -31,14 +33,26 @@ pub struct GitCommandBus {
 
 impl GitCommandBus {
     pub fn spawn() -> Self {
-        let requested_path = default_backend_log_path();
-        match BackendLogger::open(requested_path.clone()) {
+        let config = ResolvedConfig::default();
+        Self::spawn_with_logging_config(&config.logging)
+            .expect("default best-effort logging must not prevent startup")
+    }
+
+    pub fn spawn_with_logging_config(config: &ResolvedLoggingConfig) -> io::Result<Self> {
+        if !config.enabled {
+            return Ok(Self::spawn_with_logger(None, None));
+        }
+        let requested_path = config.path.clone();
+        let bus = match BackendLogger::open_config(config) {
             Ok(logger) => Self::spawn_with_logger(Some(logger), None),
+            Err(primary_error) if config.fail_on_open_error => return Err(primary_error),
             Err(primary_error) => {
                 let fallback_path = std::env::temp_dir()
                     .join("pitui")
                     .join(format!("pitui-{}.jsonl", std::process::id()));
-                match BackendLogger::open(fallback_path.clone()) {
+                let mut fallback = config.clone();
+                fallback.path = fallback_path.clone();
+                match BackendLogger::open_config(&fallback) {
                     Ok(logger) => Self::spawn_with_logger(
                         Some(logger),
                         Some(format!(
@@ -57,13 +71,17 @@ impl GitCommandBus {
                     ),
                 }
             }
-        }
+        };
+        Ok(bus)
     }
 
     /// Creates a command bus that writes its backend operation log to an
     /// explicit path. This is useful for embedders and deterministic tests.
     pub fn spawn_with_log_path(path: impl Into<PathBuf>) -> io::Result<Self> {
-        BackendLogger::open(path.into()).map(|logger| Self::spawn_with_logger(Some(logger), None))
+        let mut config = ResolvedConfig::default().logging;
+        config.path = path.into();
+        config.fail_on_open_error = true;
+        Self::spawn_with_logging_config(&config)
     }
 
     fn spawn_with_logger(logger: Option<BackendLogger>, logging_warning: Option<String>) -> Self {
@@ -74,7 +92,22 @@ impl GitCommandBus {
         thread::Builder::new()
             .name("pitui-git-worker".into())
             .spawn(move || {
-                while let Ok(job) = request_rx.recv() {
+                loop {
+                    let job = match request_rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(job) => job,
+                        Err(RecvTimeoutError::Timeout) => {
+                            if let Some(logger) = worker_logger.as_ref() {
+                                logger.flush_due();
+                            }
+                            continue;
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            if let Some(logger) = worker_logger.as_ref() {
+                                logger.flush();
+                            }
+                            break;
+                        }
+                    };
                     let operation = operation_log(&job.request);
                     if let Some(logger) = worker_logger.as_ref() {
                         logger.started(job.id, &job.cwd, &operation);
@@ -154,5 +187,42 @@ impl GitCommandBus {
 
     pub fn logging_warning(&self) -> Option<&str> {
         self.logging_warning.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logging_can_be_disabled_without_creating_a_sink() {
+        let mut config = ResolvedConfig::default().logging;
+        config.enabled = false;
+        let bus = GitCommandBus::spawn_with_logging_config(&config).unwrap();
+        assert_eq!(bus.log_path(), None);
+        assert_eq!(bus.logging_warning(), None);
+    }
+
+    #[test]
+    fn strict_log_open_failures_are_returned_before_the_tui_starts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = ResolvedConfig::default().logging;
+        config.path = directory.path().to_path_buf();
+        config.fail_on_open_error = true;
+        assert!(GitCommandBus::spawn_with_logging_config(&config).is_err());
+    }
+
+    #[test]
+    fn best_effort_log_open_failures_fall_back_and_report_the_actual_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = ResolvedConfig::default().logging;
+        config.path = directory.path().to_path_buf();
+        config.fail_on_open_error = false;
+        let bus = GitCommandBus::spawn_with_logging_config(&config).unwrap();
+        assert!(bus.log_path().is_some_and(|path| path != directory.path()));
+        assert!(
+            bus.logging_warning()
+                .is_some_and(|warning| warning.contains("logging to"))
+        );
     }
 }

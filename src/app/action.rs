@@ -1,3 +1,5 @@
+use crate::config::KeyStroke;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
     Tick,
@@ -53,7 +55,7 @@ pub enum Action {
     PrevFile,
     ToggleWrap,
     ToggleCommitCopySelection,
-    OpenCommitCopyShortcuts,
+    BeginChord(Vec<KeyStroke>),
     CopySelectedCommitHashes,
     CopyCurrentCommitInfo,
     CopyCurrentCommitMessage,

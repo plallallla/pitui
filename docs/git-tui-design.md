@@ -167,14 +167,11 @@ pub enum GlobalMode {
         input: String,
         validation_error: Option<String>,
     },
-    Shortcut {
-        menu: ShortcutMenu,
+    Chord {
+        prefix: Vec<KeyStroke>,
+        started_at: Instant,
     },
     Error,
-}
-
-pub enum ShortcutMenu {
-    CommitCopy,
 }
 ```
 
@@ -184,6 +181,7 @@ pub enum ShortcutMenu {
 
 ```rust
 pub struct AppState {
+    pub config: Arc<ResolvedConfig>,
     pub repositories: Vec<RepositoryState>,
     pub backend_log_path: Option<PathBuf>,
     pub backend_logging_warning: Option<String>,
@@ -351,7 +349,7 @@ pub enum Action {
     ToggleWrap,
 
     ToggleCommitCopySelection,
-    OpenCommitCopyShortcuts,
+    BeginChord(Vec<KeyStroke>),
     CopySelectedCommitHashes,
     CopyCurrentCommitInfo,
     CopyCurrentCommitMessage,
@@ -552,7 +550,7 @@ focus = BranchList
 | End | End | commits 非空 | 选择最后一个 commit |
 | Enter | OpenCommitDetail | 已选择 commit | 加载 commit detail，然后进入 View 2 |
 | Space | ToggleCommitCopySelection | 已选择 commit | 加入/移出独立的复制多选集合 |
-| Ctrl+C | OpenCommitCopyShortcuts | 已选择 commit | 进入 CommitCopy 二级快捷键，不改变 focus |
+| Ctrl+C | BeginChord([Ctrl+C]) | 已选择 commit | 进入当前有效 keymap 的复制 chord，不改变 focus |
 | Ctrl+C → h | CopySelectedCommitHashes | commits 非空 | 按列表顺序复制多选完整 hashes；集合为空则复制当前 hash |
 | Ctrl+C → i | CopyCurrentCommitInfo | 已选择 commit | 复制 hash、author、date、refs 与 message |
 | Ctrl+C → m | CopyCurrentCommitMessage | 已选择 commit | 复制完整 message；缺少 detail 时后台加载，不切换 screen/focus |
@@ -567,7 +565,10 @@ focus = BranchList
 
 `commit_copy_selection` 与 cherry-pick queue 完全独立；切换仓库或 viewing branch 时清空，过滤列表不会改变集合。剪贴板由 TUI 层通过 OSC 52 写入，不引入平台特定 clipboard 命令。message copy 必须返回完整 subject/body；若 `CommitDetail` 尚未缓存，则发送独立 `LoadCommitMessage`，响应只写 clipboard，不得导航到 Commit Detail 或改变当前 focus。
 
-`Ctrl+C` 是可扩展的二级快捷键 prefix。进入 `GlobalMode::Shortcut { CommitCopy }` 后，状态栏只显示 `h hash | i info | m message | Esc cancel`；`q` 或再次按 `Ctrl+C` 也取消。普通模式不再长期占用 `c/i/m` 三个单键，二级操作完成或取消后恢复 `Normal`，focus 始终不变。
+`Ctrl+C` 是可配置的二级快捷键 prefix。进入 `GlobalMode::Chord` 后，底部只显示当前 prefix
+直接可接受的 `h hash | i info | m message | Esc cancel`；`q` 或再次按 `Ctrl+C` 也取消。
+通用 resolver 同样支持三段 chord，且每次只揭示下一段。普通模式不再长期占用 `c/i/m`
+三个单键，chord 完成、超时或取消后恢复 `Normal`，focus 始终不变。
 
 ### 6.6 View 1 状态转移
 
@@ -1827,3 +1828,31 @@ Pitui 的定位是：
 - `.github/workflows/ci.yml` 在 Linux 执行 format/clippy，并在 Linux、macOS、Windows 执行完整测试。
 - Dependabot 同时跟踪 Cargo 与 GitHub Actions 依赖。
 - Bug / Feature Issue Forms、PR template、`CONTRIBUTING.md` 和 `SECURITY.md` 规范复现信息、危险 Git 操作审查、AI 生成披露与私密漏洞报告。
+
+---
+
+## 22. 全局配置层（第一阶段已实现）
+
+全局配置层采用版本化 TOML，并在进入 terminal raw mode 前完成加载、合并与严格校验。
+它只读取受信任的用户全局配置，不读取仓库内配置；默认配置保持原有绑定、Git 与日志
+语义，同时把 footer 升级为 action-only 和逐级 chord 提示。
+
+核心设计约束：
+
+1. 建立稳定的 `CommandId + CommandDescriptor` 注册表；输入映射、二级快捷键和底部
+   hotkey bar 共同读取同一份有效 keymap，禁止分别维护绑定字符串。
+2. footer 只展示当前状态下 input resolver 会接受的下一键；chord 在 root 只展示第一级
+   prefix，按下后才展示第二级，三段 chord 继续逐级揭示，不提前泄露后续提示。
+3. 配置可覆盖单键、修饰键及多段 chord，并独立配置哪些 command/chord group 提示可见、
+   footer label、优先级、显示模式与最大行数；隐藏提示不解除绑定。
+4. `[diff].default_mode` 配置 Commit File Diff 与 Changes Diff 共用的启动默认模式；
+   side-by-side 在窄终端仍保持安全的临时 unified 降级。
+5. 日志配置覆盖路径、level、target level、flush interval、writer buffer、单文件大小、
+   备份数量与打开失败策略，同时继续强制脱敏和运行时 I/O best-effort 语义。
+6. 不自动监视配置文件；后续手动 reload 必须完整校验后原子切换，失败时保留最后一份
+   有效配置，避免输入与提示跨 generation 不一致。
+7. 第一阶段不提供 TUI 配置编辑器，不配置 shell/Git 命令模板，也不改变当前 Git 安全策略。
+
+第一阶段不包含运行时 reload、文件 watcher、TUI 配置编辑器或独立异步日志事件队列。
+完整 schema、快捷键冲突规则、footer 生成算法、日志轮转/刷新策略、模块边界、测试矩阵与
+后续计划见 [`global-configuration-design.md`](global-configuration-design.md)。

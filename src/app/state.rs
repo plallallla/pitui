@@ -1,9 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
 };
 
 use crate::{
+    config::{KeyStroke, ResolvedConfig},
     domain::{
         Branch, BranchName, Commit, CommitDetail, CommitHash, CommitList, FileDiff, GitPath,
         ReflogEntry, RemoteInfo, Repository, WorkingTreeChange,
@@ -84,14 +87,6 @@ pub enum DiffViewMode {
 pub enum FilterTarget {
     Branches,
     Commits,
-}
-
-/// Extensible second-level shortcut palette. Prefix keys enter a palette;
-/// the following key chooses one related operation without consuming more
-/// single-key bindings in normal navigation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ShortcutMenu {
-    CommitCopy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,8 +187,9 @@ pub enum GlobalMode {
         url: String,
         validation_error: Option<String>,
     },
-    Shortcut {
-        menu: ShortcutMenu,
+    Chord {
+        prefix: Vec<KeyStroke>,
+        started_at: Instant,
     },
     Error,
 }
@@ -474,6 +470,9 @@ impl RepositoryState {
 
 #[derive(Debug)]
 pub struct AppState {
+    /// Immutable effective configuration snapshot shared by input and
+    /// rendering, so hints can never disagree with the active bindings.
+    pub config: Arc<ResolvedConfig>,
     pub repositories: Vec<RepositoryState>,
     /// Persistent JSONL audit trail written by the Git worker. The value is
     /// exposed to the UI so users can discover the effective path, including
@@ -540,12 +539,18 @@ impl Default for AppState {
 
 impl AppState {
     pub fn with_repository_paths(paths: Vec<PathBuf>) -> Self {
+        Self::with_config(paths, ResolvedConfig::shared_default())
+    }
+
+    pub fn with_config(paths: Vec<PathBuf>, config: Arc<ResolvedConfig>) -> Self {
         let repositories = paths
             .into_iter()
             .map(RepositoryState::new)
             .collect::<Vec<_>>();
         let active_repository_index = (!repositories.is_empty()).then_some(0);
         Self {
+            diff_mode: config.diff.default_mode,
+            config,
             repositories,
             backend_log_path: None,
             backend_logging_warning: None,
@@ -573,7 +578,6 @@ impl AppState {
                 ..SelectionState::default()
             },
             expansion: ExpansionState::default(),
-            diff_mode: DiffViewMode::Unified,
             wrap_diff: false,
             cherry_pick_queue: Vec::new(),
             cherry_pick_queue_repository_index: None,
@@ -595,6 +599,16 @@ impl AppState {
             commit_filter: String::new(),
             tick_count: 0,
         }
+    }
+
+    pub fn chord_expired(&self, now: Instant) -> bool {
+        let GlobalMode::Chord { started_at, .. } = &self.mode else {
+            return false;
+        };
+        self.config
+            .keymap
+            .chord_timeout
+            .is_some_and(|timeout| now.saturating_duration_since(*started_at) >= timeout)
     }
 
     pub fn is_loading(&self) -> bool {

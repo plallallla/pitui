@@ -11,8 +11,8 @@ use crate::{
     app::{
         AppState, BranchTreeNode, ChangeGroup, ChangesTreeNode, ConfirmDialog, DiffViewMode,
         FilterTarget, FocusPanel, GlobalMode, RemoteEditKind, RemoteInputField, Screen,
-        ShortcutMenu,
     },
+    config::{FooterMode, FooterOverflow},
     domain::{DiffCellKind, DiffLineKind, FileDiff, side_by_side_rows},
 };
 
@@ -38,12 +38,22 @@ fn terminal_safe(value: &str) -> String {
 
 pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     let area = frame.area();
+    let footer_height = match app.mode {
+        GlobalMode::Normal | GlobalMode::Chord { .. } => {
+            if app.config.footer.mode != FooterMode::Hidden {
+                app.config.footer.max_rows
+            } else {
+                0
+            }
+        }
+        _ => 1,
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(1),
+            Constraint::Length(footer_height),
         ])
         .split(area);
 
@@ -56,7 +66,9 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
         Screen::Changes => render_changes(frame, app, rows[1], area.width),
         Screen::Remotes => render_remotes(frame, app, rows[1]),
     }
-    render_hotkeys(frame, app, rows[2]);
+    if footer_height > 0 {
+        render_hotkeys(frame, app, rows[2]);
+    }
     render_popup(frame, app, area);
 }
 
@@ -133,7 +145,7 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         GlobalMode::TypingConfirmation { .. } => "TYPE",
         GlobalMode::EditingCommitMessage { .. } => "COMMIT",
         GlobalMode::EditingRemote { .. } => "REMOTE",
-        GlobalMode::Shortcut { .. } => "SHORTCUT",
+        GlobalMode::Chord { .. } => "SHORTCUT",
         GlobalMode::Error => "ERROR",
     };
     let spinner = if app.is_loading() {
@@ -1251,7 +1263,7 @@ fn side_by_side_text(diff: Option<&FileDiff>, width: u16, empty_message: &str) -
 }
 
 fn render_hotkeys(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let mut text = match &app.mode {
+    let mut static_text = match &app.mode {
         GlobalMode::Filtering { target, query } => format!(
             " /{}: {}_ | Enter apply | Esc cancel ",
             match target {
@@ -1285,158 +1297,124 @@ fn render_hotkeys(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 " Set shared fetch/push URL | Enter continue | Esc cancel ".into()
             }
         },
-        GlobalMode::Shortcut {
-            menu: ShortcutMenu::CommitCopy,
-        } => " Copy commit: h hash | i info | m message | Esc cancel ".into(),
+        GlobalMode::Chord { .. } | GlobalMode::Normal => String::new(),
         GlobalMode::Error => " Enter / Esc dismiss ".into(),
-        GlobalMode::Normal => match (app.screen, app.focus) {
-            (Screen::BranchOverview, FocusPanel::BranchList) => {
-                let mut keys = vec!["Tab focus"];
-                match app.selected_tree_node() {
-                    Some(BranchTreeNode::Repository { .. }) => {
-                        keys.extend([
-                            "Enter expand/collapse",
-                            "o remotes",
-                            "f fetch",
-                            "p pull --rebase",
-                            "P push",
-                            "g reflog",
-                        ]);
-                    }
-                    Some(BranchTreeNode::Branch { .. }) => {
-                        keys.extend(["Enter view commits", "o remotes", "s switch", "b rebase"]);
-                    }
-                    None => {}
-                }
-                if app.selected_commit().is_some() {
-                    keys.push("Ctrl+C copy commit…");
-                }
-                keys.extend(["/ filter", "q quit"]);
-                format!(" {} ", keys.join(" | "))
-            }
-            (Screen::BranchOverview, FocusPanel::CommitList) => {
-                let mut keys = vec!["Tab focus"];
-                if app.selected_commit().is_some() {
-                    keys.extend([
-                        "Enter detail",
-                        "Space select",
-                        "Ctrl+C copy…",
-                        "y queue",
-                        "R reset",
-                    ]);
-                }
-                if !app.cherry_pick_queue.is_empty() {
-                    keys.push("Y cherry-pick");
-                }
-                keys.extend(["/ filter", "q quit"]);
-                format!(" {} ", keys.join(" | "))
-            }
-            (Screen::CommitDetail, FocusPanel::CommitList) => {
-                let mut keys = Vec::new();
-                if app.selected_commit().is_some() {
-                    keys.extend([
-                        "Enter detail",
-                        "Space select",
-                        "Ctrl+C copy…",
-                        "y queue",
-                        "R reset",
-                    ]);
-                }
-                if !app.cherry_pick_queue.is_empty() {
-                    keys.push("Y cherry-pick");
-                }
-                keys.extend(["/ filter", "Esc back"]);
-                format!(" {} ", keys.join(" | "))
-            }
-            (Screen::CommitDetail, FocusPanel::CommitFileList) => {
-                let mut keys = Vec::new();
-                if app.selected_file().is_some() {
-                    keys.extend(["Space expand", "Enter file diff"]);
-                }
-                if app.selected_commit().is_some() {
-                    keys.extend(["Ctrl+C copy commit…", "y queue"]);
-                }
-                keys.extend([
-                    "Home/End first/last",
-                    "PgUp/PgDn page",
-                    "Tab focus",
-                    "Esc back",
-                    "q quit",
-                ]);
-                format!(" {} ", keys.join(" | "))
-            }
-            (Screen::FileDiffDetail, _) => {
-                let mut keys = vec!["v mode", "Ctrl+C copy commit…"];
-                if app.selected_file().is_some() {
-                    keys.extend(["n next", "p prev"]);
-                }
-                keys.extend([
-                    "w wrap",
-                    "Home/End",
-                    "PgUp/PgDn",
-                    "Tab focus",
-                    "Esc back",
-                    "q quit",
-                ]);
-                format!(" {} ", keys.join(" | "))
-            }
-            (Screen::Reflog, FocusPanel::ReflogList) => {
-                let mut keys = Vec::new();
-                if app.selected_reflog().is_some() {
-                    keys.push("R reset");
-                }
-                keys.extend(["Esc back", "q quit"]);
-                format!(" {} ", keys.join(" | "))
-            }
-            (Screen::Remotes, FocusPanel::RemoteList) => {
-                let mut keys = vec!["a add remote"];
-                if app.selected_remote().is_some() {
-                    keys.extend(["e set shared URL", "u set upstream"]);
-                }
-                keys.extend(["Home/End", "PgUp/PgDn", "Esc back", "q quit"]);
-                format!(" {} ", keys.join(" | "))
-            }
-            (Screen::Changes, FocusPanel::ChangesTree) => {
-                let mut keys = Vec::new();
-                match app.selected_changes_node() {
-                    Some(ChangesTreeNode::File { .. }) => keys.push("Enter open diff"),
-                    Some(_) => keys.push("Enter expand/collapse"),
-                    None => {}
-                }
-                keys.extend([
-                    "Space select",
-                    "s stage",
-                    "u unstage",
-                    "c commit",
-                    "←/→ collapse/expand",
-                    "v diff mode",
-                    "w wrap",
-                    "Home/End",
-                    "PgUp/PgDn",
-                    "Tab focus",
-                    "Esc back",
-                    "q quit",
-                ]);
-                format!(" {} ", keys.join(" | "))
-            }
-            (Screen::Changes, FocusPanel::ChangesDiff) => {
-                " Space select file | s stage | u unstage | c commit | ↑/↓ scroll | Home/End | PgUp/PgDn | v mode | w wrap | Tab tree | Esc back "
-                    .into()
-            }
-            _ => " q quit ".into(),
-        },
     };
-    if matches!(app.mode, GlobalMode::Normal) {
-        text = format!(" Ctrl+G changes | Ctrl+R refresh | {} ", text.trim());
-    }
-    if let Some(message) = app.last_message.as_ref() {
-        text.push_str(&format!(" | ✓ {message} "));
-    }
+
+    let text = if matches!(app.mode, GlobalMode::Normal | GlobalMode::Chord { .. }) {
+        let mut items = app
+            .config
+            .keymap
+            .footer_items(app, &app.config.footer)
+            .into_iter()
+            .map(|item| format!("{} {}", item.key, item.label))
+            .collect::<Vec<_>>();
+        if matches!(app.mode, GlobalMode::Chord { .. }) {
+            items.push("Esc cancel".into());
+        }
+        if let Some(message) = app.last_message.as_ref() {
+            items.push(format!("✓ {message}"));
+        }
+        footer_lines(
+            &items,
+            usize::from(area.width),
+            usize::from(area.height),
+            &app.config.footer.separator,
+            app.config.footer.overflow,
+        )
+    } else {
+        if let Some(message) = app.last_message.as_ref() {
+            static_text.push_str(&format!(" | ✓ {message} "));
+        }
+        vec![terminal_safe(&static_text)]
+    };
     frame.render_widget(
-        Paragraph::new(terminal_safe(&text))
-            .style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Paragraph::new(Text::from(
+            text.into_iter().map(Line::raw).collect::<Vec<_>>(),
+        ))
+        .style(Style::default().bg(Color::DarkGray).fg(Color::White)),
         area,
     );
+}
+
+fn footer_lines(
+    items: &[String],
+    width: usize,
+    max_rows: usize,
+    separator: &str,
+    overflow: FooterOverflow,
+) -> Vec<String> {
+    if width == 0 || max_rows == 0 {
+        return Vec::new();
+    }
+    let separator = terminal_safe(separator);
+    let items = items
+        .iter()
+        .map(|item| terminal_safe(item))
+        .collect::<Vec<_>>();
+    let mut lines = vec![Vec::<String>::new()];
+    let mut hidden = 0usize;
+    for (index, item) in items.iter().enumerate() {
+        let current = lines.last_mut().expect("at least one footer line");
+        let current_width = current
+            .iter()
+            .map(|entry| UnicodeWidthStr::width(entry.as_str()))
+            .sum::<usize>()
+            + separator
+                .width()
+                .saturating_mul(current.len().saturating_sub(1));
+        let item_width = UnicodeWidthStr::width(item.as_str());
+        let separator_width = if current.is_empty() {
+            0
+        } else {
+            separator.width()
+        };
+        let candidate_width = current_width + separator_width + item_width;
+        if candidate_width <= width {
+            current.push(item.clone());
+        } else if item_width <= width && lines.len() < max_rows {
+            lines.push(vec![item.clone()]);
+        } else {
+            hidden = items.len().saturating_sub(index);
+            break;
+        }
+    }
+    if hidden > 0 {
+        loop {
+            let mut suffix = match overflow {
+                FooterOverflow::Count => format!("… +{hidden}"),
+                FooterOverflow::Ellipsis => "…".into(),
+            };
+            if UnicodeWidthStr::width(suffix.as_str()) > width {
+                suffix = "…".into();
+            }
+            let last = lines.last_mut().expect("at least one footer line");
+            let current = last.join(&separator);
+            let separator_width = if last.is_empty() {
+                0
+            } else {
+                separator.width()
+            };
+            let candidate_width = UnicodeWidthStr::width(current.as_str())
+                + separator_width
+                + UnicodeWidthStr::width(suffix.as_str());
+            if candidate_width <= width {
+                last.push(suffix);
+                break;
+            }
+            if last.pop().is_some() {
+                hidden = hidden.saturating_add(1);
+                continue;
+            }
+            // Only possible for a zero-column terminal (handled above) or an
+            // exotic width implementation. Avoid looping even in that case.
+            break;
+        }
+    }
+    lines
+        .into_iter()
+        .map(|line| line.join(&separator))
+        .collect()
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -1959,9 +1937,12 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::Instant};
+
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
+    use crate::config::{KeyStroke, ResolvedConfig};
     use crate::domain::{
         ChangedFile, Commit, CommitDetail, CommitHash, DiffHunk, DiffLine, FileChangeKind,
         FileDiff, GitPath, ReflogEntry, RemoteInfo, Repository, WorkingTreeChange,
@@ -1988,6 +1969,114 @@ mod tests {
         assert!(rendered.contains("Branches"));
         assert!(rendered.contains("Commits"));
         assert!(rendered.contains("q quit"));
+        assert!(!rendered.contains("Ctrl+R refresh"));
+        assert!(!rendered.contains("Ctrl+G changes"));
+    }
+
+    #[test]
+    fn renders_only_the_current_chord_level_in_the_footer() {
+        let mut state = AppState {
+            focus: FocusPanel::CommitList,
+            ..AppState::default()
+        };
+        state.branch_commits.items.push(Commit {
+            hash: CommitHash("0123456789abcdef".into()),
+            short_hash: "01234567".into(),
+            author: "Ada".into(),
+            authored_at: "2026-07-16".into(),
+            decorations: String::new(),
+            subject: "copy this commit".into(),
+        });
+        state.ensure_valid_commit_selection();
+
+        let backend = TestBackend::new(200, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("Ctrl+C copy…"));
+        assert!(!rendered.contains("h hash"));
+        assert!(!rendered.contains("i info"));
+        assert!(!rendered.contains("m message"));
+
+        state.mode = GlobalMode::Chord {
+            prefix: vec![KeyStroke::parse("Ctrl+C").unwrap()],
+            started_at: Instant::now(),
+        };
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("h hash"));
+        assert!(rendered.contains("i info"));
+        assert!(rendered.contains("m message"));
+        assert!(rendered.contains("Esc cancel"));
+        assert!(!rendered.contains("Ctrl+C copy…"));
+    }
+
+    #[test]
+    fn configured_footer_rows_do_not_replace_the_status_bar() {
+        let mut config = ResolvedConfig::default();
+        config.footer.max_rows = 2;
+        let mut state = AppState::with_config(vec!["/repo".into()], Arc::new(config));
+        state.focus = FocusPanel::CommitList;
+        state.branch_commits.items.push(Commit {
+            hash: CommitHash("0123456789abcdef".into()),
+            short_hash: "01234567".into(),
+            author: "Ada".into(),
+            authored_at: "2026-07-16".into(),
+            decorations: String::new(),
+            subject: "many footer actions".into(),
+        });
+        state.ensure_valid_commit_selection();
+
+        let backend = TestBackend::new(42, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(
+            !row(0).trim().is_empty(),
+            "status bar must stay on the first row"
+        );
+        assert!(!row(13).trim().is_empty(), "first footer row must be used");
+        assert!(!row(14).trim().is_empty(), "second footer row must be used");
+    }
+
+    #[test]
+    fn hidden_footer_keeps_the_status_and_main_view_visible() {
+        let mut config = ResolvedConfig::default();
+        config.footer.mode = FooterMode::Hidden;
+        let state = AppState::with_config(Vec::new(), Arc::new(config));
+        let backend = TestBackend::new(100, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("Branches"));
+        assert!(rendered.contains("repo=—"));
+        assert!(!rendered.contains("q quit"));
+    }
+
+    #[test]
+    fn footer_overflow_removes_whole_items() {
+        let lines = footer_lines(
+            &["alpha one".into(), "beta two".into(), "gamma three".into()],
+            16,
+            1,
+            " | ",
+            FooterOverflow::Count,
+        );
+        assert_eq!(lines, vec!["alpha one | … +2"]);
+
+        let lines = footer_lines(
+            &["an item wider than the terminal".into(), "second".into()],
+            8,
+            1,
+            " | ",
+            FooterOverflow::Count,
+        );
+        assert_eq!(lines, vec!["… +2"]);
     }
 
     #[test]
