@@ -1,0 +1,1524 @@
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
+};
+
+use pitui::{
+    app::{
+        Action, App, BranchTreeNode, ChangeGroup, ChangesTreeNode, DiffViewMode, FocusPanel,
+        GlobalMode, Screen,
+    },
+    domain::{BranchName, CommitHash, FileChangeKind, GitPath, WorkingTreeDiffKind},
+    git::{GitCommandBus, GitRequest, GitResponse, ResetMode, execute_request},
+};
+use tempfile::TempDir;
+
+static NEXT_TEST_LOG: AtomicU64 = AtomicU64::new(1);
+
+fn git(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("Git must be installed for integration tests");
+    assert!(
+        output.status.success(),
+        "git {} failed:\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_may_fail(repo: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("Git must be installed for integration tests")
+        .status
+        .success()
+}
+
+fn repository() -> TempDir {
+    let directory = tempfile::tempdir().unwrap();
+    git(directory.path(), &["init", "-b", "main"]);
+    git(directory.path(), &["config", "user.name", "Pitui Test"]);
+    git(
+        directory.path(),
+        &["config", "user.email", "pitui@example.invalid"],
+    );
+    directory
+}
+
+fn commit_all(repo: &Path, message: &str) -> String {
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-m", message]);
+    git(repo, &["rev-parse", "HEAD"])
+}
+
+fn wait_until_idle(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        app.poll_git();
+        if app.state.pending_jobs.is_empty() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!(
+        "Git worker did not become idle: {:?}",
+        app.state.pending_jobs
+    );
+}
+
+fn app_for(paths: &[&Path]) -> App {
+    let log_path = std::env::temp_dir()
+        .join("pitui-integration-logs")
+        .join(format!(
+            "{}-{}.jsonl",
+            std::process::id(),
+            NEXT_TEST_LOG.fetch_add(1, Ordering::Relaxed)
+        ));
+    App::new(
+        GitCommandBus::spawn_with_log_path(log_path).unwrap(),
+        paths.iter().map(|path| path.to_path_buf()).collect(),
+    )
+}
+
+fn branch_tree_index(app: &App, repository_index: usize, name: &str) -> usize {
+    app.state
+        .visible_tree_nodes()
+        .iter()
+        .position(|node| match *node {
+            BranchTreeNode::Branch {
+                repository_index: index,
+                branch_index,
+            } if index == repository_index => {
+                app.state.repositories[index].branches[branch_index].name.0 == name
+            }
+            _ => false,
+        })
+        .unwrap_or_else(|| panic!("branch {name} is absent from repository {repository_index}"))
+}
+
+fn repository_tree_index(app: &App, repository_index: usize) -> usize {
+    app.state
+        .visible_tree_nodes()
+        .iter()
+        .position(|node| *node == BranchTreeNode::Repository { repository_index })
+        .unwrap()
+}
+
+#[test]
+fn loads_repository_branches_commits_details_and_diffs() {
+    let repo = repository();
+    fs::write(repo.path().join("alpha.txt"), "one\n").unwrap();
+    let root_commit = commit_all(repo.path(), "initial");
+
+    fs::write(repo.path().join("alpha.txt"), "one\ntwo\n").unwrap();
+    fs::write(repo.path().join("beta.txt"), "beta\n").unwrap();
+    let second_commit = commit_all(repo.path(), "add second line");
+    git(repo.path(), &["branch", "feature/read-only"]);
+
+    match execute_request(repo.path(), GitRequest::LoadRepositoryStatus) {
+        GitResponse::RepositoryStatusLoaded(repository) => {
+            assert_eq!(repository.current_branch.unwrap().0, "main");
+            assert_eq!(repository.head.0, &second_commit[..8]);
+            assert!(repository.status.is_clean());
+        }
+        response => panic!("unexpected repository response: {response:?}"),
+    }
+
+    match execute_request(repo.path(), GitRequest::LoadBranches) {
+        GitResponse::BranchesLoaded(branches) => {
+            assert_eq!(branches.len(), 2);
+            assert!(branches.iter().any(|branch| branch.name.0 == "main"));
+            assert!(
+                branches
+                    .iter()
+                    .any(|branch| branch.name.0 == "feature/read-only")
+            );
+            assert_eq!(
+                branches.iter().filter(|branch| branch.is_current).count(),
+                1
+            );
+        }
+        response => panic!("unexpected branch response: {response:?}"),
+    }
+
+    let commits = match execute_request(
+        repo.path(),
+        GitRequest::LoadCommits {
+            branch: BranchName("main".into()),
+            limit: 300,
+        },
+    ) {
+        GitResponse::CommitsLoaded { branch, commits } => {
+            assert_eq!(branch.0, "main");
+            commits
+        }
+        response => panic!("unexpected commit response: {response:?}"),
+    };
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0].hash.0, second_commit);
+    assert_eq!(commits[1].hash.0, root_commit);
+
+    let detail = match execute_request(
+        repo.path(),
+        GitRequest::LoadCommitDetail {
+            commit: CommitHash(second_commit.clone()),
+        },
+    ) {
+        GitResponse::CommitDetailLoaded(detail) => detail,
+        response => panic!("unexpected detail response: {response:?}"),
+    };
+    assert_eq!(detail.commit.subject, "add second line");
+    assert_eq!(detail.files.len(), 2);
+    let alpha = detail
+        .files
+        .iter()
+        .find(|file| file.path.as_str() == "alpha.txt")
+        .unwrap();
+    assert_eq!(alpha.additions, Some(1));
+    assert_eq!(alpha.deletions, Some(0));
+    assert_eq!(alpha.hunks.len(), 1);
+
+    match execute_request(
+        repo.path(),
+        GitRequest::LoadFileDiff {
+            commit: CommitHash(second_commit),
+            path: GitPath::from("alpha.txt"),
+            old_path: None,
+        },
+    ) {
+        GitResponse::FileDiffLoaded(diff) => {
+            assert_eq!(diff.hunks.len(), 1);
+            assert!(diff.hunks[0].lines.iter().any(|line| line.text == "two"));
+        }
+        response => panic!("unexpected diff response: {response:?}"),
+    }
+}
+
+#[test]
+fn loads_root_commit_and_rename() {
+    let repo = repository();
+    fs::write(
+        repo.path().join("old-name.txt"),
+        "content that remains identical\n",
+    )
+    .unwrap();
+    let root = commit_all(repo.path(), "root");
+
+    let root_detail = match execute_request(
+        repo.path(),
+        GitRequest::LoadCommitDetail {
+            commit: CommitHash(root),
+        },
+    ) {
+        GitResponse::CommitDetailLoaded(detail) => detail,
+        response => panic!("unexpected root detail response: {response:?}"),
+    };
+    assert_eq!(root_detail.files.len(), 1);
+    assert!(matches!(root_detail.files[0].kind, FileChangeKind::Added));
+
+    git(repo.path(), &["mv", "old-name.txt", "new-name.txt"]);
+    let rename = commit_all(repo.path(), "rename");
+    let detail = match execute_request(
+        repo.path(),
+        GitRequest::LoadCommitDetail {
+            commit: CommitHash(rename.clone()),
+        },
+    ) {
+        GitResponse::CommitDetailLoaded(detail) => detail,
+        response => panic!("unexpected rename response: {response:?}"),
+    };
+    assert_eq!(detail.files.len(), 1);
+    assert!(matches!(
+        detail.files[0].kind,
+        FileChangeKind::Renamed { .. }
+    ));
+    assert_eq!(detail.files[0].path.as_str(), "new-name.txt");
+    assert_eq!(
+        detail.files[0].old_path.as_ref().unwrap().as_str(),
+        "old-name.txt"
+    );
+
+    match execute_request(
+        repo.path(),
+        GitRequest::LoadFileDiff {
+            commit: CommitHash(rename),
+            path: GitPath::from("new-name.txt"),
+            old_path: Some(GitPath::from("old-name.txt")),
+        },
+    ) {
+        GitResponse::FileDiffLoaded(diff) => {
+            assert_eq!(diff.path.as_str(), "new-name.txt");
+            assert_eq!(diff.old_path.unwrap().as_str(), "old-name.txt");
+        }
+        response => panic!("unexpected rename diff response: {response:?}"),
+    }
+}
+
+#[test]
+fn counts_staged_modified_untracked_and_conflicted_entries() {
+    let repo = repository();
+    fs::write(repo.path().join("conflict.txt"), "base\n").unwrap();
+    fs::write(repo.path().join("modified.txt"), "clean\n").unwrap();
+    commit_all(repo.path(), "base");
+
+    fs::write(repo.path().join("modified.txt"), "dirty\n").unwrap();
+    fs::write(repo.path().join("staged.txt"), "staged\n").unwrap();
+    git(repo.path(), &["add", "staged.txt"]);
+    fs::write(repo.path().join("untracked.txt"), "untracked\n").unwrap();
+    match execute_request(repo.path(), GitRequest::LoadRepositoryStatus) {
+        GitResponse::RepositoryStatusLoaded(repository) => {
+            assert_eq!(repository.status.staged, 1);
+            assert_eq!(repository.status.modified, 1);
+            assert_eq!(repository.status.untracked, 1);
+            assert_eq!(repository.status.conflicted, 0);
+        }
+        response => panic!("unexpected status response: {response:?}"),
+    }
+
+    git(repo.path(), &["reset", "--hard", "HEAD"]);
+    let _ = fs::remove_file(repo.path().join("untracked.txt"));
+    git(repo.path(), &["switch", "-c", "other"]);
+    fs::write(repo.path().join("conflict.txt"), "other\n").unwrap();
+    commit_all(repo.path(), "other change");
+    git(repo.path(), &["switch", "main"]);
+    fs::write(repo.path().join("conflict.txt"), "main\n").unwrap();
+    commit_all(repo.path(), "main change");
+    assert!(!git_may_fail(repo.path(), &["merge", "other"]));
+
+    match execute_request(repo.path(), GitRequest::LoadRepositoryStatus) {
+        GitResponse::RepositoryStatusLoaded(repository) => {
+            assert_eq!(repository.status.conflicted, 1);
+        }
+        response => panic!("unexpected conflict status response: {response:?}"),
+    }
+
+    let conflict = match execute_request(repo.path(), GitRequest::LoadWorkingTree) {
+        GitResponse::WorkingTreeLoaded(changes) => changes
+            .into_iter()
+            .find(|change| change.path.as_str() == "conflict.txt")
+            .unwrap(),
+        response => panic!("unexpected conflicted worktree response: {response:?}"),
+    };
+    assert!(conflict.is_conflicted());
+    let include_staged = conflict.has_staged_changes();
+    let include_worktree = conflict.has_worktree_changes();
+    match execute_request(
+        repo.path(),
+        GitRequest::LoadWorkingTreeDiff {
+            path: conflict.path,
+            old_path: conflict.old_path,
+            include_staged,
+            include_worktree,
+            untracked: false,
+        },
+    ) {
+        GitResponse::WorkingTreeDiffLoaded(diff) => {
+            assert!(!diff.sections.is_empty());
+            assert!(
+                diff.sections
+                    .iter()
+                    .any(|section| !section.lines.is_empty())
+            );
+        }
+        response => panic!("unexpected conflicted worktree diff response: {response:?}"),
+    }
+}
+
+#[test]
+fn loads_working_tree_files_and_index_worktree_untracked_diffs() {
+    let repo = repository();
+    fs::write(repo.path().join("staged.txt"), "base\n").unwrap();
+    fs::write(repo.path().join("modified.txt"), "base\n").unwrap();
+    fs::write(repo.path().join("both.txt"), "base\n").unwrap();
+    commit_all(repo.path(), "base");
+
+    fs::write(repo.path().join("staged.txt"), "base\nstaged line\n").unwrap();
+    git(repo.path(), &["add", "staged.txt"]);
+    fs::write(
+        repo.path().join("modified.txt"),
+        "base\nworking tree line\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join("untracked.txt"), "untracked line\n").unwrap();
+    fs::write(repo.path().join("both.txt"), "base\nindex line\n").unwrap();
+    git(repo.path(), &["add", "both.txt"]);
+    fs::write(
+        repo.path().join("both.txt"),
+        "base\nindex line\nworktree line\n",
+    )
+    .unwrap();
+
+    let changes = match execute_request(repo.path(), GitRequest::LoadWorkingTree) {
+        GitResponse::WorkingTreeLoaded(changes) => changes,
+        response => panic!("unexpected working tree response: {response:?}"),
+    };
+    assert_eq!(changes.len(), 4);
+    let staged = changes
+        .iter()
+        .find(|change| change.path.as_str() == "staged.txt")
+        .unwrap();
+    assert!(staged.has_staged_changes());
+    assert!(!staged.has_worktree_changes());
+    let modified = changes
+        .iter()
+        .find(|change| change.path.as_str() == "modified.txt")
+        .unwrap();
+    assert!(!modified.has_staged_changes());
+    assert!(modified.has_worktree_changes());
+    let untracked = changes
+        .iter()
+        .find(|change| change.path.as_str() == "untracked.txt")
+        .unwrap();
+    assert!(untracked.is_untracked());
+    let both = changes
+        .iter()
+        .find(|change| change.path.as_str() == "both.txt")
+        .unwrap();
+    assert!(both.has_staged_changes());
+    assert!(both.has_worktree_changes());
+
+    for (change, expected_kind, expected_line) in [
+        (staged, WorkingTreeDiffKind::Staged, "+staged line"),
+        (
+            modified,
+            WorkingTreeDiffKind::Worktree,
+            "+working tree line",
+        ),
+        (untracked, WorkingTreeDiffKind::Untracked, "+untracked line"),
+    ] {
+        match execute_request(
+            repo.path(),
+            GitRequest::LoadWorkingTreeDiff {
+                path: change.path.clone(),
+                old_path: change.old_path.clone(),
+                include_staged: change.has_staged_changes(),
+                include_worktree: change.has_worktree_changes(),
+                untracked: change.is_untracked(),
+            },
+        ) {
+            GitResponse::WorkingTreeDiffLoaded(diff) => {
+                assert_eq!(diff.sections.len(), 1);
+                assert_eq!(diff.sections[0].kind, expected_kind);
+                assert!(
+                    diff.sections[0]
+                        .lines
+                        .iter()
+                        .any(|line| line == expected_line)
+                );
+            }
+            response => panic!("unexpected working tree diff response: {response:?}"),
+        }
+    }
+
+    match execute_request(
+        repo.path(),
+        GitRequest::LoadWorkingTreeDiff {
+            path: both.path.clone(),
+            old_path: None,
+            include_staged: true,
+            include_worktree: true,
+            untracked: false,
+        },
+    ) {
+        GitResponse::WorkingTreeDiffLoaded(diff) => {
+            assert_eq!(diff.sections.len(), 2);
+            assert_eq!(diff.sections[0].kind, WorkingTreeDiffKind::Staged);
+            assert_eq!(diff.sections[1].kind, WorkingTreeDiffKind::Worktree);
+            assert!(
+                diff.sections[0]
+                    .lines
+                    .iter()
+                    .any(|line| line == "+index line")
+            );
+            assert!(
+                diff.sections[1]
+                    .lines
+                    .iter()
+                    .any(|line| line == "+worktree line")
+            );
+        }
+        response => panic!("unexpected two-section worktree diff: {response:?}"),
+    }
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    app.dispatch(Action::ToggleChanges);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.screen, Screen::Changes);
+    assert_eq!(app.state.focus, FocusPanel::ChangesTree);
+    assert_eq!(app.state.changes.len(), 4);
+    assert!(app.state.current_changes_diff.is_some());
+    let nodes = app.state.visible_changes_nodes();
+    assert_eq!(nodes[0], ChangesTreeNode::Root);
+    assert_eq!(nodes[1], ChangesTreeNode::Group(ChangeGroup::Staged));
+    assert_eq!(app.state.change_group_count(ChangeGroup::Staged), 2);
+    assert_eq!(app.state.change_group_count(ChangeGroup::Unstaged), 3);
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|node| matches!(node, ChangesTreeNode::File { .. }))
+            .count(),
+        5
+    );
+    assert_eq!(
+        app.state.current_changes_diff_group,
+        Some(ChangeGroup::Staged)
+    );
+    let selected_diff = app.state.current_changes_diff.as_ref().unwrap();
+    assert!(
+        selected_diff
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .any(|line| line.text == "index line" || line.text == "staged line")
+    );
+    app.dispatch(Action::Back);
+    assert_eq!(app.state.screen, Screen::BranchOverview);
+}
+
+#[test]
+fn stages_unstages_and_commits_paths_without_touching_worktree_content() {
+    let repo = repository();
+    fs::write(repo.path().join("tracked.txt"), "base\n").unwrap();
+    commit_all(repo.path(), "base");
+
+    fs::write(repo.path().join("tracked.txt"), "base\nchanged\n").unwrap();
+    fs::write(repo.path().join("odd -- file.txt"), "new\n").unwrap();
+
+    match execute_request(
+        repo.path(),
+        GitRequest::StagePaths {
+            paths: vec![GitPath::from("tracked.txt")],
+        },
+    ) {
+        GitResponse::CommandSucceeded { .. } => {}
+        response => panic!("unexpected stage response: {response:?}"),
+    }
+    assert_eq!(
+        git(repo.path(), &["diff", "--cached", "--name-only"]),
+        "tracked.txt"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+        "base\nchanged\n"
+    );
+
+    match execute_request(
+        repo.path(),
+        GitRequest::UnstagePaths {
+            paths: vec![GitPath::from("tracked.txt")],
+        },
+    ) {
+        GitResponse::CommandSucceeded { .. } => {}
+        response => panic!("unexpected unstage response: {response:?}"),
+    }
+    assert!(git(repo.path(), &["diff", "--cached", "--name-only"]).is_empty());
+    assert_eq!(
+        fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+        "base\nchanged\n"
+    );
+
+    match execute_request(
+        repo.path(),
+        GitRequest::StagePaths {
+            paths: vec![
+                GitPath::from("tracked.txt"),
+                GitPath::from("odd -- file.txt"),
+            ],
+        },
+    ) {
+        GitResponse::CommandSucceeded { .. } => {}
+        response => panic!("unexpected second stage response: {response:?}"),
+    }
+    match execute_request(
+        repo.path(),
+        GitRequest::Commit {
+            message: "create from Changes".into(),
+        },
+    ) {
+        GitResponse::CommandSucceeded { message } => assert_eq!(message, "Commit created"),
+        response => panic!("unexpected commit response: {response:?}"),
+    }
+    assert_eq!(
+        git(repo.path(), &["log", "-1", "--format=%s"]),
+        "create from Changes"
+    );
+    assert!(git(repo.path(), &["status", "--porcelain"]).is_empty());
+}
+
+#[test]
+fn unstaging_is_safe_in_an_unborn_repository() {
+    let repo = repository();
+    fs::write(repo.path().join("first.txt"), "first\n").unwrap();
+    let path = GitPath::from("first.txt");
+
+    assert!(matches!(
+        execute_request(
+            repo.path(),
+            GitRequest::StagePaths {
+                paths: vec![path.clone()]
+            }
+        ),
+        GitResponse::CommandSucceeded { .. }
+    ));
+    assert!(git(repo.path(), &["status", "--short"]).starts_with("A "));
+    assert!(matches!(
+        execute_request(repo.path(), GitRequest::UnstagePaths { paths: vec![path] }),
+        GitResponse::CommandSucceeded { .. }
+    ));
+    assert!(git(repo.path(), &["status", "--short"]).starts_with("??"));
+    assert_eq!(
+        fs::read_to_string(repo.path().join("first.txt")).unwrap(),
+        "first\n"
+    );
+}
+
+#[test]
+fn changes_controller_multiselects_stages_unstages_and_creates_a_commit() {
+    let repo = repository();
+    fs::write(repo.path().join("one.txt"), "one\n").unwrap();
+    fs::write(repo.path().join("two.txt"), "two\n").unwrap();
+    commit_all(repo.path(), "base");
+    fs::write(repo.path().join("one.txt"), "one changed\n").unwrap();
+    fs::write(repo.path().join("two.txt"), "two changed\n").unwrap();
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    app.dispatch(Action::ToggleChanges);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.change_group_count(ChangeGroup::Unstaged), 2);
+    assert!(matches!(
+        app.state.selected_changes_node(),
+        Some(ChangesTreeNode::File {
+            group: ChangeGroup::Unstaged,
+            ..
+        })
+    ));
+
+    // Selection and stage work while the reusable diff panel has focus.
+    app.dispatch(Action::FocusNext);
+    assert_eq!(app.state.focus, FocusPanel::ChangesDiff);
+    app.dispatch(Action::ToggleChangeSelection);
+    assert_eq!(app.state.change_selection.len(), 1);
+    app.dispatch(Action::StageSelectedChanges);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.change_group_count(ChangeGroup::Staged), 1);
+    assert_eq!(app.state.change_group_count(ChangeGroup::Unstaged), 1);
+    assert!(app.state.change_selection.is_empty());
+
+    // With no explicit selection, unstage applies to the currently displayed
+    // staged file and never changes its working-tree content.
+    app.dispatch(Action::UnstageSelectedChanges);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.change_group_count(ChangeGroup::Staged), 0);
+    assert_eq!(app.state.change_group_count(ChangeGroup::Unstaged), 2);
+
+    // Space on a group selects every child, then one command stages all of it.
+    let unstaged_group = app
+        .state
+        .visible_changes_nodes()
+        .iter()
+        .position(|node| *node == ChangesTreeNode::Group(ChangeGroup::Unstaged))
+        .unwrap();
+    app.state.selection.selected_changes_index = Some(unstaged_group);
+    app.state.focus = FocusPanel::ChangesTree;
+    app.dispatch(Action::ToggleChangeSelection);
+    assert_eq!(app.state.selected_change_count(ChangeGroup::Unstaged), 2);
+    app.dispatch(Action::StageSelectedChanges);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.change_group_count(ChangeGroup::Staged), 2);
+    assert_eq!(app.state.change_group_count(ChangeGroup::Unstaged), 0);
+
+    app.dispatch(Action::OpenCommitDialog);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::EditingCommitMessage { .. }
+    ));
+    app.dispatch(Action::SubmitCommit);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::EditingCommitMessage {
+            validation_error: Some(_),
+            ..
+        }
+    ));
+    app.dispatch(Action::UpdateCommitMessage(
+        "commit created in Changes".into(),
+    ));
+    app.dispatch(Action::SubmitCommit);
+    wait_until_idle(&mut app);
+
+    assert_eq!(app.state.mode, GlobalMode::Normal);
+    assert_eq!(app.state.screen, Screen::Changes);
+    assert_eq!(app.state.change_group_count(ChangeGroup::Staged), 0);
+    assert_eq!(app.state.change_group_count(ChangeGroup::Unstaged), 0);
+    assert_eq!(
+        git(repo.path(), &["log", "-1", "--format=%s"]),
+        "commit created in Changes"
+    );
+}
+
+#[test]
+fn mutating_commands_are_executed_safely_in_a_temporary_repository() {
+    let repo = repository();
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    let base = commit_all(repo.path(), "base");
+    git(repo.path(), &["switch", "-c", "feature"]);
+    fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+    let feature_commit = commit_all(repo.path(), "feature work");
+
+    assert!(matches!(
+        execute_request(
+            repo.path(),
+            GitRequest::SwitchBranch {
+                branch: BranchName("main".into())
+            }
+        ),
+        GitResponse::CommandSucceeded { .. }
+    ));
+    assert_eq!(git(repo.path(), &["branch", "--show-current"]), "main");
+
+    assert!(matches!(
+        execute_request(
+            repo.path(),
+            GitRequest::CherryPick {
+                commits: vec![CommitHash(feature_commit)]
+            }
+        ),
+        GitResponse::CommandSucceeded { .. }
+    ));
+    assert!(repo.path().join("feature.txt").exists());
+    let cherry_picked = git(repo.path(), &["rev-parse", "HEAD"]);
+
+    assert!(matches!(
+        execute_request(
+            repo.path(),
+            GitRequest::Reset {
+                commit: CommitHash(base.clone()),
+                mode: ResetMode::Soft
+            }
+        ),
+        GitResponse::CommandSucceeded { .. }
+    ));
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), base);
+    assert_eq!(
+        git(repo.path(), &["diff", "--cached", "--name-only"]),
+        "feature.txt"
+    );
+
+    assert!(matches!(
+        execute_request(
+            repo.path(),
+            GitRequest::Reset {
+                commit: CommitHash(cherry_picked.clone()),
+                mode: ResetMode::Mixed
+            }
+        ),
+        GitResponse::CommandSucceeded { .. }
+    ));
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), cherry_picked);
+    assert!(git(repo.path(), &["status", "--porcelain"]).is_empty());
+
+    assert!(matches!(
+        execute_request(
+            repo.path(),
+            GitRequest::Reset {
+                commit: CommitHash(base.clone()),
+                mode: ResetMode::Hard
+            }
+        ),
+        GitResponse::CommandSucceeded { .. }
+    ));
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), base);
+    assert!(!repo.path().join("feature.txt").exists());
+}
+
+#[test]
+fn non_repository_returns_a_structured_error() {
+    let directory = tempfile::tempdir().unwrap();
+    match execute_request(directory.path(), GitRequest::LoadRepositoryStatus) {
+        GitResponse::CommandFailed { command, stderr } => {
+            assert!(command.contains("rev-parse"));
+            assert!(!stderr.is_empty());
+        }
+        response => panic!("expected error, got {response:?}"),
+    }
+}
+
+#[test]
+fn unborn_repository_is_a_valid_empty_repository() {
+    let repo = repository();
+    match execute_request(repo.path(), GitRequest::LoadRepositoryStatus) {
+        GitResponse::RepositoryStatusLoaded(repository) => {
+            assert_eq!(repository.current_branch.unwrap().0, "main");
+            assert!(repository.head.0.is_empty());
+            assert!(repository.status.is_clean());
+        }
+        response => panic!("unexpected unborn repository response: {response:?}"),
+    }
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.visible_tree_nodes().len(), 2);
+    assert_eq!(app.state.repositories[0].branches.len(), 1);
+    assert_eq!(app.state.repositories[0].branches[0].name.0, "main");
+    assert_eq!(app.state.repositories[0].branches[0].short_head, "unborn");
+    let main_index = branch_tree_index(&app, 0, "main");
+    app.dispatch(Action::SelectBranch(main_index));
+    app.dispatch(Action::LoadCommitsForSelectedBranch);
+    wait_until_idle(&mut app);
+    assert!(app.state.branch_commits.items.is_empty());
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.mode, GlobalMode::Normal);
+}
+
+#[test]
+fn detached_head_can_still_load_commits() {
+    let repo = repository();
+    fs::write(repo.path().join("detached.txt"), "content\n").unwrap();
+    let head = commit_all(repo.path(), "detached target");
+    git(repo.path(), &["switch", "--detach", "HEAD"]);
+
+    match execute_request(repo.path(), GitRequest::LoadRepositoryStatus) {
+        GitResponse::RepositoryStatusLoaded(repository) => {
+            assert!(repository.current_branch.is_none());
+            assert_eq!(repository.head.0, &head[..8]);
+        }
+        response => panic!("unexpected detached repository response: {response:?}"),
+    }
+    match execute_request(
+        repo.path(),
+        GitRequest::LoadCommits {
+            branch: BranchName("HEAD".into()),
+            limit: 300,
+        },
+    ) {
+        GitResponse::CommitsLoaded { commits, .. } => {
+            assert_eq!(commits.len(), 1);
+            assert_eq!(commits[0].hash.0, head);
+        }
+        response => panic!("unexpected detached commit response: {response:?}"),
+    }
+}
+
+#[test]
+fn identifies_binary_file_changes() {
+    let repo = repository();
+    fs::write(repo.path().join("image.bin"), [0, 1, 2, 3]).unwrap();
+    commit_all(repo.path(), "binary base");
+    fs::write(repo.path().join("image.bin"), [0, 1, 9, 3]).unwrap();
+    let commit = commit_all(repo.path(), "binary update");
+
+    let detail = match execute_request(
+        repo.path(),
+        GitRequest::LoadCommitDetail {
+            commit: CommitHash(commit.clone()),
+        },
+    ) {
+        GitResponse::CommitDetailLoaded(detail) => detail,
+        response => panic!("unexpected binary detail response: {response:?}"),
+    };
+    assert_eq!(detail.files.len(), 1);
+    assert!(detail.files[0].is_binary);
+    assert_eq!(detail.files[0].additions, None);
+    assert_eq!(detail.files[0].deletions, None);
+
+    match execute_request(
+        repo.path(),
+        GitRequest::LoadFileDiff {
+            commit: CommitHash(commit),
+            path: detail.files[0].path.clone(),
+            old_path: None,
+        },
+    ) {
+        GitResponse::FileDiffLoaded(diff) => assert!(diff.is_binary),
+        response => panic!("unexpected binary diff response: {response:?}"),
+    }
+}
+
+#[test]
+fn application_controller_drives_the_three_view_workflow_and_modals() {
+    let repo = repository();
+    fs::write(repo.path().join("app.txt"), "first\n").unwrap();
+    commit_all(repo.path(), "first");
+    fs::write(repo.path().join("app.txt"), "first\nsecond\n").unwrap();
+    commit_all(repo.path(), "second");
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    assert!(app.state.active_repository().is_some());
+    assert_eq!(app.state.repositories[0].branches.len(), 1);
+    assert_eq!(app.state.branch_commits.items.len(), 2);
+    assert_eq!(app.state.focus, FocusPanel::BranchList);
+
+    app.dispatch(Action::FocusNext);
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    app.dispatch(Action::OpenCommitDetail);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.screen, Screen::CommitDetail);
+    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+    assert_eq!(
+        app.state
+            .current_commit_detail
+            .as_ref()
+            .unwrap()
+            .files
+            .len(),
+        1
+    );
+
+    app.dispatch(Action::ToggleFileExpanded);
+    assert_eq!(app.state.expansion.expanded_files.len(), 1);
+    app.dispatch(Action::OpenSelectedFileDiff);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.screen, Screen::FileDiffDetail);
+    assert_eq!(app.state.focus, FocusPanel::DiffView);
+    assert!(app.state.current_file_diff.is_some());
+    app.dispatch(Action::ToggleDiffMode);
+    assert_eq!(app.state.diff_mode, DiffViewMode::SideBySide);
+    app.dispatch(Action::ToggleWrap);
+    assert!(app.state.wrap_diff);
+
+    // Changes is a global destination, not a child of Branch Overview. It can
+    // be opened from a commit diff and returns to that exact screen/focus.
+    app.dispatch(Action::ToggleChanges);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.screen, Screen::Changes);
+    app.dispatch(Action::Back);
+    assert_eq!(app.state.screen, Screen::FileDiffDetail);
+    assert_eq!(app.state.focus, FocusPanel::DiffView);
+    assert!(app.state.current_file_diff.is_some());
+
+    app.dispatch(Action::Back);
+    assert_eq!(app.state.screen, Screen::CommitDetail);
+    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+    app.dispatch(Action::QueueCherryPickSelectedCommit);
+    app.dispatch(Action::QueueCherryPickSelectedCommit);
+    assert_eq!(app.state.cherry_pick_queue.len(), 1);
+    app.dispatch(Action::OpenCherryPickQueueDialog);
+    assert!(matches!(app.state.mode, GlobalMode::Confirming { .. }));
+    assert_eq!(app.state.focus, FocusPanel::Popup);
+    app.dispatch(Action::Cancel);
+    assert_eq!(app.state.mode, GlobalMode::Normal);
+    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+
+    app.dispatch(Action::FocusNext);
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    app.dispatch(Action::ToggleCommitCopySelection);
+    app.dispatch(Action::MoveDown);
+    app.dispatch(Action::ToggleCommitCopySelection);
+    assert_eq!(app.state.commit_copy_selection.len(), 2);
+    app.dispatch(Action::CopySelectedCommitHashes);
+    let expected_hashes = app
+        .state
+        .branch_commits
+        .items
+        .iter()
+        .map(|commit| commit.hash.0.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        app.take_clipboard_request().as_deref(),
+        Some(expected_hashes.as_str())
+    );
+    app.dispatch(Action::CopyCurrentCommitInfo);
+    let info = app.take_clipboard_request().unwrap();
+    assert!(info.contains(&app.state.selected_commit().unwrap().hash.0));
+    assert!(info.contains("Author:"));
+
+    app.dispatch(Action::OpenResetDialog);
+    assert!(matches!(app.state.mode, GlobalMode::Confirming { .. }));
+    app.dispatch(Action::ChooseResetHard);
+    assert!(matches!(app.state.mode, GlobalMode::Confirming { .. }));
+    app.dispatch(Action::Confirm);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::TypingConfirmation { .. }
+    ));
+    app.dispatch(Action::UpdateTypedConfirmation("wrong".into()));
+    app.dispatch(Action::ConfirmReset);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::TypingConfirmation {
+            validation_error: Some(_),
+            ..
+        }
+    ));
+    app.dispatch(Action::Cancel);
+    assert_eq!(app.state.mode, GlobalMode::Normal);
+
+    app.dispatch(Action::Back);
+    assert_eq!(app.state.screen, Screen::BranchOverview);
+    app.dispatch(Action::StartFilter);
+    app.dispatch(Action::UpdateFilter("second".into()));
+    assert_eq!(app.state.visible_commits().len(), 1);
+    app.dispatch(Action::SubmitFilter);
+    assert_eq!(app.state.commit_filter, "second");
+}
+
+#[test]
+fn application_surfaces_and_dismisses_non_repository_errors() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = app_for(&[directory.path()]);
+    wait_until_idle(&mut app);
+    assert!(matches!(app.state.mode, GlobalMode::Error));
+    assert_eq!(app.state.focus, FocusPanel::Popup);
+    assert!(app.state.last_error.is_some());
+
+    app.dispatch(Action::DismissError);
+    assert_eq!(app.state.mode, GlobalMode::Normal);
+    assert_eq!(app.state.focus, FocusPanel::BranchList);
+    assert!(app.state.last_error.is_none());
+}
+
+#[test]
+fn latest_branch_request_wins_over_stale_worker_responses() {
+    let repo = repository();
+    fs::write(repo.path().join("branch.txt"), "content\n").unwrap();
+    commit_all(repo.path(), "base");
+    git(repo.path(), &["branch", "feature"]);
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    let main_index = branch_tree_index(&app, 0, "main");
+    let feature_index = branch_tree_index(&app, 0, "feature");
+
+    // Queue two reads without polling between them. The serial worker returns
+    // both, but only the response associated with the latest id may be applied.
+    app.dispatch(Action::SelectBranch(main_index));
+    app.dispatch(Action::LoadCommitsForSelectedBranch);
+    app.dispatch(Action::SelectBranch(feature_index));
+    app.dispatch(Action::LoadCommitsForSelectedBranch);
+    wait_until_idle(&mut app);
+
+    assert_eq!(
+        app.state.branch_commits.viewing_branch.as_ref().unwrap().0,
+        "feature"
+    );
+}
+
+#[test]
+fn application_confirms_switch_cherry_pick_and_typed_reset_end_to_end() {
+    let repo = repository();
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    commit_all(repo.path(), "base");
+    git(repo.path(), &["switch", "-c", "feature"]);
+    fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+    let feature_commit = commit_all(repo.path(), "feature work");
+    git(repo.path(), &["switch", "main"]);
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+
+    let feature_index = branch_tree_index(&app, 0, "feature");
+    app.dispatch(Action::SelectBranch(feature_index));
+    app.dispatch(Action::OpenSwitchBranchDialog);
+    app.dispatch(Action::Confirm);
+    wait_until_idle(&mut app);
+    assert_eq!(git(repo.path(), &["branch", "--show-current"]), "feature");
+
+    let main_index = branch_tree_index(&app, 0, "main");
+    app.dispatch(Action::SelectBranch(main_index));
+    app.dispatch(Action::OpenSwitchBranchDialog);
+    app.dispatch(Action::Confirm);
+    wait_until_idle(&mut app);
+    assert_eq!(git(repo.path(), &["branch", "--show-current"]), "main");
+
+    let feature_index = branch_tree_index(&app, 0, "feature");
+    app.dispatch(Action::SelectBranch(feature_index));
+    app.dispatch(Action::LoadCommitsForSelectedBranch);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.selected_commit().unwrap().hash.0, feature_commit);
+
+    app.dispatch(Action::QueueCherryPickSelectedCommit);
+    app.dispatch(Action::OpenCherryPickQueueDialog);
+    app.dispatch(Action::Confirm);
+    wait_until_idle(&mut app);
+    assert!(app.state.cherry_pick_queue.is_empty());
+    assert!(repo.path().join("feature.txt").exists());
+    assert_eq!(
+        git(repo.path(), &["log", "-1", "--format=%s"]),
+        "feature work"
+    );
+
+    let expected = app.state.selected_commit().unwrap().short_hash.clone();
+    app.dispatch(Action::OpenResetDialog);
+    app.dispatch(Action::ChooseResetHard);
+    app.dispatch(Action::Confirm);
+    app.dispatch(Action::UpdateTypedConfirmation(expected));
+    app.dispatch(Action::ConfirmReset);
+    wait_until_idle(&mut app);
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), feature_commit);
+    assert_eq!(app.state.mode, GlobalMode::Normal);
+    assert_eq!(app.state.screen, Screen::BranchOverview);
+}
+
+#[test]
+fn application_loads_and_navigates_multiple_repository_trees() {
+    let first = repository();
+    fs::write(first.path().join("first.txt"), "first\n").unwrap();
+    commit_all(first.path(), "first repository commit");
+    git(first.path(), &["branch", "first-feature"]);
+
+    let second = repository();
+    fs::write(second.path().join("second.txt"), "second\n").unwrap();
+    commit_all(second.path(), "second repository commit");
+    git(second.path(), &["branch", "second-feature"]);
+
+    let mut app = app_for(&[first.path(), second.path()]);
+    wait_until_idle(&mut app);
+
+    assert_eq!(app.state.repositories.len(), 2);
+    assert!(
+        app.state
+            .repositories
+            .iter()
+            .all(|repo| repo.repository.is_some())
+    );
+    assert!(
+        app.state
+            .repositories
+            .iter()
+            .all(|repo| repo.branches.len() == 2)
+    );
+    assert_eq!(
+        app.state
+            .visible_tree_nodes()
+            .iter()
+            .filter(|node| matches!(node, BranchTreeNode::Repository { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        app.state.branch_commits.items[0].subject,
+        "first repository commit"
+    );
+
+    let second_repository = repository_tree_index(&app, 1);
+    app.dispatch(Action::SelectBranch(second_repository));
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.active_repository_index, Some(1));
+    assert_eq!(app.state.branch_commits_repository_index, Some(1));
+    assert_eq!(
+        app.state.branch_commits.items[0].subject,
+        "second repository commit"
+    );
+
+    app.dispatch(Action::LoadCommitsForSelectedBranch);
+    assert!(!app.state.repositories[1].expanded);
+    assert_eq!(
+        app.state
+            .visible_tree_nodes()
+            .iter()
+            .filter(|node| node.repository_index() == 1)
+            .count(),
+        1
+    );
+
+    let first_feature = branch_tree_index(&app, 0, "first-feature");
+    app.dispatch(Action::SelectBranch(first_feature));
+    app.dispatch(Action::LoadCommitsForSelectedBranch);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.active_repository_index, Some(0));
+    assert_eq!(
+        app.state.branch_commits.viewing_branch.as_ref().unwrap().0,
+        "first-feature"
+    );
+    assert_eq!(
+        app.state.branch_commits.items[0].subject,
+        "first repository commit"
+    );
+}
+
+#[test]
+fn selected_repository_fetches_its_remote_and_refreshes_tree() {
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare", "-b", "main"]);
+
+    let source = repository();
+    fs::write(source.path().join("shared.txt"), "base\n").unwrap();
+    commit_all(source.path(), "remote base");
+    let remote_path = remote.path().to_string_lossy().into_owned();
+    git(source.path(), &["remote", "add", "origin", &remote_path]);
+    git(source.path(), &["push", "-u", "origin", "main"]);
+
+    let clone_parent = tempfile::tempdir().unwrap();
+    git(
+        clone_parent.path(),
+        &["clone", &remote_path, "fetch-target"],
+    );
+    let target = clone_parent.path().join("fetch-target");
+    let before = git(&target, &["rev-parse", "refs/remotes/origin/main"]);
+
+    fs::write(source.path().join("shared.txt"), "base\nnew\n").unwrap();
+    let new_head = commit_all(source.path(), "remote update");
+    git(source.path(), &["push", "origin", "main"]);
+    assert_ne!(before, new_head);
+
+    let unrelated = repository();
+    fs::write(unrelated.path().join("local.txt"), "local\n").unwrap();
+    commit_all(unrelated.path(), "unrelated");
+
+    let mut app = app_for(&[unrelated.path(), &target]);
+    wait_until_idle(&mut app);
+    let target_repository = repository_tree_index(&app, 1);
+    app.dispatch(Action::SelectBranch(target_repository));
+    app.dispatch(Action::OpenFetchRepositoryDialog);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::Confirming {
+            dialog: pitui::app::ConfirmDialog::FetchRepository {
+                repository_index: 1
+            }
+        }
+    ));
+    app.dispatch(Action::Confirm);
+    wait_until_idle(&mut app);
+
+    assert_eq!(
+        git(&target, &["rev-parse", "refs/remotes/origin/main"]),
+        new_head
+    );
+    assert_eq!(
+        git(unrelated.path(), &["log", "-1", "--format=%s"]),
+        "unrelated"
+    );
+    assert_eq!(app.state.last_message.as_deref(), Some("Fetch completed"));
+    assert!(
+        app.state.repositories[1]
+            .branches
+            .iter()
+            .any(|branch| branch.name.0 == "origin/main" && branch.head.0 == new_head)
+    );
+}
+
+#[test]
+fn application_browses_reflog_and_resets_to_a_selected_entry() {
+    let repo = repository();
+    fs::write(repo.path().join("history.txt"), "one\n").unwrap();
+    let first = commit_all(repo.path(), "first reflog target");
+    fs::write(repo.path().join("history.txt"), "one\ntwo\n").unwrap();
+    let second = commit_all(repo.path(), "second reflog target");
+
+    let loaded = execute_request(repo.path(), GitRequest::LoadReflog { limit: 300 });
+    match loaded {
+        GitResponse::ReflogLoaded(entries) => {
+            assert!(entries.iter().any(|entry| entry.hash.0 == first));
+            assert!(entries.iter().any(|entry| entry.hash.0 == second));
+            assert!(entries.iter().any(|entry| entry.action == "commit"));
+        }
+        response => panic!("unexpected reflog response: {response:?}"),
+    }
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    app.dispatch(Action::OpenReflog);
+    app.dispatch(Action::Back);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.screen, Screen::BranchOverview);
+
+    app.dispatch(Action::OpenReflog);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.screen, Screen::Reflog);
+    assert_eq!(app.state.focus, FocusPanel::ReflogList);
+    assert_eq!(app.state.reflog_repository_index, Some(0));
+
+    let first_index = app
+        .state
+        .reflog_entries
+        .iter()
+        .position(|entry| entry.hash.0 == first)
+        .unwrap();
+    app.state.selection.selected_reflog_index = Some(first_index);
+    app.dispatch(Action::OpenResetDialog);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::Confirming {
+            dialog: pitui::app::ConfirmDialog::ResetModeChoice { .. }
+        }
+    ));
+    app.dispatch(Action::ChooseResetSoft);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::Confirming {
+            dialog: pitui::app::ConfirmDialog::Reset {
+                mode: ResetMode::Soft,
+                ..
+            }
+        }
+    ));
+    app.dispatch(Action::Confirm);
+    wait_until_idle(&mut app);
+
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), first);
+    assert_eq!(
+        git(repo.path(), &["diff", "--cached", "--name-only"]),
+        "history.txt"
+    );
+    assert_eq!(app.state.screen, Screen::BranchOverview);
+}
+
+#[test]
+fn safe_rebase_succeeds_when_clean() {
+    let repo = repository();
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    let base = commit_all(repo.path(), "base");
+
+    git(repo.path(), &["switch", "-c", "upstream"]);
+    fs::write(repo.path().join("upstream.txt"), "upstream\n").unwrap();
+    let upstream_head = commit_all(repo.path(), "upstream work");
+
+    git(repo.path(), &["switch", "-c", "feature", &base]);
+    fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+    commit_all(repo.path(), "feature work");
+
+    assert!(matches!(
+        execute_request(
+            repo.path(),
+            GitRequest::Rebase {
+                upstream: BranchName("upstream".into())
+            }
+        ),
+        GitResponse::CommandSucceeded { .. }
+    ));
+    assert_eq!(git(repo.path(), &["branch", "--show-current"]), "feature");
+    assert!(git_may_fail(
+        repo.path(),
+        &["merge-base", "--is-ancestor", &upstream_head, "HEAD"]
+    ));
+    assert_eq!(
+        git(repo.path(), &["log", "-1", "--format=%s"]),
+        "feature work"
+    );
+}
+
+#[test]
+fn safe_rebase_refuses_a_dirty_working_tree_before_running_git() {
+    let repo = repository();
+    fs::write(repo.path().join("tracked.txt"), "base\n").unwrap();
+    let head = commit_all(repo.path(), "base");
+    git(repo.path(), &["branch", "upstream"]);
+    fs::write(repo.path().join("tracked.txt"), "dirty\n").unwrap();
+
+    match execute_request(
+        repo.path(),
+        GitRequest::Rebase {
+            upstream: BranchName("upstream".into()),
+        },
+    ) {
+        GitResponse::CommandFailed { stderr, .. } => {
+            assert!(stderr.contains("clean working tree"));
+        }
+        response => panic!("dirty rebase should be rejected, got {response:?}"),
+    }
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    let upstream_index = branch_tree_index(&app, 0, "upstream");
+    app.dispatch(Action::SelectBranch(upstream_index));
+    app.dispatch(Action::OpenRebaseDialog);
+
+    assert!(matches!(app.state.mode, GlobalMode::Error));
+    assert!(
+        app.state
+            .last_error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("clean working tree")
+    );
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+        "dirty\n"
+    );
+}
+
+#[test]
+fn safe_rebase_conflict_is_reported_and_automatically_aborted() {
+    let repo = repository();
+    fs::write(repo.path().join("conflict.txt"), "base\n").unwrap();
+    let base = commit_all(repo.path(), "base");
+
+    git(repo.path(), &["switch", "-c", "upstream"]);
+    fs::write(repo.path().join("conflict.txt"), "upstream\n").unwrap();
+    commit_all(repo.path(), "upstream conflict");
+
+    git(repo.path(), &["switch", "-c", "feature", &base]);
+    fs::write(repo.path().join("conflict.txt"), "feature\n").unwrap();
+    let feature_head = commit_all(repo.path(), "feature conflict");
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    let upstream_index = branch_tree_index(&app, 0, "upstream");
+    app.dispatch(Action::SelectBranch(upstream_index));
+    app.dispatch(Action::OpenRebaseDialog);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::Confirming {
+            dialog: pitui::app::ConfirmDialog::Rebase { .. }
+        }
+    ));
+    app.dispatch(Action::Confirm);
+    wait_until_idle(&mut app);
+
+    assert!(matches!(app.state.mode, GlobalMode::Error));
+    assert!(
+        app.state
+            .last_error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("automatically ran `git rebase --abort`")
+    );
+    assert_eq!(git(repo.path(), &["branch", "--show-current"]), "feature");
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), feature_head);
+    assert!(git(repo.path(), &["status", "--porcelain"]).is_empty());
+    assert!(!repo.path().join(".git/rebase-merge").exists());
+    assert!(!repo.path().join(".git/rebase-apply").exists());
+}
+
+#[test]
+fn safe_rebase_never_aborts_a_preexisting_rebase() {
+    let repo = repository();
+    fs::write(repo.path().join("conflict.txt"), "base\n").unwrap();
+    let base = commit_all(repo.path(), "base");
+
+    git(repo.path(), &["switch", "-c", "upstream"]);
+    fs::write(repo.path().join("conflict.txt"), "upstream\n").unwrap();
+    commit_all(repo.path(), "upstream conflict");
+
+    git(repo.path(), &["switch", "-c", "feature", &base]);
+    fs::write(repo.path().join("conflict.txt"), "feature\n").unwrap();
+    let feature_head = commit_all(repo.path(), "feature conflict");
+
+    assert!(!git_may_fail(repo.path(), &["rebase", "upstream"]));
+    assert!(
+        repo.path().join(".git/rebase-merge").exists()
+            || repo.path().join(".git/rebase-apply").exists()
+    );
+
+    match execute_request(
+        repo.path(),
+        GitRequest::Rebase {
+            upstream: BranchName("upstream".into()),
+        },
+    ) {
+        GitResponse::CommandFailed { stderr, .. } => {
+            assert!(stderr.contains("already in progress"));
+            assert!(stderr.contains("left it untouched"));
+        }
+        response => panic!("preexisting rebase should be preserved, got {response:?}"),
+    }
+
+    assert!(
+        repo.path().join(".git/rebase-merge").exists()
+            || repo.path().join(".git/rebase-apply").exists()
+    );
+    assert!(!git(repo.path(), &["diff", "--name-only", "--diff-filter=U"]).is_empty());
+
+    git(repo.path(), &["rebase", "--abort"]);
+    assert_eq!(git(repo.path(), &["branch", "--show-current"]), "feature");
+    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), feature_head);
+}
+
+#[test]
+fn backend_jsonl_log_records_every_job_lifecycle_and_failure() {
+    let repo = repository();
+    let log_directory = tempfile::tempdir().unwrap();
+    let log_path = log_directory.path().join("backend.jsonl");
+    let mut bus = GitCommandBus::spawn_with_log_path(log_path.clone()).unwrap();
+
+    let load_job = bus.submit(repo.path().to_path_buf(), GitRequest::LoadWorkingTree);
+    let failed_job = bus.submit(
+        repo.path().to_path_buf(),
+        GitRequest::StagePaths { paths: Vec::new() },
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut responses = Vec::new();
+    while responses.len() < 2 && Instant::now() < deadline {
+        if let Ok(response) = bus.try_recv() {
+            responses.push(response);
+        } else {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert_eq!(responses.len(), 2);
+    assert!(responses.iter().any(|response| {
+        response.id == load_job && matches!(response.response, GitResponse::WorkingTreeLoaded(_))
+    }));
+    assert!(responses.iter().any(|response| {
+        response.id == failed_job && matches!(response.response, GitResponse::CommandFailed { .. })
+    }));
+
+    // The worker writes and flushes the completion record before publishing
+    // each response, so the log is safe to inspect while the bus is alive.
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("\"event\":\"session_started\""));
+    assert!(log.contains("\"operation\":\"load_working_tree\""));
+    assert!(log.contains("\"operation\":\"stage_paths\""));
+    assert!(log.contains("\"status\":\"success\""));
+    assert!(log.contains("\"status\":\"failure\""));
+    assert!(log.contains("No files were selected for staging"));
+
+    for job_id in [load_job, failed_job] {
+        for event in ["queued", "started", "completed"] {
+            assert!(log.lines().any(|line| {
+                line.contains(&format!("\"job_id\":{job_id}"))
+                    && line.contains(&format!("\"event\":\"{event}\""))
+            }));
+        }
+    }
+}
+
+// APFS rejects invalid UTF-8 names at creation time; Unix filesystems such as
+// ext4 accept them and exercise the full argv round trip.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn preserves_non_utf8_git_paths_for_follow_up_diff_commands() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let repo = repository();
+    let raw_name = b"non-utf8-\xff.txt".to_vec();
+    let os_name = OsString::from_vec(raw_name.clone());
+    fs::write(repo.path().join(&os_name), "content\n").unwrap();
+    let commit = commit_all(repo.path(), "non utf8 path");
+
+    let detail = match execute_request(
+        repo.path(),
+        GitRequest::LoadCommitDetail {
+            commit: CommitHash(commit.clone()),
+        },
+    ) {
+        GitResponse::CommitDetailLoaded(detail) => detail,
+        response => panic!("unexpected non-UTF8 detail response: {response:?}"),
+    };
+    assert_eq!(detail.files.len(), 1);
+    assert_eq!(detail.files[0].path.as_bytes(), raw_name);
+
+    match execute_request(
+        repo.path(),
+        GitRequest::LoadFileDiff {
+            commit: CommitHash(commit),
+            path: detail.files[0].path.clone(),
+            old_path: None,
+        },
+    ) {
+        GitResponse::FileDiffLoaded(diff) => {
+            assert_eq!(diff.path.as_bytes(), raw_name);
+            assert_eq!(diff.hunks.len(), 1);
+        }
+        response => panic!("unexpected non-UTF8 diff response: {response:?}"),
+    }
+}

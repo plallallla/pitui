@@ -1,0 +1,17 @@
+[package]
+name = "pitui"
+version = "0.1.0"
+edition = "2024"
+description = "A safe, focused, multi-repository Git TUI"
+readme = "README.md"
+license = "MIT"
+keywords = ["git", "tui", "terminal", "reflog", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+crossterm = "0.29.0"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"

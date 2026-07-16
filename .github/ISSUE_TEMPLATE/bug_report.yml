@@ -1,0 +1,65 @@
+name: Bug report
+description: Report a reproducible Pitui problem
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Pitui. Search existing issues first and remove secrets, private repository names, and sensitive diff content from all logs.
+  - type: input
+    id: version
+    attributes:
+      label: Pitui version or commit
+      placeholder: v0.1.0 or a commit SHA
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, terminal, terminal size, and Git version.
+      placeholder: macOS 15, iTerm2 3.x, 160x50, Git 2.x
+    validations:
+      required: true
+  - type: dropdown
+    id: repositories
+    attributes:
+      label: Repository mode
+      options:
+        - One repository
+        - Multiple repositories
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest safe sequence of commands and key presses that reproduces the problem.
+      placeholder: |
+        1. Start Pitui with ...
+        2. Select ...
+        3. Press ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and sanitized output
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, private paths, repository secrets, and sensitive source/diff content.
+          required: true
