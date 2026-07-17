@@ -15,9 +15,10 @@ use crate::{
 };
 
 use super::{
-    Action, AppError, AppState, BranchTreeNode, ChangeGroup, ChangeSelection, ChangesTreeNode,
-    CommandKind, ConfirmDialog, DiffViewMode, FilterTarget, FocusPanel, GlobalMode, PendingJobKind,
-    RemoteEditKind, RemoteInputField, Screen, ShortcutContext, prompt_command,
+    Action, AppError, AppState, BranchId, BranchTreeNode, ChangeGroup, ChangeSelection,
+    ChangesTreeNode, CommandKind, CommitId, ConfirmDialog, DataRequirement, DiffViewMode, FileId,
+    FilterTarget, FocusKind, FocusRole, GlobalMode, OperationId, PendingJobKind, RemoteEditKind,
+    RemoteInputField, RepositoryId, ViewId, prompt_command,
 };
 
 const PAGE_SIZE: usize = 10;
@@ -97,8 +98,7 @@ impl App {
     ) -> Option<GitJobId> {
         let cwd = self
             .state
-            .repositories
-            .get(repository_index)?
+            .repository_node(repository_index)?
             .git_cwd()
             .to_path_buf();
         let id = self.bus.submit(cwd, request);
@@ -130,7 +130,7 @@ impl App {
             full_refresh,
         };
         if let Some(id) = self.submit(repository_index, GitRequest::LoadRepositoryStatus, kind)
-            && let Some(repository) = self.state.repositories.get_mut(repository_index)
+            && let Some(repository) = self.state.repository_ui.get_mut(repository_index)
         {
             repository.latest_status_job = Some(id);
         }
@@ -141,7 +141,7 @@ impl App {
     }
 
     fn refresh_all_repositories(&mut self) {
-        for repository_index in 0..self.state.repositories.len() {
+        for repository_index in 0..self.state.repository_ui.len() {
             self.submit_status(repository_index, true);
         }
     }
@@ -151,7 +151,7 @@ impl App {
             repository_index,
             GitRequest::LoadBranches,
             PendingJobKind::Branches { repository_index },
-        ) && let Some(repository) = self.state.repositories.get_mut(repository_index)
+        ) && let Some(repository) = self.state.repository_ui.get_mut(repository_index)
         {
             repository.latest_branches_job = Some(id);
         }
@@ -164,10 +164,17 @@ impl App {
             PendingJobKind::Remotes { repository_index },
         ) {
             self.state.latest_remotes_job = Some(id);
+            self.state
+                .model
+                .mark_remotes_loading(RepositoryId(repository_index));
         }
     }
 
     fn submit_commits(&mut self, repository_index: usize, branch: BranchName) {
+        let branch_id = BranchId {
+            repository: RepositoryId(repository_index),
+            name: branch.clone(),
+        };
         let kind = PendingJobKind::Commits {
             repository_index,
             branch: branch.clone(),
@@ -181,6 +188,7 @@ impl App {
             kind,
         ) {
             self.state.latest_commits_job = Some(id);
+            self.state.model.mark_branch_commits_loading(&branch_id);
         }
     }
 
@@ -190,6 +198,10 @@ impl App {
         commit: CommitHash,
         focus_files: bool,
     ) {
+        let commit_id = CommitId {
+            repository: RepositoryId(repository_index),
+            hash: commit.clone(),
+        };
         let kind = PendingJobKind::CommitDetail {
             repository_index,
             commit: commit.clone(),
@@ -201,6 +213,7 @@ impl App {
             kind,
         ) {
             self.state.latest_commit_detail_job = Some(id);
+            self.state.model.mark_commit_loading(&commit_id);
         }
     }
 
@@ -227,6 +240,9 @@ impl App {
             PendingJobKind::Reflog { repository_index },
         ) {
             self.state.latest_reflog_job = Some(id);
+            self.state
+                .model
+                .mark_reflog_loading(RepositoryId(repository_index));
         }
     }
 
@@ -237,6 +253,9 @@ impl App {
             PendingJobKind::Changes { repository_index },
         ) {
             self.state.latest_changes_job = Some(id);
+            self.state
+                .model
+                .mark_working_tree_loading(RepositoryId(repository_index));
         }
     }
 
@@ -278,18 +297,21 @@ impl App {
     }
 
     fn submit_selected_file_diff(&mut self, focus_diff: bool) {
-        let Some(repository_index) = self.state.branch_commits_repository_index else {
+        let Some(file) = self.state.selected_file_id() else {
             return;
         };
-        let Some(detail) = self.state.current_commit_detail.as_ref() else {
-            return;
-        };
-        let Some(file) = self.state.selected_file() else {
-            return;
-        };
-        let commit = detail.commit.hash.clone();
-        let path = file.path.clone();
-        let old_path = file.old_path.clone();
+        self.submit_file_diff(file, focus_diff);
+    }
+
+    fn submit_file_diff(&mut self, file_id: FileId, focus_diff: bool) {
+        let repository_index = file_id.commit.repository.0;
+        let commit = file_id.commit.hash.clone();
+        let path = file_id.path.clone();
+        let old_path = self
+            .state
+            .model
+            .file(&file_id)
+            .and_then(|file| file.summary.old_path.clone());
         let kind = PendingJobKind::FileDiff {
             repository_index,
             commit: commit.clone(),
@@ -306,6 +328,7 @@ impl App {
             kind,
         ) {
             self.state.latest_file_diff_job = Some(id);
+            self.state.model.mark_file_diff_loading(&file_id);
         }
         self.state.selection.diff_scroll = 0;
     }
@@ -315,19 +338,19 @@ impl App {
         match kind {
             PendingJobKind::RepositoryStatus { .. } => self
                 .state
-                .repositories
+                .repository_ui
                 .get(repository_index)
                 .is_none_or(|repository| repository.latest_status_job != Some(id)),
             PendingJobKind::Branches { .. } => self
                 .state
-                .repositories
+                .repository_ui
                 .get(repository_index)
                 .is_none_or(|repository| repository.latest_branches_job != Some(id)),
             PendingJobKind::Remotes { .. } => {
                 self.state.latest_remotes_job != Some(id)
                     || self.state.active_repository_index != Some(repository_index)
                     || self.state.remotes_repository_index != Some(repository_index)
-                    || self.state.screen != Screen::Remotes
+                    || self.state.view_projection().view != ViewId::Remotes
             }
             PendingJobKind::Commits { .. } => {
                 self.state.latest_commits_job != Some(id)
@@ -339,16 +362,16 @@ impl App {
                 ..
             } => {
                 self.state.latest_commit_detail_job != Some(id)
-                    || self.state.branch_commits_repository_index != Some(repository_index)
+                    || self.state.viewing_repository_index() != Some(repository_index)
                     || self
                         .state
                         .selected_commit()
                         .is_none_or(|selected| &selected.hash != commit)
-                    || (!focus_files && self.state.screen != Screen::CommitDetail)
+                    || (!focus_files && self.state.view_projection().view != ViewId::Commit)
             }
             PendingJobKind::CommitMessage { commit, .. } => {
                 self.state.latest_commit_message_job != Some(id)
-                    || self.state.branch_commits_repository_index != Some(repository_index)
+                    || self.state.viewing_repository_index() != Some(repository_index)
                     || self
                         .state
                         .selected_commit()
@@ -361,44 +384,170 @@ impl App {
                 ..
             } => {
                 self.state.latest_file_diff_job != Some(id)
-                    || self.state.branch_commits_repository_index != Some(repository_index)
+                    || self.state.viewing_repository_index() != Some(repository_index)
                     || self
                         .state
-                        .current_commit_detail
-                        .as_ref()
-                        .is_none_or(|detail| &detail.commit.hash != commit)
+                        .current_commit_id()
+                        .is_none_or(|selected| &selected.hash != commit)
                     || self
                         .state
                         .selected_file()
                         .is_none_or(|file| &file.path != path)
                     || if *focus_diff {
                         !matches!(
-                            self.state.screen,
-                            Screen::CommitDetail | Screen::FileDiffDetail
+                            self.state.view_projection().view,
+                            ViewId::Commit | ViewId::FileDiff
                         )
                     } else {
-                        self.state.screen != Screen::FileDiffDetail
+                        self.state.view_projection().view != ViewId::FileDiff
                     }
             }
             PendingJobKind::Reflog { .. } => {
                 self.state.latest_reflog_job != Some(id)
                     || self.state.active_repository_index != Some(repository_index)
                     || self.state.reflog_repository_index != Some(repository_index)
-                    || self.state.screen != Screen::Reflog
+                    || self.state.view_projection().view != ViewId::Reflog
             }
             PendingJobKind::Changes { .. } => {
                 self.state.latest_changes_job != Some(id)
                     || self.state.active_repository_index != Some(repository_index)
                     || self.state.changes_repository_index != Some(repository_index)
-                    || self.state.screen != Screen::Changes
+                    || self.state.view_projection().view != ViewId::Changes
             }
             PendingJobKind::ChangesDiff { .. } => {
                 self.state.latest_changes_diff_job != Some(id)
                     || self.state.active_repository_index != Some(repository_index)
                     || self.state.changes_repository_index != Some(repository_index)
-                    || self.state.screen != Screen::Changes
+                    || self.state.view_projection().view != ViewId::Changes
             }
             PendingJobKind::Command { .. } => false,
+        }
+    }
+
+    fn same_data_resource(left: &PendingJobKind, right: &PendingJobKind) -> bool {
+        match (left, right) {
+            (
+                PendingJobKind::Commits {
+                    repository_index: left_repository,
+                    branch: left_branch,
+                },
+                PendingJobKind::Commits {
+                    repository_index: right_repository,
+                    branch: right_branch,
+                },
+            ) => left_repository == right_repository && left_branch == right_branch,
+            (
+                PendingJobKind::CommitDetail {
+                    repository_index: left_repository,
+                    commit: left_commit,
+                    ..
+                },
+                PendingJobKind::CommitDetail {
+                    repository_index: right_repository,
+                    commit: right_commit,
+                    ..
+                },
+            ) => left_repository == right_repository && left_commit == right_commit,
+            (
+                PendingJobKind::FileDiff {
+                    repository_index: left_repository,
+                    commit: left_commit,
+                    path: left_path,
+                    ..
+                },
+                PendingJobKind::FileDiff {
+                    repository_index: right_repository,
+                    commit: right_commit,
+                    path: right_path,
+                    ..
+                },
+            ) => {
+                left_repository == right_repository
+                    && left_commit == right_commit
+                    && left_path == right_path
+            }
+            (
+                PendingJobKind::Reflog {
+                    repository_index: left,
+                },
+                PendingJobKind::Reflog {
+                    repository_index: right,
+                },
+            )
+            | (
+                PendingJobKind::Changes {
+                    repository_index: left,
+                },
+                PendingJobKind::Changes {
+                    repository_index: right,
+                },
+            )
+            | (
+                PendingJobKind::Remotes {
+                    repository_index: left,
+                },
+                PendingJobKind::Remotes {
+                    repository_index: right,
+                },
+            ) => left == right,
+            _ => false,
+        }
+    }
+
+    fn reset_stale_resource_if_orphaned(&mut self, kind: &PendingJobKind) {
+        if self
+            .state
+            .pending_jobs
+            .values()
+            .any(|pending| Self::same_data_resource(kind, pending))
+        {
+            return;
+        }
+        match kind {
+            PendingJobKind::Commits {
+                repository_index,
+                branch,
+            } => self.state.model.reset_branch_commits_loading(&BranchId {
+                repository: RepositoryId(*repository_index),
+                name: branch.clone(),
+            }),
+            PendingJobKind::CommitDetail {
+                repository_index,
+                commit,
+                ..
+            } => self.state.model.reset_commit_loading(&CommitId {
+                repository: RepositoryId(*repository_index),
+                hash: commit.clone(),
+            }),
+            PendingJobKind::FileDiff {
+                repository_index,
+                commit,
+                path,
+                ..
+            } => self.state.model.reset_file_diff_loading(&FileId {
+                commit: CommitId {
+                    repository: RepositoryId(*repository_index),
+                    hash: commit.clone(),
+                },
+                path: path.clone(),
+            }),
+            PendingJobKind::Reflog { repository_index } => self
+                .state
+                .model
+                .reset_reflog_loading(RepositoryId(*repository_index)),
+            PendingJobKind::Changes { repository_index } => self
+                .state
+                .model
+                .reset_working_tree_loading(RepositoryId(*repository_index)),
+            PendingJobKind::Remotes { repository_index } => self
+                .state
+                .model
+                .reset_remotes_loading(RepositoryId(*repository_index)),
+            PendingJobKind::RepositoryStatus { .. }
+            | PendingJobKind::Branches { .. }
+            | PendingJobKind::CommitMessage { .. }
+            | PendingJobKind::ChangesDiff { .. }
+            | PendingJobKind::Command { .. } => {}
         }
     }
 
@@ -406,14 +555,14 @@ impl App {
         let repository_index = kind.repository_index();
         match kind {
             PendingJobKind::RepositoryStatus { .. } => {
-                if let Some(repository) = self.state.repositories.get_mut(repository_index)
+                if let Some(repository) = self.state.repository_ui.get_mut(repository_index)
                     && repository.latest_status_job == Some(id)
                 {
                     repository.latest_status_job = None;
                 }
             }
             PendingJobKind::Branches { .. } => {
-                if let Some(repository) = self.state.repositories.get_mut(repository_index)
+                if let Some(repository) = self.state.repository_ui.get_mut(repository_index)
                     && repository.latest_branches_job == Some(id)
                 {
                     repository.latest_branches_job = None;
@@ -462,10 +611,7 @@ impl App {
             } => Some((
                 repository_index,
                 self.state
-                    .repositories
-                    .get(repository_index)?
-                    .branches
-                    .get(branch_index)
+                    .repository_branch(repository_index, branch_index)
                     .map(|branch| branch.name.clone()),
             )),
         }
@@ -491,9 +637,7 @@ impl App {
                 repository_index == wanted_repository
                     && self
                         .state
-                        .repositories
-                        .get(repository_index)
-                        .and_then(|repository| repository.branches.get(branch_index))
+                        .repository_branch(repository_index, branch_index)
                         .is_some_and(|branch| branch.name == *branch_name)
             }
             _ => false,
@@ -511,14 +655,14 @@ impl App {
     }
 
     fn desired_branch(&self, repository_index: usize) -> Option<BranchName> {
-        let repository = self.state.repositories.get(repository_index)?;
-        repository
+        self.state
+            .repository_ui
+            .get(repository_index)?
             .viewing_branch
             .clone()
             .or_else(|| {
-                repository
-                    .repository
-                    .as_ref()
+                self.state
+                    .repository(repository_index)
                     .and_then(|value| value.current_branch.clone())
             })
             .or_else(|| Some(BranchName("HEAD".into())))
@@ -537,12 +681,14 @@ impl App {
                 self.submit_commits(repository_index, branch);
             }
         } else {
-            self.state.branch_commits_repository_index = Some(repository_index);
-            self.state.branch_commits.viewing_branch = self
+            self.state.viewing_branch = self
                 .state
                 .repository(repository_index)
-                .and_then(|repository| repository.current_branch.clone());
-            self.state.branch_commits.items.clear();
+                .and_then(|repository| repository.current_branch.clone())
+                .map(|name| BranchId {
+                    repository: RepositoryId(repository_index),
+                    name,
+                });
             self.state.ensure_valid_commit_selection();
         }
     }
@@ -555,11 +701,15 @@ impl App {
         let stale = self.is_stale(envelope.id, &kind);
         self.clear_latest(envelope.id, &kind);
         if stale {
+            self.reset_stale_resource_if_orphaned(&kind);
             return;
         }
 
         match envelope.response {
             GitResponse::RepositoryStatusLoaded(repository) => {
+                self.state
+                    .model
+                    .set_repository_summary(RepositoryId(repository_index), repository);
                 let identity = self.selected_tree_identity();
                 let full_refresh = matches!(
                     kind,
@@ -568,10 +718,8 @@ impl App {
                         ..
                     }
                 );
-                if let Some(state) = self.state.repositories.get_mut(repository_index) {
-                    state.repository = Some(repository);
+                if let Some(state) = self.state.repository_ui.get_mut(repository_index) {
                     state.last_error = None;
-                    state.ensure_current_branch_visible();
                 }
                 self.restore_tree_selection(identity);
                 if full_refresh {
@@ -581,56 +729,55 @@ impl App {
             }
             GitResponse::BranchesLoaded(branches) => {
                 let identity = self.selected_tree_identity();
-                if let Some(repository) = self.state.repositories.get_mut(repository_index) {
-                    repository.branches = branches;
+                self.state
+                    .model
+                    .replace_branches(RepositoryId(repository_index), branches);
+                if let Some(repository) = self.state.repository_ui.get_mut(repository_index) {
                     repository.last_error = None;
-                    repository.ensure_current_branch_visible();
                 }
                 self.restore_tree_selection(identity);
             }
             GitResponse::RemotesLoaded(remotes) => {
+                self.state
+                    .model
+                    .set_remotes(RepositoryId(repository_index), remotes);
                 let selected_name = self
                     .state
                     .selected_remote()
                     .map(|remote| remote.name.clone());
                 self.state.remotes_repository_index = Some(repository_index);
-                self.state.remotes = remotes;
                 self.state.selection.selected_remote_index = selected_name.and_then(|name| {
                     self.state
-                        .remotes
+                        .remotes()
                         .iter()
                         .position(|remote| remote.name == name)
                 });
                 self.state.ensure_valid_remote_selection();
-                self.state.screen = Screen::Remotes;
-                if self.state.focus != FocusPanel::Popup {
-                    self.state.focus = FocusPanel::RemoteList;
-                }
-                if let Some(repository) = self.state.repositories.get_mut(repository_index) {
+                self.state
+                    .set_focus_layer(FocusKind::Remote, FocusRole::Entity);
+                if let Some(repository) = self.state.repository_ui.get_mut(repository_index) {
                     repository.last_error = None;
                 }
             }
             GitResponse::CommitsLoaded { branch, commits } => {
+                let branch_id = BranchId {
+                    repository: RepositoryId(repository_index),
+                    name: branch.clone(),
+                };
                 let available_hashes = commits
                     .iter()
                     .map(|commit| commit.hash.clone())
                     .collect::<HashSet<_>>();
-                let changed_repository =
-                    self.state.branch_commits_repository_index != Some(repository_index);
-                let changed_branch =
-                    self.state.branch_commits.viewing_branch.as_ref() != Some(&branch);
-                if let Some(repository) = self.state.repositories.get_mut(repository_index) {
+                let changed_branch = self.state.viewing_branch.as_ref() != Some(&branch_id);
+                self.state.model.replace_branch_commits(&branch_id, commits);
+                self.state.viewing_branch = Some(branch_id);
+                if let Some(repository) = self.state.repository_ui.get_mut(repository_index) {
                     repository.viewing_branch = Some(branch.clone());
                     repository.last_error = None;
                 }
-                self.state.branch_commits_repository_index = Some(repository_index);
-                self.state.branch_commits.viewing_branch = Some(branch);
-                self.state.branch_commits.items = commits;
-                if changed_repository || changed_branch {
+                if changed_branch {
                     self.state.commit_filter.clear();
                     self.state.selection.selected_commit_index = None;
-                    self.state.current_commit_detail = None;
-                    self.state.current_file_diff = None;
                     self.state.commit_selection.clear();
                     self.state.commit_selection_repository_index = Some(repository_index);
                 } else {
@@ -645,15 +792,24 @@ impl App {
                     PendingJobKind::CommitDetail { focus_files, .. } => *focus_files,
                     _ => return,
                 };
-                self.state.current_commit_detail = Some(detail);
-                self.state.current_file_diff = None;
+                self.state
+                    .model
+                    .set_commit_detail(RepositoryId(repository_index), detail);
                 self.state.selection.selected_file_index = None;
                 self.state.ensure_valid_file_selection();
                 self.state.expansion.expanded_files.clear();
-                self.state.screen = Screen::CommitDetail;
-                if focus_files {
-                    self.state.focus = FocusPanel::CommitFileList;
-                }
+                self.state.set_focus_layer(
+                    if focus_files {
+                        FocusKind::File
+                    } else {
+                        FocusKind::Commit
+                    },
+                    if focus_files {
+                        FocusRole::Collection
+                    } else {
+                        FocusRole::Entity
+                    },
+                );
             }
             GitResponse::CommitMessageLoaded { commit, message } => {
                 let requested_commit = match &kind {
@@ -671,23 +827,35 @@ impl App {
                     PendingJobKind::FileDiff { focus_diff, .. } => *focus_diff,
                     _ => return,
                 };
-                self.state.current_file_diff = Some(diff);
+                self.state
+                    .model
+                    .set_file_diff(RepositoryId(repository_index), diff);
                 self.state.selection.diff_scroll = 0;
-                self.state.screen = Screen::FileDiffDetail;
                 // Enter/open deliberately focuses the diff. Up/Down/Home/End
                 // and n/p only refresh it and preserve the current panel.
-                if focus_diff {
-                    self.state.focus = FocusPanel::DiffView;
-                }
+                self.state.set_focus_layer(
+                    if focus_diff {
+                        FocusKind::Diff
+                    } else {
+                        FocusKind::File
+                    },
+                    if focus_diff {
+                        FocusRole::Content
+                    } else {
+                        FocusRole::Entity
+                    },
+                );
             }
             GitResponse::ReflogLoaded(entries) => {
+                self.state
+                    .model
+                    .set_reflog(RepositoryId(repository_index), entries);
                 self.state.reflog_repository_index = Some(repository_index);
-                self.state.reflog_entries = entries;
                 self.state.selection.selected_reflog_index = None;
                 self.state.ensure_valid_reflog_selection();
-                self.state.screen = Screen::Reflog;
-                self.state.focus = FocusPanel::ReflogList;
-                if let Some(repository) = self.state.repositories.get_mut(repository_index) {
+                self.state
+                    .set_focus_layer(FocusKind::Reflog, FocusRole::Entity);
+                if let Some(repository) = self.state.repository_ui.get_mut(repository_index) {
                     repository.last_error = None;
                 }
             }
@@ -697,8 +865,10 @@ impl App {
                         .then_some(node)
                 });
                 let selected_identity = self.state.selected_change_identity();
+                self.state
+                    .model
+                    .set_working_tree(RepositoryId(repository_index), changes);
                 self.state.changes_repository_index = Some(repository_index);
-                self.state.changes = changes;
                 self.state.retain_available_change_selection();
                 self.state.current_changes_diff = None;
                 self.state.current_changes_diff_group = None;
@@ -722,21 +892,21 @@ impl App {
                                 group == wanted_group
                                     && self
                                         .state
-                                        .changes
+                                        .working_tree_changes()
                                         .get(change_index)
                                         .is_some_and(|change| change.path == wanted_path)
                             })
                         })
                     });
                 self.state.ensure_valid_changes_selection();
-                self.state.screen = Screen::Changes;
                 if !matches!(
-                    self.state.focus,
-                    FocusPanel::ChangesTree | FocusPanel::ChangesDiff
+                    self.state.focus_context().kind,
+                    FocusKind::Changes | FocusKind::ChangesDiff
                 ) {
-                    self.state.focus = FocusPanel::ChangesTree;
+                    self.state
+                        .set_focus_layer(FocusKind::Changes, FocusRole::Entity);
                 }
-                if let Some(repository) = self.state.repositories.get_mut(repository_index) {
+                if let Some(repository) = self.state.repository_ui.get_mut(repository_index) {
                     repository.last_error = None;
                 }
                 self.submit_selected_change_diff();
@@ -789,10 +959,9 @@ impl App {
                     self.state.commit_selection.clear();
                 }
                 if command_kind == Some(CommandKind::Reset) {
-                    self.state.current_commit_detail = None;
-                    self.state.current_file_diff = None;
-                    self.state.screen = Screen::BranchOverview;
-                    self.state.focus = FocusPanel::CommitList;
+                    self.state.selection.selected_file_index = None;
+                    self.state
+                        .set_focus_layer(FocusKind::Commit, FocusRole::Collection);
                 }
                 if matches!(
                     command_kind,
@@ -810,19 +979,19 @@ impl App {
                             | CommandKind::SetUpstreamRemote
                     )
                 );
-                if let Some(repository) = self.state.repositories.get_mut(repository_index) {
+                if let Some(repository) = self.state.repository_ui.get_mut(repository_index) {
                     repository.last_error = None;
                 }
                 self.state.last_error = None;
                 self.state.last_message = Some(message);
                 self.refresh_repository(repository_index);
-                if self.state.screen == Screen::Changes
+                if self.state.view_projection().view == ViewId::Changes
                     && self.state.changes_repository_index == Some(repository_index)
                 {
                     self.submit_changes(repository_index);
                 }
                 if remote_command
-                    && self.state.screen == Screen::Remotes
+                    && self.state.view_projection().view == ViewId::Remotes
                     && self.state.remotes_repository_index == Some(repository_index)
                 {
                     self.submit_remotes(repository_index);
@@ -849,11 +1018,12 @@ impl App {
                 self.refresh_repository(repository_index);
             }
             GitResponse::CommandFailed { command, stderr } => {
+                self.mark_model_resource_failed(&kind, stderr.clone());
                 let error = AppError {
                     command: command.clone(),
                     message: stderr.clone(),
                 };
-                if let Some(repository) = self.state.repositories.get_mut(repository_index) {
+                if let Some(repository) = self.state.repository_ui.get_mut(repository_index) {
                     repository.last_error = Some(error);
                 }
                 let command_job = matches!(kind, PendingJobKind::Command { .. });
@@ -864,6 +1034,66 @@ impl App {
                     self.submit_status(repository_index, false);
                 }
             }
+        }
+        self.state.reconcile_focus();
+        self.reconcile_data_requirements();
+    }
+
+    fn mark_model_resource_failed(&mut self, kind: &PendingJobKind, error: String) {
+        match kind {
+            PendingJobKind::Commits {
+                repository_index,
+                branch,
+            } => self.state.model.mark_branch_commits_failed(
+                &BranchId {
+                    repository: RepositoryId(*repository_index),
+                    name: branch.clone(),
+                },
+                error,
+            ),
+            PendingJobKind::CommitDetail {
+                repository_index,
+                commit,
+                ..
+            } => self.state.model.mark_commit_failed(
+                &CommitId {
+                    repository: RepositoryId(*repository_index),
+                    hash: commit.clone(),
+                },
+                error,
+            ),
+            PendingJobKind::FileDiff {
+                repository_index,
+                commit,
+                path,
+                ..
+            } => self.state.model.mark_file_diff_failed(
+                &FileId {
+                    commit: CommitId {
+                        repository: RepositoryId(*repository_index),
+                        hash: commit.clone(),
+                    },
+                    path: path.clone(),
+                },
+                error,
+            ),
+            PendingJobKind::Reflog { repository_index } => self
+                .state
+                .model
+                .mark_reflog_failed(RepositoryId(*repository_index), error),
+            PendingJobKind::Changes { repository_index } => self
+                .state
+                .model
+                .mark_working_tree_failed(RepositoryId(*repository_index), error),
+            PendingJobKind::Remotes { repository_index } => self
+                .state
+                .model
+                .mark_remotes_failed(RepositoryId(*repository_index), error),
+            PendingJobKind::RepositoryStatus { .. }
+            | PendingJobKind::Branches { .. }
+            | PendingJobKind::CommitMessage { .. }
+            | PendingJobKind::ChangesDiff { .. }
+            | PendingJobKind::Command { .. } => {}
         }
     }
 
@@ -887,6 +1117,7 @@ impl App {
             GlobalMode::Chord { .. } => self.dispatch_chord(action),
             GlobalMode::CommandPrompt { .. } => self.dispatch_command_prompt(action),
             GlobalMode::ShortcutHelp { .. } => self.dispatch_shortcut_help(action),
+            GlobalMode::OperationPalette { .. } => self.dispatch_operation_palette(action),
             GlobalMode::Error => match action {
                 Action::DismissError | Action::Cancel | Action::Back | Action::Confirm => {
                     self.state.dismiss_error();
@@ -894,6 +1125,25 @@ impl App {
                 _ => {}
             },
             GlobalMode::Normal => self.dispatch_normal(action),
+        }
+        self.state.reconcile_focus();
+        self.reconcile_data_requirements();
+    }
+
+    fn reconcile_data_requirements(&mut self) {
+        for requirement in self.state.missing_data_requirements() {
+            match requirement {
+                DataRequirement::BranchCommits(branch) => {
+                    self.submit_commits(branch.repository.0, branch.name)
+                }
+                DataRequirement::CommitDetail(commit) => {
+                    self.submit_commit_detail(commit.repository.0, commit.hash, false)
+                }
+                DataRequirement::FileDiff(file) => self.submit_file_diff(file, false),
+                DataRequirement::Reflog(repository) => self.submit_reflog(repository.0),
+                DataRequirement::WorkingTree(repository) => self.submit_changes(repository.0),
+                DataRequirement::Remotes(repository) => self.submit_remotes(repository.0),
+            }
         }
     }
 
@@ -909,15 +1159,11 @@ impl App {
             self.state.close_popup();
             return;
         }
-        let origin_focus = self
-            .state
-            .previous_focus
-            .unwrap_or_else(|| self.state.default_focus_for_screen());
-        let context = ShortcutContext::from_view(self.state.screen, origin_focus);
+        let context = Some(self.state.focus_context().kind);
         let maximum = self
             .state
             .config
-            .shortcut_help_line_count(context)
+            .shortcut_help_line_count_for_view(self.state.view_projection().view, context)
             .saturating_sub(1)
             .min(usize::from(u16::MAX)) as u16;
         let GlobalMode::ShortcutHelp { scroll } = &mut self.state.mode else {
@@ -982,6 +1228,66 @@ impl App {
         }
     }
 
+    fn dispatch_operation_palette(&mut self, action: Action) {
+        match action {
+            Action::UpdateOperationPalette(query) => {
+                if let GlobalMode::OperationPalette {
+                    query: current,
+                    selected,
+                    ..
+                } = &mut self.state.mode
+                {
+                    *current = query;
+                    *selected = 0;
+                }
+            }
+            Action::MoveUp
+            | Action::MoveDown
+            | Action::PageUp
+            | Action::PageDown
+            | Action::Home
+            | Action::End => {
+                let count = self.state.operation_palette_matches().len();
+                let GlobalMode::OperationPalette { selected, .. } = &mut self.state.mode else {
+                    return;
+                };
+                if count == 0 {
+                    *selected = 0;
+                    return;
+                }
+                *selected = match action {
+                    Action::MoveUp => selected.saturating_sub(1),
+                    Action::MoveDown => selected.saturating_add(1).min(count - 1),
+                    Action::PageUp => selected.saturating_sub(PAGE_SIZE),
+                    Action::PageDown => selected.saturating_add(PAGE_SIZE).min(count - 1),
+                    Action::Home => 0,
+                    Action::End => count - 1,
+                    _ => *selected,
+                };
+            }
+            Action::SubmitOperationPalette | Action::Confirm => {
+                let selected = match &self.state.mode {
+                    GlobalMode::OperationPalette { selected, .. } => *selected,
+                    _ => return,
+                };
+                let Some(operation) = self
+                    .state
+                    .operation_palette_matches()
+                    .get(selected)
+                    .copied()
+                else {
+                    return;
+                };
+                self.state.close_popup();
+                if let Some(next_action) = operation.action(&self.state) {
+                    self.dispatch_normal(next_action);
+                }
+            }
+            Action::Cancel | Action::Back => self.state.close_popup(),
+            _ => {}
+        }
+    }
+
     fn dispatch_filtering(&mut self, action: Action) {
         match action {
             Action::UpdateFilter(query) => {
@@ -1005,9 +1311,11 @@ impl App {
                 self.state.mode = GlobalMode::Normal;
                 self.state.ensure_valid_branch_selection();
                 self.state.ensure_valid_commit_selection();
-                match self.state.focus {
-                    FocusPanel::BranchList => self.preview_selected_branch_commits(),
-                    FocusPanel::CommitList => self.preview_selected_commit_detail(),
+                match self.state.focus_context().kind {
+                    FocusKind::Repository | FocusKind::Branch => {
+                        self.preview_selected_branch_commits()
+                    }
+                    FocusKind::Commit => self.preview_selected_commit_detail(),
                     _ => {}
                 }
             }
@@ -1015,9 +1323,11 @@ impl App {
                 self.state.mode = GlobalMode::Normal;
                 self.state.ensure_valid_branch_selection();
                 self.state.ensure_valid_commit_selection();
-                match self.state.focus {
-                    FocusPanel::BranchList => self.preview_selected_branch_commits(),
-                    FocusPanel::CommitList => self.preview_selected_commit_detail(),
+                match self.state.focus_context().kind {
+                    FocusKind::Repository | FocusKind::Branch => {
+                        self.preview_selected_branch_commits()
+                    }
+                    FocusKind::Commit => self.preview_selected_commit_detail(),
                     _ => {}
                 }
             }
@@ -1152,7 +1462,11 @@ impl App {
             return;
         }
         if matches!(kind, RemoteEditKind::Add)
-            && self.state.remotes.iter().any(|remote| remote.name == name)
+            && self
+                .state
+                .remotes()
+                .iter()
+                .any(|remote| remote.name == name)
         {
             if let GlobalMode::EditingRemote {
                 validation_error, ..
@@ -1477,10 +1791,10 @@ impl App {
             Action::PageDown => self.page_down(),
             Action::Home => self.move_home(),
             Action::End => self.move_end(),
-            Action::MoveLeft if self.state.focus == FocusPanel::ChangesTree => {
+            Action::MoveLeft if self.state.focus_context().kind == FocusKind::Changes => {
                 self.collapse_selected_change_node()
             }
-            Action::MoveRight if self.state.focus == FocusPanel::ChangesTree => {
+            Action::MoveRight if self.state.focus_context().kind == FocusKind::Changes => {
                 self.expand_selected_change_node()
             }
             Action::MoveLeft => self.navigate_left(),
@@ -1490,17 +1804,17 @@ impl App {
             Action::Back => self.back(),
             Action::RefreshRepository => {
                 self.refresh_all_repositories();
-                if self.state.screen == Screen::Reflog
+                if self.state.view_projection().view == ViewId::Reflog
                     && let Some(repository_index) = self.state.reflog_repository_index
                 {
                     self.submit_reflog(repository_index);
                 }
-                if self.state.screen == Screen::Changes
+                if self.state.view_projection().view == ViewId::Changes
                     && let Some(repository_index) = self.state.changes_repository_index
                 {
                     self.submit_changes(repository_index);
                 }
-                if self.state.screen == Screen::Remotes
+                if self.state.view_projection().view == ViewId::Remotes
                     && let Some(repository_index) = self.state.remotes_repository_index
                 {
                     self.submit_remotes(repository_index);
@@ -1542,7 +1856,7 @@ impl App {
                     DiffViewMode::Unified => DiffViewMode::SideBySide,
                     DiffViewMode::SideBySide => DiffViewMode::Unified,
                 };
-                if self.state.screen == Screen::Changes {
+                if self.state.view_projection().view == ViewId::Changes {
                     self.state.selection.changes_diff_scroll = 0;
                 } else {
                     self.state.selection.diff_scroll = 0;
@@ -1561,6 +1875,20 @@ impl App {
             Action::OpenShortcutHelp => {
                 self.state.open_popup();
                 self.state.mode = GlobalMode::ShortcutHelp { scroll: 0 };
+            }
+            Action::OpenOperationPalette => {
+                let operations = OperationId::ALL
+                    .iter()
+                    .copied()
+                    .filter(|operation| *operation != OperationId::AppOperationPalette)
+                    .filter(|operation| operation.action(&self.state).is_some())
+                    .collect();
+                self.state.open_popup();
+                self.state.mode = GlobalMode::OperationPalette {
+                    query: String::new(),
+                    selected: 0,
+                    operations,
+                };
             }
             Action::OpenCommandPrompt => {
                 self.state.open_popup();
@@ -1592,6 +1920,8 @@ impl App {
             | Action::SubmitCommit
             | Action::UpdateCommandPrompt(_)
             | Action::SubmitCommandPrompt
+            | Action::UpdateOperationPalette(_)
+            | Action::SubmitOperationPalette
             | Action::UpdateRemoteName(_)
             | Action::UpdateRemoteUrl(_)
             | Action::FocusNextRemoteField
@@ -1636,56 +1966,58 @@ impl App {
         }
     }
 
+    fn move_file_selection(&mut self, delta: isize) {
+        let length = self.state.current_file_count();
+        Self::move_selection(&mut self.state.selection.selected_file_index, length, delta);
+    }
+
+    fn move_reflog_selection(&mut self, delta: isize) {
+        let length = self.state.reflog_entries().len();
+        Self::move_selection(
+            &mut self.state.selection.selected_reflog_index,
+            length,
+            delta,
+        );
+    }
+
+    fn move_remote_selection(&mut self, delta: isize) {
+        let length = self.state.remotes().len();
+        Self::move_selection(
+            &mut self.state.selection.selected_remote_index,
+            length,
+            delta,
+        );
+    }
+
     fn move_up(&mut self) {
-        match self.state.focus {
-            FocusPanel::BranchList => self.move_branch_selection(-1),
-            FocusPanel::CommitList => self.move_commit_selection(-1),
-            FocusPanel::CommitFileList => Self::move_selection(
-                &mut self.state.selection.selected_file_index,
-                self.state
-                    .current_commit_detail
-                    .as_ref()
-                    .map_or(0, |detail| detail.files.len()),
-                -1,
-            ),
-            FocusPanel::FileList => self.move_file(-1),
-            FocusPanel::DiffView => {
+        let focus = self.state.focus_context();
+        match (focus.kind, focus.role) {
+            (FocusKind::Repository | FocusKind::Branch, _) => self.move_branch_selection(-1),
+            (FocusKind::Commit, _) => self.move_commit_selection(-1),
+            (FocusKind::File, FocusRole::Collection) => self.move_file_selection(-1),
+            (FocusKind::File, _) => self.move_file(-1),
+            (FocusKind::Diff, _) => {
                 self.state.selection.diff_scroll =
                     self.state.selection.diff_scroll.saturating_sub(1);
             }
-            FocusPanel::ReflogList => Self::move_selection(
-                &mut self.state.selection.selected_reflog_index,
-                self.state.reflog_entries.len(),
-                -1,
-            ),
-            FocusPanel::RemoteList => Self::move_selection(
-                &mut self.state.selection.selected_remote_index,
-                self.state.remotes.len(),
-                -1,
-            ),
-            FocusPanel::ChangesTree => self.move_change_node(-1),
-            FocusPanel::ChangesDiff => {
+            (FocusKind::Reflog, _) => self.move_reflog_selection(-1),
+            (FocusKind::Remote, _) => self.move_remote_selection(-1),
+            (FocusKind::Changes, _) => self.move_change_node(-1),
+            (FocusKind::ChangesDiff, _) => {
                 self.state.selection.changes_diff_scroll =
                     self.state.selection.changes_diff_scroll.saturating_sub(1);
             }
-            FocusPanel::Popup => {}
         }
     }
 
     fn move_down(&mut self) {
-        match self.state.focus {
-            FocusPanel::BranchList => self.move_branch_selection(1),
-            FocusPanel::CommitList => self.move_commit_selection(1),
-            FocusPanel::CommitFileList => Self::move_selection(
-                &mut self.state.selection.selected_file_index,
-                self.state
-                    .current_commit_detail
-                    .as_ref()
-                    .map_or(0, |detail| detail.files.len()),
-                1,
-            ),
-            FocusPanel::FileList => self.move_file(1),
-            FocusPanel::DiffView => {
+        let focus = self.state.focus_context();
+        match (focus.kind, focus.role) {
+            (FocusKind::Repository | FocusKind::Branch, _) => self.move_branch_selection(1),
+            (FocusKind::Commit, _) => self.move_commit_selection(1),
+            (FocusKind::File, FocusRole::Collection) => self.move_file_selection(1),
+            (FocusKind::File, _) => self.move_file(1),
+            (FocusKind::Diff, _) => {
                 let maximum = Self::maximum_scroll(self.state.diff_line_count());
                 self.state.selection.diff_scroll = self
                     .state
@@ -1694,18 +2026,10 @@ impl App {
                     .saturating_add(1)
                     .min(maximum);
             }
-            FocusPanel::ReflogList => Self::move_selection(
-                &mut self.state.selection.selected_reflog_index,
-                self.state.reflog_entries.len(),
-                1,
-            ),
-            FocusPanel::RemoteList => Self::move_selection(
-                &mut self.state.selection.selected_remote_index,
-                self.state.remotes.len(),
-                1,
-            ),
-            FocusPanel::ChangesTree => self.move_change_node(1),
-            FocusPanel::ChangesDiff => {
+            (FocusKind::Reflog, _) => self.move_reflog_selection(1),
+            (FocusKind::Remote, _) => self.move_remote_selection(1),
+            (FocusKind::Changes, _) => self.move_change_node(1),
+            (FocusKind::ChangesDiff, _) => {
                 let maximum = Self::maximum_scroll(self.state.changes_diff_line_count());
                 self.state.selection.changes_diff_scroll = self
                     .state
@@ -1714,38 +2038,35 @@ impl App {
                     .saturating_add(1)
                     .min(maximum);
             }
-            FocusPanel::Popup => {}
         }
     }
 
     fn page_up(&mut self) {
-        match self.state.focus {
-            FocusPanel::BranchList => self.move_branch_selection(-(PAGE_SIZE as isize)),
-            FocusPanel::CommitList => self.move_commit_selection(-(PAGE_SIZE as isize)),
-            FocusPanel::CommitFileList => Self::move_selection(
-                &mut self.state.selection.selected_file_index,
-                self.state
-                    .current_commit_detail
-                    .as_ref()
-                    .map_or(0, |detail| detail.files.len()),
-                -(PAGE_SIZE as isize),
-            ),
-            FocusPanel::FileList => self.move_file(-(PAGE_SIZE as isize)),
-            FocusPanel::DiffView => {
+        let focus = self.state.focus_context();
+        match (focus.kind, focus.role) {
+            (FocusKind::Repository | FocusKind::Branch, _) => {
+                self.move_branch_selection(-(PAGE_SIZE as isize))
+            }
+            (FocusKind::Commit, _) => self.move_commit_selection(-(PAGE_SIZE as isize)),
+            (FocusKind::File, FocusRole::Collection) => {
+                self.move_file_selection(-(PAGE_SIZE as isize))
+            }
+            (FocusKind::File, _) => self.move_file(-(PAGE_SIZE as isize)),
+            (FocusKind::Diff, _) => {
                 self.state.selection.diff_scroll = self
                     .state
                     .selection
                     .diff_scroll
                     .saturating_sub(PAGE_SIZE as u16);
             }
-            FocusPanel::ChangesDiff => {
+            (FocusKind::ChangesDiff, _) => {
                 self.state.selection.changes_diff_scroll = self
                     .state
                     .selection
                     .changes_diff_scroll
                     .saturating_sub(PAGE_SIZE as u16);
             }
-            FocusPanel::ChangesTree => self.move_change_node(-(PAGE_SIZE as isize)),
+            (FocusKind::Changes, _) => self.move_change_node(-(PAGE_SIZE as isize)),
             _ => {
                 for _ in 0..PAGE_SIZE {
                     self.move_up();
@@ -1755,19 +2076,17 @@ impl App {
     }
 
     fn page_down(&mut self) {
-        match self.state.focus {
-            FocusPanel::BranchList => self.move_branch_selection(PAGE_SIZE as isize),
-            FocusPanel::CommitList => self.move_commit_selection(PAGE_SIZE as isize),
-            FocusPanel::CommitFileList => Self::move_selection(
-                &mut self.state.selection.selected_file_index,
-                self.state
-                    .current_commit_detail
-                    .as_ref()
-                    .map_or(0, |detail| detail.files.len()),
-                PAGE_SIZE as isize,
-            ),
-            FocusPanel::FileList => self.move_file(PAGE_SIZE as isize),
-            FocusPanel::DiffView => {
+        let focus = self.state.focus_context();
+        match (focus.kind, focus.role) {
+            (FocusKind::Repository | FocusKind::Branch, _) => {
+                self.move_branch_selection(PAGE_SIZE as isize)
+            }
+            (FocusKind::Commit, _) => self.move_commit_selection(PAGE_SIZE as isize),
+            (FocusKind::File, FocusRole::Collection) => {
+                self.move_file_selection(PAGE_SIZE as isize)
+            }
+            (FocusKind::File, _) => self.move_file(PAGE_SIZE as isize),
+            (FocusKind::Diff, _) => {
                 let maximum = Self::maximum_scroll(self.state.diff_line_count());
                 self.state.selection.diff_scroll = self
                     .state
@@ -1776,7 +2095,7 @@ impl App {
                     .saturating_add(PAGE_SIZE as u16)
                     .min(maximum);
             }
-            FocusPanel::ChangesDiff => {
+            (FocusKind::ChangesDiff, _) => {
                 let maximum = Self::maximum_scroll(self.state.changes_diff_line_count());
                 self.state.selection.changes_diff_scroll = self
                     .state
@@ -1785,7 +2104,7 @@ impl App {
                     .saturating_add(PAGE_SIZE as u16)
                     .min(maximum);
             }
-            FocusPanel::ChangesTree => self.move_change_node(PAGE_SIZE as isize),
+            (FocusKind::Changes, _) => self.move_change_node(PAGE_SIZE as isize),
             _ => {
                 for _ in 0..PAGE_SIZE {
                     self.move_down();
@@ -1795,8 +2114,9 @@ impl App {
     }
 
     fn move_home(&mut self) {
-        match self.state.focus {
-            FocusPanel::BranchList => {
+        let focus = self.state.focus_context();
+        match (focus.kind, focus.role) {
+            (FocusKind::Repository | FocusKind::Branch, _) => {
                 let before = self.state.selection.selected_branch_index;
                 self.state.selection.selected_branch_index = Some(0);
                 self.state.ensure_valid_branch_selection();
@@ -1804,7 +2124,7 @@ impl App {
                     self.preview_selected_branch_commits();
                 }
             }
-            FocusPanel::CommitList => {
+            (FocusKind::Commit, _) => {
                 let before = self.state.selection.selected_commit_index;
                 self.state.selection.selected_commit_index = Some(0);
                 self.state.ensure_valid_commit_selection();
@@ -1812,22 +2132,19 @@ impl App {
                     self.preview_selected_commit_detail();
                 }
             }
-            FocusPanel::CommitFileList | FocusPanel::FileList => {
+            (FocusKind::File, _) => {
                 self.state.selection.selected_file_index = Some(0);
-                if self.state.focus == FocusPanel::FileList {
-                    self.submit_selected_file_diff(false);
-                }
+                self.state.selection.diff_scroll = 0;
             }
-            FocusPanel::DiffView => self.state.selection.diff_scroll = 0,
-            FocusPanel::ReflogList => self.state.selection.selected_reflog_index = Some(0),
-            FocusPanel::RemoteList => self.state.selection.selected_remote_index = Some(0),
-            FocusPanel::ChangesTree => {
+            (FocusKind::Diff, _) => self.state.selection.diff_scroll = 0,
+            (FocusKind::Reflog, _) => self.state.selection.selected_reflog_index = Some(0),
+            (FocusKind::Remote, _) => self.state.selection.selected_remote_index = Some(0),
+            (FocusKind::Changes, _) => {
                 self.state.selection.selected_changes_index = Some(0);
                 self.state.ensure_valid_changes_selection();
                 self.submit_selected_change_diff();
             }
-            FocusPanel::ChangesDiff => self.state.selection.changes_diff_scroll = 0,
-            FocusPanel::Popup => {}
+            (FocusKind::ChangesDiff, _) => self.state.selection.changes_diff_scroll = 0,
         }
         self.state.ensure_valid_commit_selection();
         self.state.ensure_valid_file_selection();
@@ -1837,8 +2154,9 @@ impl App {
     }
 
     fn move_end(&mut self) {
-        match self.state.focus {
-            FocusPanel::BranchList => {
+        let focus = self.state.focus_context();
+        match (focus.kind, focus.role) {
+            (FocusKind::Repository | FocusKind::Branch, _) => {
                 let before = self.state.selection.selected_branch_index;
                 self.state.selection.selected_branch_index =
                     self.state.visible_tree_nodes().len().checked_sub(1);
@@ -1846,7 +2164,7 @@ impl App {
                     self.preview_selected_branch_commits();
                 }
             }
-            FocusPanel::CommitList => {
+            (FocusKind::Commit, _) => {
                 let before = self.state.selection.selected_commit_index;
                 self.state.selection.selected_commit_index =
                     self.state.visible_commit_indices().len().checked_sub(1);
@@ -1854,38 +2172,32 @@ impl App {
                     self.preview_selected_commit_detail();
                 }
             }
-            FocusPanel::CommitFileList | FocusPanel::FileList => {
-                self.state.selection.selected_file_index = self
-                    .state
-                    .current_commit_detail
-                    .as_ref()
-                    .and_then(|detail| detail.files.len().checked_sub(1));
-                if self.state.focus == FocusPanel::FileList {
-                    self.submit_selected_file_diff(false);
-                }
+            (FocusKind::File, _) => {
+                self.state.selection.selected_file_index =
+                    self.state.current_file_count().checked_sub(1);
+                self.state.selection.diff_scroll = 0;
             }
-            FocusPanel::DiffView => {
+            (FocusKind::Diff, _) => {
                 self.state.selection.diff_scroll =
                     Self::maximum_scroll(self.state.diff_line_count());
             }
-            FocusPanel::ReflogList => {
+            (FocusKind::Reflog, _) => {
                 self.state.selection.selected_reflog_index =
-                    self.state.reflog_entries.len().checked_sub(1);
+                    self.state.reflog_entries().len().checked_sub(1);
             }
-            FocusPanel::RemoteList => {
+            (FocusKind::Remote, _) => {
                 self.state.selection.selected_remote_index =
-                    self.state.remotes.len().checked_sub(1);
+                    self.state.remotes().len().checked_sub(1);
             }
-            FocusPanel::ChangesTree => {
+            (FocusKind::Changes, _) => {
                 self.state.selection.selected_changes_index =
                     self.state.visible_changes_nodes().len().checked_sub(1);
                 self.submit_selected_change_diff();
             }
-            FocusPanel::ChangesDiff => {
+            (FocusKind::ChangesDiff, _) => {
                 self.state.selection.changes_diff_scroll =
                     Self::maximum_scroll(self.state.changes_diff_line_count());
             }
-            FocusPanel::Popup => {}
         }
     }
 
@@ -1894,18 +2206,24 @@ impl App {
     }
 
     fn focus_next(&mut self) {
-        self.state.focus = match (self.state.screen, self.state.focus) {
-            (Screen::BranchOverview, FocusPanel::BranchList) => FocusPanel::CommitList,
-            (Screen::BranchOverview, _) => FocusPanel::BranchList,
-            (Screen::CommitDetail, FocusPanel::CommitList) => FocusPanel::CommitFileList,
-            (Screen::CommitDetail, _) => FocusPanel::CommitList,
-            (Screen::FileDiffDetail, FocusPanel::FileList) => FocusPanel::DiffView,
-            (Screen::FileDiffDetail, _) => FocusPanel::FileList,
-            (Screen::Reflog, _) => FocusPanel::ReflogList,
-            (Screen::Remotes, _) => FocusPanel::RemoteList,
-            (Screen::Changes, FocusPanel::ChangesTree) => FocusPanel::ChangesDiff,
-            (Screen::Changes, _) => FocusPanel::ChangesTree,
+        let focus = self.state.focus_context();
+        let (kind, role) = match (focus.kind, focus.role) {
+            (FocusKind::Repository | FocusKind::Branch, _) => {
+                (FocusKind::Commit, FocusRole::Collection)
+            }
+            (FocusKind::Commit, FocusRole::Collection) => {
+                (self.history_tree_focus(), FocusRole::Entity)
+            }
+            (FocusKind::Commit, _) => (FocusKind::File, FocusRole::Collection),
+            (FocusKind::File, FocusRole::Collection) => (FocusKind::Commit, FocusRole::Entity),
+            (FocusKind::File, _) => (FocusKind::Diff, FocusRole::Content),
+            (FocusKind::Diff, _) => (FocusKind::File, FocusRole::Entity),
+            (FocusKind::Reflog, _) => (FocusKind::Reflog, FocusRole::Entity),
+            (FocusKind::Remote, _) => (FocusKind::Remote, FocusRole::Entity),
+            (FocusKind::Changes, _) => (FocusKind::ChangesDiff, FocusRole::Content),
+            (FocusKind::ChangesDiff, _) => (FocusKind::Changes, FocusRole::Entity),
         };
+        self.state.set_focus_layer(kind, role);
     }
 
     fn focus_previous(&mut self) {
@@ -1916,23 +2234,26 @@ impl App {
     /// the right-hand column, slide the two-column window one level deeper:
     /// the old right column becomes the new left column and keeps focus.
     fn navigate_right(&mut self) {
-        match (self.state.screen, self.state.focus) {
-            (Screen::BranchOverview, FocusPanel::BranchList) => {
-                self.state.focus = FocusPanel::CommitList;
+        let focus = self.state.focus_context();
+        match (focus.kind, focus.role) {
+            (FocusKind::Repository | FocusKind::Branch, _) => {
+                self.state
+                    .set_focus_layer(FocusKind::Commit, FocusRole::Collection);
             }
-            (Screen::BranchOverview, FocusPanel::CommitList) => {
+            (FocusKind::Commit, FocusRole::Collection) => {
                 self.shift_to_commit_detail();
             }
-            (Screen::CommitDetail, FocusPanel::CommitList) => {
-                self.state.focus = FocusPanel::CommitFileList;
+            (FocusKind::Commit, _) => {
+                self.state
+                    .set_focus_layer(FocusKind::File, FocusRole::Collection);
             }
-            (Screen::CommitDetail, FocusPanel::CommitFileList) => {
+            (FocusKind::File, FocusRole::Collection) => {
                 self.shift_to_file_diff();
             }
-            (Screen::FileDiffDetail, FocusPanel::FileList) => {
-                self.state.focus = FocusPanel::DiffView;
+            (FocusKind::File, _) => {
+                self.state
+                    .set_focus_layer(FocusKind::Diff, FocusRole::Content);
             }
-            (Screen::Changes, FocusPanel::ChangesDiff) => {}
             _ => {}
         }
     }
@@ -1941,88 +2262,96 @@ impl App {
     /// exact inverse of `navigate_right`: the current left column becomes the
     /// previous screen's right column and retains focus.
     fn navigate_left(&mut self) {
-        match (self.state.screen, self.state.focus) {
-            (Screen::BranchOverview, FocusPanel::CommitList) => {
-                self.state.focus = FocusPanel::BranchList;
+        let focus = self.state.focus_context();
+        match (focus.kind, focus.role) {
+            (FocusKind::Commit, FocusRole::Collection) => {
+                self.state
+                    .set_focus_layer(self.history_tree_focus(), FocusRole::Entity);
             }
-            (Screen::CommitDetail, FocusPanel::CommitFileList) => {
-                self.state.focus = FocusPanel::CommitList;
+            (FocusKind::File, FocusRole::Collection) => {
+                self.state
+                    .set_focus_layer(FocusKind::Commit, FocusRole::Entity);
             }
-            (Screen::CommitDetail, FocusPanel::CommitList) => {
-                self.state.screen = Screen::BranchOverview;
-                self.state.focus = FocusPanel::CommitList;
+            (FocusKind::Commit, _) => {
+                self.state
+                    .set_focus_layer(FocusKind::Commit, FocusRole::Collection);
             }
-            (Screen::FileDiffDetail, FocusPanel::DiffView) => {
-                self.state.focus = FocusPanel::FileList;
+            (FocusKind::Diff, _) => {
+                self.state
+                    .set_focus_layer(FocusKind::File, FocusRole::Entity);
             }
-            (Screen::FileDiffDetail, FocusPanel::FileList) => {
-                self.state.screen = Screen::CommitDetail;
-                self.state.focus = FocusPanel::CommitFileList;
+            (FocusKind::File, _) => {
+                self.state
+                    .set_focus_layer(FocusKind::File, FocusRole::Collection);
             }
-            (Screen::Changes, FocusPanel::ChangesDiff) => {
-                self.state.focus = FocusPanel::ChangesTree;
+            (FocusKind::ChangesDiff, _) => {
+                self.state
+                    .set_focus_layer(FocusKind::Changes, FocusRole::Entity);
             }
             _ => {}
         }
     }
 
     fn back(&mut self) {
-        match self.state.screen {
-            Screen::BranchOverview => {}
-            Screen::CommitDetail => {
-                self.state.screen = Screen::BranchOverview;
-                self.state.focus = FocusPanel::CommitList;
+        match self.state.view_projection().view {
+            ViewId::History => {}
+            ViewId::Commit => {
+                self.state
+                    .set_focus_layer(FocusKind::Commit, FocusRole::Collection);
             }
-            Screen::FileDiffDetail => {
-                self.state.screen = Screen::CommitDetail;
-                self.state.focus = FocusPanel::CommitFileList;
+            ViewId::FileDiff => {
+                self.state
+                    .set_focus_layer(FocusKind::File, FocusRole::Collection);
             }
-            Screen::Reflog => {
-                self.state.screen = Screen::BranchOverview;
-                self.state.focus = FocusPanel::BranchList;
+            ViewId::Reflog => {
+                self.state
+                    .set_focus_layer(self.history_tree_focus(), FocusRole::Entity);
             }
-            Screen::Remotes => {
-                self.state.screen = Screen::BranchOverview;
-                self.state.focus = FocusPanel::BranchList;
+            ViewId::Remotes => {
+                self.state
+                    .set_focus_layer(self.history_tree_focus(), FocusRole::Entity);
             }
-            Screen::Changes => {
-                let (screen, focus) = self
-                    .state
-                    .changes_return_context
-                    .take()
-                    .unwrap_or((Screen::BranchOverview, FocusPanel::BranchList));
-                self.state.screen = screen;
-                self.state.focus = focus;
+            ViewId::Changes => {
+                if let Some(context) = self.state.changes_return_context.take() {
+                    self.state.restore_focus_context(context);
+                } else {
+                    self.state
+                        .set_focus_layer(self.history_tree_focus(), FocusRole::Entity);
+                }
             }
         }
     }
 
+    fn history_tree_focus(&self) -> FocusKind {
+        if self.state.selected_branch_id().is_some() {
+            FocusKind::Branch
+        } else {
+            FocusKind::Repository
+        }
+    }
+
     fn start_filter(&mut self) {
-        let (target, query) = match self.state.focus {
-            FocusPanel::BranchList => (FilterTarget::Branches, self.state.branch_filter.clone()),
-            FocusPanel::CommitList => (FilterTarget::Commits, self.state.commit_filter.clone()),
+        let (target, query) = match self.state.focus_context().kind {
+            FocusKind::Repository | FocusKind::Branch => {
+                (FilterTarget::Branches, self.state.branch_filter.clone())
+            }
+            FocusKind::Commit => (FilterTarget::Commits, self.state.commit_filter.clone()),
             _ => return,
         };
         self.state.mode = GlobalMode::Filtering { target, query };
     }
 
     fn activate_repository(&mut self, repository_index: usize) {
-        if self.state.repositories.get(repository_index).is_none()
+        if self.state.repository_ui.get(repository_index).is_none()
             || self.state.active_repository_index == Some(repository_index)
         {
             return;
         }
         self.state.active_repository_index = Some(repository_index);
-        self.state.branch_commits_repository_index = Some(repository_index);
-        self.state.branch_commits = crate::domain::CommitList::empty();
-        self.state.current_commit_detail = None;
-        self.state.current_file_diff = None;
+        self.state.viewing_branch = None;
         self.state.reflog_repository_index = None;
-        self.state.reflog_entries.clear();
         self.state.remotes_repository_index = None;
-        self.state.remotes.clear();
         self.state.changes_repository_index = None;
-        self.state.changes.clear();
         self.state.current_changes_diff = None;
         self.state.current_changes_diff_group = None;
         self.state.change_selection.clear();
@@ -2041,9 +2370,15 @@ impl App {
         self.state.selection.selected_reflog_index = None;
         self.state.selection.selected_remote_index = None;
         self.state.selection.selected_changes_index = None;
-        self.state.screen = Screen::BranchOverview;
-        if self.state.focus != FocusPanel::BranchList {
-            self.state.focus = FocusPanel::CommitList;
+        if matches!(
+            self.state.focus_context().kind,
+            FocusKind::Repository | FocusKind::Branch
+        ) {
+            self.state
+                .set_focus_layer(self.history_tree_focus(), FocusRole::Entity);
+        } else {
+            self.state
+                .set_focus_layer(FocusKind::Commit, FocusRole::Collection);
         }
         if self.state.commit_selection_repository_index != Some(repository_index) {
             self.state.commit_selection.clear();
@@ -2052,24 +2387,9 @@ impl App {
         self.load_active_repository_commits(repository_index);
     }
 
-    fn latest_commits_request_matches(&self, repository_index: usize, branch: &BranchName) -> bool {
-        self.state
-            .latest_commits_job
-            .and_then(|id| self.state.pending_jobs.get(&id))
-            .is_some_and(|kind| {
-                matches!(
-                    kind,
-                    PendingJobKind::Commits {
-                        repository_index: pending_repository,
-                        branch: pending_branch,
-                    } if *pending_repository == repository_index && pending_branch == branch
-                )
-            })
-    }
-
     /// Selection-driven branch preview. Unlike Enter, this never moves focus
-    /// into the commit list; it only makes the right pane follow the selected
-    /// branch and relies on latest-job-wins for rapid navigation.
+    /// into the commit list. It changes only the semantic branch scope; the
+    /// post-action DataRequirement reconciliation owns any required load.
     fn preview_selected_branch_commits(&mut self) {
         let selected = match self.state.selected_tree_node() {
             Some(BranchTreeNode::Repository { repository_index }) => {
@@ -2081,9 +2401,7 @@ impl App {
                 branch_index,
             }) => self
                 .state
-                .repositories
-                .get(repository_index)
-                .and_then(|repository| repository.branches.get(branch_index))
+                .repository_branch(repository_index, branch_index)
                 .map(|branch| {
                     (
                         repository_index,
@@ -2098,62 +2416,54 @@ impl App {
         };
 
         self.activate_repository(repository_index);
-        if !has_commit {
-            // Invalidate any older in-flight commit-list response before
-            // showing an unborn branch as an empty list.
-            self.state.latest_commits_job = None;
-            if let Some(repository) = self.state.repositories.get_mut(repository_index) {
-                repository.viewing_branch = Some(branch.clone());
+        let branch_id = BranchId {
+            repository: RepositoryId(repository_index),
+            name: branch.clone(),
+        };
+        if self.state.viewing_branch.as_ref() == Some(&branch_id) {
+            if !has_commit {
+                self.state
+                    .model
+                    .replace_branch_commits(&branch_id, Vec::new());
             }
-            self.state.branch_commits_repository_index = Some(repository_index);
-            self.state.branch_commits.viewing_branch = Some(branch);
-            self.state.branch_commits.items.clear();
-            self.state.commit_filter.clear();
-            self.state.selection.selected_commit_index = None;
-            self.state.current_commit_detail = None;
-            self.state.current_file_diff = None;
-            self.state.commit_selection.clear();
-            self.state.commit_selection_repository_index = Some(repository_index);
             self.state.ensure_valid_commit_selection();
             return;
         }
 
-        let already_loaded = self.state.branch_commits_repository_index == Some(repository_index)
-            && self.state.branch_commits.viewing_branch.as_ref() == Some(&branch)
-            && self.state.latest_commits_job.is_none();
-        if already_loaded || self.latest_commits_request_matches(repository_index, &branch) {
-            return;
-        }
-
-        // Remove stale right-pane content immediately so the highlighted
-        // branch and the displayed commits can never disagree while loading.
-        if let Some(repository) = self.state.repositories.get_mut(repository_index) {
+        if let Some(repository) = self.state.repository_ui.get_mut(repository_index) {
             repository.viewing_branch = Some(branch.clone());
         }
-        self.state.branch_commits_repository_index = Some(repository_index);
-        self.state.branch_commits.viewing_branch = Some(branch.clone());
-        self.state.branch_commits.items.clear();
+        self.state.viewing_branch = Some(branch_id.clone());
         self.state.commit_filter.clear();
         self.state.selection.selected_commit_index = None;
-        self.state.current_commit_detail = None;
-        self.state.current_file_diff = None;
+        self.state.selection.selected_file_index = None;
         self.state.commit_selection.clear();
         self.state.commit_selection_repository_index = Some(repository_index);
-        self.submit_commits(repository_index, branch);
+
+        if !has_commit {
+            // Invalidate any older in-flight commit-list response before
+            // showing an unborn branch as an empty list.
+            self.state.latest_commits_job = None;
+            self.state
+                .model
+                .replace_branch_commits(&branch_id, Vec::new());
+            self.state.ensure_valid_commit_selection();
+        }
     }
 
     fn activate_selected_tree_node(&mut self) {
         match self.state.selected_tree_node() {
             Some(BranchTreeNode::Repository { repository_index }) => {
                 self.activate_repository(repository_index);
-                if let Some(repository) = self.state.repositories.get_mut(repository_index) {
+                if let Some(repository) = self.state.repository_ui.get_mut(repository_index) {
                     repository.expanded = !repository.expanded;
                 }
                 self.state.ensure_valid_branch_selection();
             }
             Some(BranchTreeNode::Branch { .. }) => {
                 self.preview_selected_branch_commits();
-                self.state.focus = FocusPanel::CommitList;
+                self.state
+                    .set_focus_layer(FocusKind::Commit, FocusRole::Collection);
             }
             None => {}
         }
@@ -2176,8 +2486,8 @@ impl App {
         };
         self.activate_repository(repository_index);
         self.state.remotes_repository_index = Some(repository_index);
-        self.state.screen = Screen::Remotes;
-        self.state.focus = FocusPanel::RemoteList;
+        self.state
+            .set_focus_layer(FocusKind::Remote, FocusRole::Entity);
         self.state.ensure_valid_remote_selection();
         self.submit_remotes(repository_index);
     }
@@ -2347,29 +2657,28 @@ impl App {
         };
         self.activate_repository(repository_index);
         self.state.reflog_repository_index = Some(repository_index);
-        self.state.reflog_entries.clear();
         self.state.selection.selected_reflog_index = None;
-        self.state.screen = Screen::Reflog;
-        self.state.focus = FocusPanel::ReflogList;
+        self.state
+            .set_focus_layer(FocusKind::Reflog, FocusRole::Entity);
         self.submit_reflog(repository_index);
     }
 
     fn toggle_changes(&mut self) {
-        if self.state.screen == Screen::Changes {
+        if self.state.view_projection().view == ViewId::Changes {
             self.back();
             return;
         }
         let Some(repository_index) = self.state.active_repository_index else {
             return;
         };
-        self.state.changes_return_context = Some((self.state.screen, self.state.focus));
+        self.state.changes_return_context = Some(self.state.focus_context());
         self.state.changes_repository_index = Some(repository_index);
         self.state.current_changes_diff = None;
         self.state.current_changes_diff_group = None;
         self.state.selection.changes_diff_scroll = 0;
-        self.state.screen = Screen::Changes;
-        self.state.focus = FocusPanel::ChangesTree;
-        if self.state.changes.is_empty() {
+        self.state
+            .set_focus_layer(FocusKind::Changes, FocusRole::Entity);
+        if self.state.working_tree_changes().is_empty() {
             // Do not turn the implicit pre-load root into an intentional user
             // selection. Once data arrives, selection should land on the
             // first file so its diff is immediately useful.
@@ -2419,7 +2728,8 @@ impl App {
             }
             ChangesTreeNode::File { .. } => {
                 self.submit_selected_change_diff();
-                self.state.focus = FocusPanel::ChangesDiff;
+                self.state
+                    .set_focus_layer(FocusKind::ChangesDiff, FocusRole::Content);
             }
         }
     }
@@ -2439,7 +2749,7 @@ impl App {
                 change_index,
             } => self
                 .state
-                .changes
+                .working_tree_changes()
                 .get(change_index)
                 .map(|change| vec![AppState::change_selection_key(group, change)])
                 .unwrap_or_default(),
@@ -2486,7 +2796,7 @@ impl App {
         let wanted = wanted.into_iter().collect::<HashSet<_>>();
         let mut seen = HashSet::new();
         let mut paths = Vec::new();
-        for change in &self.state.changes {
+        for change in self.state.working_tree_changes() {
             if !wanted.contains(&AppState::change_selection_key(group, change)) {
                 continue;
             }
@@ -2691,7 +3001,7 @@ impl App {
     }
 
     fn open_commit_detail(&mut self) {
-        let Some(repository_index) = self.state.branch_commits_repository_index else {
+        let Some(repository_index) = self.state.viewing_repository_index() else {
             return;
         };
         let Some(commit) = self
@@ -2708,7 +3018,7 @@ impl App {
     /// focus into the new detail column. The selected Commits column is reused
     /// as the new left column, so keyboard position remains visually stable.
     fn shift_to_commit_detail(&mut self) {
-        let Some((repository_index, commit)) = self.state.branch_commits_repository_index.zip(
+        let Some((repository_index, commit)) = self.state.viewing_repository_index().zip(
             self.state
                 .selected_commit()
                 .map(|commit| commit.hash.clone()),
@@ -2716,8 +3026,8 @@ impl App {
             return;
         };
 
-        self.state.screen = Screen::CommitDetail;
-        self.state.focus = FocusPanel::CommitList;
+        self.state
+            .set_focus_layer(FocusKind::Commit, FocusRole::Entity);
 
         // If Enter already queued the same detail request, turn it into a
         // column-shift request so its response cannot steal focus to Files.
@@ -2759,65 +3069,51 @@ impl App {
     /// Keep Commit Detail's right pane synchronized with the highlighted
     /// commit without transferring focus away from the left commit list.
     fn preview_selected_commit_detail(&mut self) {
-        if self.state.screen != Screen::CommitDetail {
+        if self.state.view_projection().view != ViewId::Commit {
             return;
         }
-        let selected = self.state.branch_commits_repository_index.zip(
+        let selected = self.state.viewing_repository_index().zip(
             self.state
                 .selected_commit()
                 .map(|commit| commit.hash.clone()),
         );
         let Some((repository_index, commit)) = selected else {
             self.state.latest_commit_detail_job = None;
-            self.state.current_commit_detail = None;
-            self.state.current_file_diff = None;
             self.state.selection.selected_file_index = None;
             self.state.expansion.expanded_files.clear();
             return;
         };
 
-        let already_loaded = self
-            .state
-            .current_commit_detail
-            .as_ref()
-            .is_some_and(|detail| detail.commit.hash == commit)
-            && self.state.latest_commit_detail_job.is_none();
-        if already_loaded || self.latest_commit_detail_request_matches(repository_index, &commit) {
+        if self.latest_commit_detail_request_matches(repository_index, &commit) {
             return;
         }
 
-        // Clear the old commit immediately; while the new request is pending,
-        // the right pane shows an explicit loading state instead of stale data.
-        self.state.current_commit_detail = None;
-        self.state.current_file_diff = None;
         self.state.selection.selected_file_index = None;
         self.state.expansion.expanded_files.clear();
-        self.submit_commit_detail(repository_index, commit, false);
     }
 
     /// Slide `Commits | Commit` to `Commit | Diff`. The complete Commit
     /// column (metadata plus changed files) remains selected and becomes the
     /// new left column; the diff is loaded on the right without stealing focus.
     fn shift_to_file_diff(&mut self) {
-        let Some(repository_index) = self.state.branch_commits_repository_index else {
+        let Some(repository_index) = self.state.viewing_repository_index() else {
             return;
         };
-        let Some(detail) = self.state.current_commit_detail.as_ref() else {
+        let Some(commit_id) = self.state.current_commit_id() else {
             return;
         };
         let Some(file) = self.state.selected_file() else {
             return;
         };
-        let commit = detail.commit.hash.clone();
+        let commit = commit_id.hash;
         let path = file.path.clone();
 
-        self.state.screen = Screen::FileDiffDetail;
-        self.state.focus = FocusPanel::FileList;
+        self.state
+            .set_focus_layer(FocusKind::File, FocusRole::Entity);
 
         if self
             .state
-            .current_file_diff
-            .as_ref()
+            .current_file_diff()
             .is_some_and(|diff| diff.commit == commit && diff.path == path)
         {
             // A different older request must not replace the reusable cached
@@ -2826,7 +3122,6 @@ impl App {
             return;
         }
 
-        self.state.current_file_diff = None;
         self.state.selection.diff_scroll = 0;
 
         // Preserve column focus if an explicit open for the same file was
@@ -2843,10 +3138,10 @@ impl App {
             && pending_path == &path
         {
             *focus_diff = false;
-            return;
         }
 
-        self.submit_selected_file_diff(false);
+        // DataRequirement reconciliation after this action loads the selected
+        // file if its Resource is not ready.
     }
 
     fn toggle_file_expanded(&mut self) {
@@ -2859,17 +3154,13 @@ impl App {
     }
 
     fn move_file(&mut self, delta: isize) {
-        let length = self
-            .state
-            .current_commit_detail
-            .as_ref()
-            .map_or(0, |detail| detail.files.len());
+        let length = self.state.current_file_count();
         let before = self.state.selection.selected_file_index;
         Self::move_selection(&mut self.state.selection.selected_file_index, length, delta);
-        if self.state.screen == Screen::FileDiffDetail
+        if self.state.view_projection().view == ViewId::FileDiff
             && self.state.selection.selected_file_index != before
         {
-            self.submit_selected_file_diff(false);
+            self.state.selection.diff_scroll = 0;
         }
     }
 
@@ -2887,7 +3178,7 @@ impl App {
     }
 
     fn toggle_commit_selection(&mut self) {
-        let Some(repository_index) = self.state.branch_commits_repository_index else {
+        let Some(repository_index) = self.state.viewing_repository_index() else {
             return;
         };
         let Some(hash) = self
@@ -2940,7 +3231,7 @@ impl App {
             return;
         }
 
-        let Some(repository_index) = self.state.branch_commits_repository_index else {
+        let Some(repository_index) = self.state.viewing_repository_index() else {
             return;
         };
         let Some(commit) = self
@@ -2956,7 +3247,7 @@ impl App {
 
     fn selected_file_path_for_copy(&self) -> Option<(usize, GitPath)> {
         Some((
-            self.state.branch_commits_repository_index?,
+            self.state.viewing_repository_index()?,
             self.state.selected_file()?.path.clone(),
         ))
     }
@@ -2977,7 +3268,7 @@ impl App {
         let Some((repository_index, path)) = self.selected_file_path_for_copy() else {
             return;
         };
-        let Some(repository) = self.state.repositories.get(repository_index) else {
+        let Some(repository) = self.state.repository_node(repository_index) else {
             return;
         };
         let root = if repository.git_cwd().is_absolute() {
@@ -3005,7 +3296,7 @@ impl App {
         let Some(repository_index) = self.state.commit_selection_repository_index else {
             return;
         };
-        if self.state.branch_commits_repository_index != Some(repository_index) {
+        if self.state.viewing_repository_index() != Some(repository_index) {
             return;
         }
         let commits = self.state.selected_commit_hashes_for_cherry_pick();
@@ -3022,7 +3313,7 @@ impl App {
     }
 
     fn open_reset_dialog(&mut self) {
-        let target = if self.state.screen == Screen::Reflog {
+        let target = if self.state.focus_context().kind == FocusKind::Reflog {
             self.state.selected_reflog().map(|entry| {
                 (
                     self.state.reflog_repository_index,
@@ -3033,7 +3324,7 @@ impl App {
         } else {
             self.state.selected_commit().map(|commit| {
                 (
-                    self.state.branch_commits_repository_index,
+                    self.state.viewing_repository_index(),
                     commit.hash.clone(),
                     commit.short_hash.clone(),
                 )

@@ -9,8 +9,8 @@ use std::{
 
 use pitui::{
     app::{
-        Action, App, BranchTreeNode, ChangeGroup, ChangesTreeNode, DiffViewMode, FocusPanel,
-        GlobalMode, Screen,
+        Action, App, BranchTreeNode, ChangeGroup, ChangesTreeNode, DiffViewMode, FocusKind,
+        FocusRole, GlobalMode, PanelId, RepositoryId, ViewId,
     },
     config::KeyStroke,
     domain::{
@@ -108,9 +108,10 @@ fn branch_tree_index(app: &App, repository_index: usize, name: &str) -> usize {
             BranchTreeNode::Branch {
                 repository_index: index,
                 branch_index,
-            } if index == repository_index => {
-                app.state.repositories[index].branches[branch_index].name.0 == name
-            }
+            } if index == repository_index => app
+                .state
+                .repository_branch(index, branch_index)
+                .is_some_and(|branch| branch.name.0 == name),
             _ => false,
         })
         .unwrap_or_else(|| panic!("branch {name} is absent from repository {repository_index}"))
@@ -464,9 +465,9 @@ fn loads_working_tree_files_and_index_worktree_untracked_diffs() {
     wait_until_idle(&mut app);
     app.dispatch(Action::ToggleChanges);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.screen, Screen::Changes);
-    assert_eq!(app.state.focus, FocusPanel::ChangesTree);
-    assert_eq!(app.state.changes.len(), 4);
+    assert_eq!(app.state.view_projection().view, ViewId::Changes);
+    assert_eq!(app.state.view_projection().focused, PanelId::Changes);
+    assert_eq!(app.state.working_tree_changes().len(), 4);
     assert!(app.state.current_changes_diff.is_some());
     let nodes = app.state.visible_changes_nodes();
     assert_eq!(nodes[0], ChangesTreeNode::Root);
@@ -493,7 +494,7 @@ fn loads_working_tree_files_and_index_worktree_untracked_diffs() {
             .any(|line| line.text == "index line" || line.text == "staged line")
     );
     app.dispatch(Action::Back);
-    assert_eq!(app.state.screen, Screen::BranchOverview);
+    assert_eq!(app.state.view_projection().view, ViewId::History);
 }
 
 #[test]
@@ -617,7 +618,7 @@ fn changes_controller_multiselects_stages_unstages_and_creates_a_commit() {
 
     // Selection and stage work while the reusable diff panel has focus.
     app.dispatch(Action::FocusNext);
-    assert_eq!(app.state.focus, FocusPanel::ChangesDiff);
+    assert_eq!(app.state.view_projection().focused, PanelId::ChangesDiff);
     app.dispatch(Action::ToggleChangeSelection);
     assert_eq!(app.state.change_selection.len(), 1);
     app.dispatch(Action::StageSelectedChanges);
@@ -641,7 +642,8 @@ fn changes_controller_multiselects_stages_unstages_and_creates_a_commit() {
         .position(|node| *node == ChangesTreeNode::Group(ChangeGroup::Unstaged))
         .unwrap();
     app.state.selection.selected_changes_index = Some(unstaged_group);
-    app.state.focus = FocusPanel::ChangesTree;
+    app.state
+        .set_focus_layer(FocusKind::Changes, FocusRole::Entity);
     app.dispatch(Action::ToggleChangeSelection);
     assert_eq!(app.state.selected_change_count(ChangeGroup::Unstaged), 2);
     app.dispatch(Action::StageSelectedChanges);
@@ -669,7 +671,7 @@ fn changes_controller_multiselects_stages_unstages_and_creates_a_commit() {
     wait_until_idle(&mut app);
 
     assert_eq!(app.state.mode, GlobalMode::Normal);
-    assert_eq!(app.state.screen, Screen::Changes);
+    assert_eq!(app.state.view_projection().view, ViewId::Changes);
     assert_eq!(app.state.change_group_count(ChangeGroup::Staged), 0);
     assert_eq!(app.state.change_group_count(ChangeGroup::Unstaged), 0);
     assert_eq!(
@@ -780,15 +782,18 @@ fn unborn_repository_is_a_valid_empty_repository() {
     let mut app = app_for(&[repo.path()]);
     wait_until_idle(&mut app);
     assert_eq!(app.state.visible_tree_nodes().len(), 2);
-    assert_eq!(app.state.repositories[0].branches.len(), 1);
-    assert_eq!(app.state.repositories[0].branches[0].name.0, "main");
-    assert_eq!(app.state.repositories[0].branches[0].short_head, "unborn");
+    assert_eq!(app.state.model.branch_summaries(RepositoryId(0)).len(), 1);
+    assert_eq!(app.state.repository_branch(0, 0).unwrap().name.0, "main");
+    assert_eq!(
+        app.state.repository_branch(0, 0).unwrap().short_head,
+        "unborn"
+    );
     let main_index = branch_tree_index(&app, 0, "main");
     app.dispatch(Action::SelectBranch(main_index));
     app.dispatch(Action::LoadCommitsForSelectedBranch);
     wait_until_idle(&mut app);
-    assert!(app.state.branch_commits.items.is_empty());
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert!(app.state.branch_commit_summaries().is_empty());
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
     assert_eq!(app.state.mode, GlobalMode::Normal);
 }
 
@@ -867,9 +872,12 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
     let mut app = app_for(&[repo.path()]);
     wait_until_idle(&mut app);
     assert!(app.state.active_repository().is_some());
-    assert_eq!(app.state.repositories[0].branches.len(), 1);
-    assert_eq!(app.state.branch_commits.items.len(), 2);
-    assert_eq!(app.state.focus, FocusPanel::BranchList);
+    assert_eq!(app.state.model.branch_summaries(RepositoryId(0)).len(), 1);
+    assert_eq!(app.state.branch_commit_summaries().len(), 2);
+    assert_eq!(
+        app.state.view_projection().focused,
+        PanelId::RepositoryBranches
+    );
 
     app.dispatch(Action::OpenCommandPrompt);
     assert!(matches!(
@@ -879,8 +887,11 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
             validation_error: None
         } if input.is_empty()
     ));
-    assert_eq!(app.state.focus, FocusPanel::Popup);
-    assert_eq!(app.state.previous_focus, Some(FocusPanel::BranchList));
+    assert!(!matches!(app.state.mode, GlobalMode::Normal));
+    assert_eq!(
+        app.state.view_projection().focused,
+        PanelId::RepositoryBranches
+    );
     app.dispatch(Action::SubmitCommandPrompt);
     assert!(matches!(
         app.state.mode,
@@ -902,8 +913,11 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
         app.state.mode,
         GlobalMode::ShortcutHelp { scroll: 0 }
     ));
-    assert_eq!(app.state.focus, FocusPanel::Popup);
-    assert_eq!(app.state.previous_focus, Some(FocusPanel::BranchList));
+    assert!(!matches!(app.state.mode, GlobalMode::Normal));
+    assert_eq!(
+        app.state.view_projection().focused,
+        PanelId::RepositoryBranches
+    );
     app.dispatch(Action::PageDown);
     assert!(matches!(
         app.state.mode,
@@ -911,31 +925,26 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
     ));
     app.dispatch(Action::Cancel);
     assert_eq!(app.state.mode, GlobalMode::Normal);
-    assert_eq!(app.state.focus, FocusPanel::BranchList);
+    assert_eq!(
+        app.state.view_projection().focused,
+        PanelId::RepositoryBranches
+    );
 
     app.dispatch(Action::FocusNext);
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
     app.dispatch(Action::OpenCommitDetail);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.screen, Screen::CommitDetail);
-    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
-    assert_eq!(
-        app.state
-            .current_commit_detail
-            .as_ref()
-            .unwrap()
-            .files
-            .len(),
-        1
-    );
+    assert_eq!(app.state.view_projection().view, ViewId::Commit);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
+    assert_eq!(app.state.current_commit_detail().unwrap().files.len(), 1);
 
     app.dispatch(Action::ToggleFileExpanded);
     assert_eq!(app.state.expansion.expanded_files.len(), 1);
     app.dispatch(Action::OpenSelectedFileDiff);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.screen, Screen::FileDiffDetail);
-    assert_eq!(app.state.focus, FocusPanel::DiffView);
-    assert!(app.state.current_file_diff.is_some());
+    assert_eq!(app.state.view_projection().view, ViewId::FileDiff);
+    assert_eq!(app.state.view_projection().focused, PanelId::FileDiff);
+    assert!(app.state.current_file_diff().is_some());
     app.dispatch(Action::ToggleDiffMode);
     assert_eq!(app.state.diff_mode, DiffViewMode::SideBySide);
     app.dispatch(Action::ToggleWrap);
@@ -945,25 +954,24 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
     // be opened from a commit diff and returns to that exact screen/focus.
     app.dispatch(Action::ToggleChanges);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.screen, Screen::Changes);
+    assert_eq!(app.state.view_projection().view, ViewId::Changes);
     app.dispatch(Action::Back);
-    assert_eq!(app.state.screen, Screen::FileDiffDetail);
-    assert_eq!(app.state.focus, FocusPanel::DiffView);
-    assert!(app.state.current_file_diff.is_some());
+    assert_eq!(app.state.view_projection().view, ViewId::FileDiff);
+    assert_eq!(app.state.view_projection().focused, PanelId::FileDiff);
+    assert!(app.state.current_file_diff().is_some());
 
     app.dispatch(Action::Back);
-    assert_eq!(app.state.screen, Screen::CommitDetail);
-    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+    assert_eq!(app.state.view_projection().view, ViewId::Commit);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
     app.dispatch(Action::FocusNext);
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
     app.dispatch(Action::ToggleCommitSelection);
     app.dispatch(Action::MoveDown);
     app.dispatch(Action::ToggleCommitSelection);
     assert_eq!(app.state.commit_selection.len(), 2);
     let expected_cherry_pick = app
         .state
-        .branch_commits
-        .items
+        .branch_commit_summaries()
         .iter()
         .rev()
         .filter(|commit| app.state.commit_selection.contains(&commit.hash))
@@ -976,10 +984,10 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
             dialog: pitui::app::ConfirmDialog::CherryPickSelected { commits, .. }
         } if commits == &expected_cherry_pick
     ));
-    assert_eq!(app.state.focus, FocusPanel::Popup);
+    assert!(!matches!(app.state.mode, GlobalMode::Normal));
     app.dispatch(Action::Cancel);
     assert_eq!(app.state.mode, GlobalMode::Normal);
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
 
     open_commit_copy_chord(&mut app);
     assert!(matches!(app.state.mode, GlobalMode::Chord { .. }));
@@ -987,8 +995,7 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
     assert_eq!(app.state.mode, GlobalMode::Normal);
     let expected_hashes = app
         .state
-        .branch_commits
-        .items
+        .branch_commit_summaries()
         .iter()
         .map(|commit| commit.hash.0.as_str())
         .collect::<Vec<_>>()
@@ -1025,12 +1032,40 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
     assert_eq!(app.state.mode, GlobalMode::Normal);
 
     app.dispatch(Action::Back);
-    assert_eq!(app.state.screen, Screen::BranchOverview);
+    assert_eq!(app.state.view_projection().view, ViewId::History);
     app.dispatch(Action::StartFilter);
     app.dispatch(Action::UpdateFilter("second".into()));
     assert_eq!(app.state.visible_commits().len(), 1);
     app.dispatch(Action::SubmitFilter);
     assert_eq!(app.state.commit_filter, "second");
+}
+
+#[test]
+fn operation_palette_invokes_the_same_focus_scoped_operation_without_changing_focus() {
+    let repo = repository();
+    fs::write(repo.path().join("palette.txt"), "content\n").unwrap();
+    commit_all(repo.path(), "palette operation");
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    app.dispatch(Action::FocusNext);
+    let focus_before = app.state.focus_context();
+
+    app.dispatch(Action::OpenOperationPalette);
+    assert_eq!(app.state.focus_context(), focus_before);
+    app.dispatch(Action::UpdateOperationPalette(
+        "commit.toggle_selection".into(),
+    ));
+    app.dispatch(Action::SubmitOperationPalette);
+
+    assert_eq!(app.state.mode, GlobalMode::Normal);
+    assert_eq!(app.state.focus_context(), focus_before);
+    assert_eq!(app.state.commit_selection.len(), 1);
+    assert!(
+        app.state
+            .commit_selection
+            .contains(&app.state.selected_commit().unwrap().hash)
+    );
 }
 
 #[test]
@@ -1041,80 +1076,89 @@ fn horizontal_navigation_slides_columns_through_branch_commit_file_and_diff_leve
 
     let mut app = app_for(&[repo.path()]);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.screen, Screen::BranchOverview);
-    assert_eq!(app.state.focus, FocusPanel::BranchList);
+    assert_eq!(app.state.view_projection().view, ViewId::History);
+    assert_eq!(
+        app.state.view_projection().focused,
+        PanelId::RepositoryBranches
+    );
 
     // Branches | Commits: move into the right column, then slide it to the
     // left of Commits | Commit without wrapping back to Branches.
     app.dispatch(Action::MoveRight);
-    assert_eq!(app.state.screen, Screen::BranchOverview);
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.view_projection().view, ViewId::History);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
     app.dispatch(Action::MoveRight);
-    assert_eq!(app.state.screen, Screen::CommitDetail);
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.view_projection().view, ViewId::Commit);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
 
     // Returning before the worker answers must keep the older screen; a stale
     // response may not reopen the deeper level.
     app.dispatch(Action::MoveLeft);
-    assert_eq!(app.state.screen, Screen::BranchOverview);
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.view_projection().view, ViewId::History);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.screen, Screen::BranchOverview);
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.view_projection().view, ViewId::History);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
 
     app.dispatch(Action::MoveRight);
-    assert_eq!(app.state.screen, Screen::CommitDetail);
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.view_projection().view, ViewId::Commit);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
-    assert!(app.state.current_commit_detail.is_some());
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
+    assert!(app.state.current_commit_detail().is_some());
 
     // Commits | Commit: enter the reused Commit column, then slide the whole
     // metadata + files column to the left of Commit | Diff.
     app.dispatch(Action::MoveRight);
-    assert_eq!(app.state.screen, Screen::CommitDetail);
-    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+    assert_eq!(app.state.view_projection().view, ViewId::Commit);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
     app.dispatch(Action::MoveRight);
-    assert_eq!(app.state.screen, Screen::FileDiffDetail);
-    assert_eq!(app.state.focus, FocusPanel::FileList);
+    assert_eq!(app.state.view_projection().view, ViewId::FileDiff);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
 
     app.dispatch(Action::MoveLeft);
-    assert_eq!(app.state.screen, Screen::CommitDetail);
-    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+    assert_eq!(app.state.view_projection().view, ViewId::Commit);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.screen, Screen::CommitDetail);
-    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+    assert_eq!(app.state.view_projection().view, ViewId::Commit);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
 
     app.dispatch(Action::MoveRight);
-    assert_eq!(app.state.screen, Screen::FileDiffDetail);
-    assert_eq!(app.state.focus, FocusPanel::FileList);
+    assert_eq!(app.state.view_projection().view, ViewId::FileDiff);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.focus, FocusPanel::FileList);
-    assert!(app.state.current_file_diff.is_some());
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
+    assert!(app.state.current_file_diff().is_some());
 
     app.dispatch(Action::MoveRight);
-    assert_eq!(app.state.focus, FocusPanel::DiffView);
+    assert_eq!(app.state.view_projection().focused, PanelId::FileDiff);
     app.dispatch(Action::MoveRight);
-    assert_eq!(app.state.screen, Screen::FileDiffDetail);
-    assert_eq!(app.state.focus, FocusPanel::DiffView);
+    assert_eq!(app.state.view_projection().view, ViewId::FileDiff);
+    assert_eq!(app.state.view_projection().focused, PanelId::FileDiff);
 
     // Left is the exact inverse: move within a pair, then slide the current
     // left column back into the previous screen's right column.
     app.dispatch(Action::MoveLeft);
-    assert_eq!(app.state.focus, FocusPanel::FileList);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
     app.dispatch(Action::MoveLeft);
-    assert_eq!(app.state.screen, Screen::CommitDetail);
-    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+    assert_eq!(app.state.view_projection().view, ViewId::Commit);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
     app.dispatch(Action::MoveLeft);
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
     app.dispatch(Action::MoveLeft);
-    assert_eq!(app.state.screen, Screen::BranchOverview);
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.view_projection().view, ViewId::History);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
     app.dispatch(Action::MoveLeft);
-    assert_eq!(app.state.focus, FocusPanel::BranchList);
+    assert_eq!(
+        app.state.view_projection().focused,
+        PanelId::RepositoryBranches
+    );
     app.dispatch(Action::MoveLeft);
-    assert_eq!(app.state.screen, Screen::BranchOverview);
-    assert_eq!(app.state.focus, FocusPanel::BranchList);
+    assert_eq!(app.state.view_projection().view, ViewId::History);
+    assert_eq!(
+        app.state.view_projection().focused,
+        PanelId::RepositoryBranches
+    );
 }
 
 #[test]
@@ -1159,16 +1203,8 @@ fn every_file_detail_panel_supports_home_end_and_page_navigation() {
     app.dispatch(Action::FocusNext);
     app.dispatch(Action::OpenCommitDetail);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
-    assert_eq!(
-        app.state
-            .current_commit_detail
-            .as_ref()
-            .unwrap()
-            .files
-            .len(),
-        15
-    );
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
+    assert_eq!(app.state.current_commit_detail().unwrap().files.len(), 15);
 
     app.dispatch(Action::PageDown);
     assert_eq!(app.state.selection.selected_file_index, Some(10));
@@ -1182,7 +1218,7 @@ fn every_file_detail_panel_supports_home_end_and_page_navigation() {
     app.dispatch(Action::OpenSelectedFileDiff);
     wait_until_idle(&mut app);
     app.dispatch(Action::FocusNext);
-    assert_eq!(app.state.focus, FocusPanel::FileList);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
     app.dispatch(Action::PageDown);
     assert_eq!(app.state.selection.selected_file_index, Some(10));
     assert_eq!(
@@ -1191,7 +1227,7 @@ fn every_file_detail_panel_supports_home_end_and_page_navigation() {
         "paging the file list must load only the final file diff"
     );
     wait_until_idle(&mut app);
-    assert_eq!(app.state.focus, FocusPanel::FileList);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
     app.dispatch(Action::PageUp);
     assert_eq!(app.state.selection.selected_file_index, Some(0));
     wait_until_idle(&mut app);
@@ -1226,9 +1262,14 @@ fn every_file_detail_panel_supports_home_end_and_page_navigation() {
     };
     let last_line = 41;
 
-    app.state.current_file_diff = Some(long_diff.clone());
-    app.state.screen = Screen::FileDiffDetail;
-    app.state.focus = FocusPanel::DiffView;
+    let mut long_diff = long_diff;
+    long_diff.commit = app.state.current_commit_id().unwrap().hash;
+    long_diff.path = app.state.selected_file().unwrap().path.clone();
+    app.state
+        .model
+        .set_file_diff(RepositoryId(0), long_diff.clone());
+    app.state
+        .set_focus_layer(FocusKind::Diff, FocusRole::Content);
     app.state.selection.diff_scroll = 0;
     app.dispatch(Action::PageDown);
     assert_eq!(app.state.selection.diff_scroll, 10);
@@ -1240,8 +1281,8 @@ fn every_file_detail_panel_supports_home_end_and_page_navigation() {
     assert_eq!(app.state.selection.diff_scroll, 0);
 
     app.state.current_changes_diff = Some(long_diff);
-    app.state.screen = Screen::Changes;
-    app.state.focus = FocusPanel::ChangesDiff;
+    app.state
+        .set_focus_layer(FocusKind::ChangesDiff, FocusRole::Content);
     app.state.selection.changes_diff_scroll = 0;
     app.dispatch(Action::PageDown);
     assert_eq!(app.state.selection.changes_diff_scroll, 10);
@@ -1274,15 +1315,15 @@ fn file_diff_navigation_keeps_file_list_focus_and_copies_full_commit_message() {
     let mut app = app_for(&[repo.path()]);
     wait_until_idle(&mut app);
     app.dispatch(Action::FocusNext);
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
 
     // Overview only has the subject, so message copying loads the full body
     // without navigating away from the current screen or focus.
     open_commit_copy_chord(&mut app);
     app.dispatch(Action::CopyCurrentCommitMessage);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.screen, Screen::BranchOverview);
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.view_projection().view, ViewId::History);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
     assert_eq!(
         app.take_clipboard_request().as_deref(),
         Some(expected_message)
@@ -1290,27 +1331,19 @@ fn file_diff_navigation_keeps_file_list_focus_and_copies_full_commit_message() {
 
     app.dispatch(Action::OpenCommitDetail);
     wait_until_idle(&mut app);
-    assert_eq!(
-        app.state
-            .current_commit_detail
-            .as_ref()
-            .unwrap()
-            .files
-            .len(),
-        2
-    );
+    assert_eq!(app.state.current_commit_detail().unwrap().files.len(), 2);
     app.dispatch(Action::OpenSelectedFileDiff);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.focus, FocusPanel::DiffView);
+    assert_eq!(app.state.view_projection().focused, PanelId::FileDiff);
 
     app.dispatch(Action::FocusNext);
-    assert_eq!(app.state.focus, FocusPanel::FileList);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
     app.dispatch(Action::MoveDown);
-    assert_eq!(app.state.focus, FocusPanel::FileList);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.focus, FocusPanel::FileList);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
     assert_eq!(
-        app.state.current_file_diff.as_ref().unwrap().path,
+        app.state.current_file_diff().unwrap().path,
         app.state.selected_file().unwrap().path
     );
 
@@ -1348,9 +1381,9 @@ fn file_diff_navigation_keeps_file_list_focus_and_copies_full_commit_message() {
 
     app.dispatch(Action::MoveUp);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.focus, FocusPanel::FileList);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
     assert_eq!(
-        app.state.current_file_diff.as_ref().unwrap().path,
+        app.state.current_file_diff().unwrap().path,
         app.state.selected_file().unwrap().path
     );
 }
@@ -1361,12 +1394,15 @@ fn application_surfaces_and_dismisses_non_repository_errors() {
     let mut app = app_for(&[directory.path()]);
     wait_until_idle(&mut app);
     assert!(matches!(app.state.mode, GlobalMode::Error));
-    assert_eq!(app.state.focus, FocusPanel::Popup);
+    assert!(!matches!(app.state.mode, GlobalMode::Normal));
     assert!(app.state.last_error.is_some());
 
     app.dispatch(Action::DismissError);
     assert_eq!(app.state.mode, GlobalMode::Normal);
-    assert_eq!(app.state.focus, FocusPanel::BranchList);
+    assert_eq!(
+        app.state.view_projection().focused,
+        PanelId::RepositoryBranches
+    );
     assert!(app.state.last_error.is_none());
 }
 
@@ -1390,10 +1426,7 @@ fn latest_branch_request_wins_over_stale_worker_responses() {
     app.dispatch(Action::LoadCommitsForSelectedBranch);
     wait_until_idle(&mut app);
 
-    assert_eq!(
-        app.state.branch_commits.viewing_branch.as_ref().unwrap().0,
-        "feature"
-    );
+    assert_eq!(app.state.viewing_branch_id().unwrap().name.0, "feature");
 }
 
 #[test]
@@ -1414,29 +1447,30 @@ fn branch_arrow_navigation_automatically_previews_the_selected_branch() {
     let feature_index = branch_tree_index(&app, 0, "feature");
     assert_eq!(main_index.abs_diff(feature_index), 1);
 
-    app.state.focus = FocusPanel::BranchList;
+    app.state
+        .set_focus_layer(FocusKind::Branch, FocusRole::Entity);
     app.dispatch(Action::SelectBranch(main_index));
     wait_until_idle(&mut app);
-    assert_eq!(
-        app.state.branch_commits.viewing_branch.as_ref().unwrap().0,
-        "main"
-    );
+    assert_eq!(app.state.viewing_branch_id().unwrap().name.0, "main");
 
     app.dispatch(if feature_index < main_index {
         Action::MoveUp
     } else {
         Action::MoveDown
     });
-    assert_eq!(app.state.focus, FocusPanel::BranchList);
+    assert_eq!(
+        app.state.view_projection().focused,
+        PanelId::RepositoryBranches
+    );
     wait_until_idle(&mut app);
 
     assert_eq!(app.state.selected_branch().unwrap().name.0, "feature");
-    assert_eq!(
-        app.state.branch_commits.viewing_branch.as_ref().unwrap().0,
-        "feature"
-    );
+    assert_eq!(app.state.viewing_branch_id().unwrap().name.0, "feature");
     assert_eq!(app.state.selected_commit().unwrap().subject, "feature tip");
-    assert_eq!(app.state.focus, FocusPanel::BranchList);
+    assert_eq!(
+        app.state.view_projection().focused,
+        PanelId::RepositoryBranches
+    );
 }
 
 #[test]
@@ -1449,48 +1483,35 @@ fn commit_arrow_navigation_automatically_previews_detail_without_stealing_focus(
 
     let mut app = app_for(&[repo.path()]);
     wait_until_idle(&mut app);
-    app.state.focus = FocusPanel::CommitList;
+    app.state
+        .set_focus_layer(FocusKind::Commit, FocusRole::Collection);
     app.dispatch(Action::OpenCommitDetail);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.screen, Screen::CommitDetail);
-    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+    assert_eq!(app.state.view_projection().view, ViewId::Commit);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commit);
     assert_eq!(
-        app.state
-            .current_commit_detail
-            .as_ref()
-            .unwrap()
-            .commit
-            .subject,
+        app.state.current_commit_detail().unwrap().commit.subject,
         "second commit"
     );
 
-    app.state.focus = FocusPanel::CommitList;
+    app.state
+        .set_focus_layer(FocusKind::Commit, FocusRole::Entity);
     app.dispatch(Action::MoveDown);
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
-    assert!(app.state.current_commit_detail.is_none());
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
+    assert!(app.state.current_commit_detail().is_none());
     assert!(app.state.latest_commit_detail_job.is_some());
     wait_until_idle(&mut app);
 
     let selected = app.state.selected_commit().unwrap().hash.clone();
     assert_eq!(
-        app.state
-            .current_commit_detail
-            .as_ref()
-            .unwrap()
-            .commit
-            .hash,
+        app.state.current_commit_detail().unwrap().commit.hash,
         selected
     );
     assert_eq!(
-        app.state
-            .current_commit_detail
-            .as_ref()
-            .unwrap()
-            .commit
-            .subject,
+        app.state.current_commit_detail().unwrap().commit.subject,
         "first commit"
     );
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
 
     // Queue two previews without polling. Only the final selection may update
     // the right pane when responses arrive.
@@ -1499,15 +1520,10 @@ fn commit_arrow_navigation_automatically_previews_detail_without_stealing_focus(
     wait_until_idle(&mut app);
     let selected = app.state.selected_commit().unwrap().hash.clone();
     assert_eq!(
-        app.state
-            .current_commit_detail
-            .as_ref()
-            .unwrap()
-            .commit
-            .hash,
+        app.state.current_commit_detail().unwrap().commit.hash,
         selected
     );
-    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert_eq!(app.state.view_projection().focused, PanelId::Commits);
 }
 
 #[test]
@@ -1565,7 +1581,7 @@ fn application_confirms_switch_cherry_pick_and_typed_reset_end_to_end() {
     wait_until_idle(&mut app);
     assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), feature_commit);
     assert_eq!(app.state.mode, GlobalMode::Normal);
-    assert_eq!(app.state.screen, Screen::BranchOverview);
+    assert_eq!(app.state.view_projection().view, ViewId::History);
 }
 
 #[test]
@@ -1583,18 +1599,10 @@ fn application_loads_and_navigates_multiple_repository_trees() {
     let mut app = app_for(&[first.path(), second.path()]);
     wait_until_idle(&mut app);
 
-    assert_eq!(app.state.repositories.len(), 2);
+    assert_eq!(app.state.repository_count(), 2);
+    assert!((0..2).all(|index| app.state.repository(index).is_some()));
     assert!(
-        app.state
-            .repositories
-            .iter()
-            .all(|repo| repo.repository.is_some())
-    );
-    assert!(
-        app.state
-            .repositories
-            .iter()
-            .all(|repo| repo.branches.len() == 2)
+        (0..2).all(|index| { app.state.model.branch_summaries(RepositoryId(index)).len() == 2 })
     );
     assert_eq!(
         app.state
@@ -1605,7 +1613,7 @@ fn application_loads_and_navigates_multiple_repository_trees() {
         2
     );
     assert_eq!(
-        app.state.branch_commits.items[0].subject,
+        app.state.branch_commit_summaries()[0].subject,
         "first repository commit"
     );
 
@@ -1613,14 +1621,14 @@ fn application_loads_and_navigates_multiple_repository_trees() {
     app.dispatch(Action::SelectBranch(second_repository));
     wait_until_idle(&mut app);
     assert_eq!(app.state.active_repository_index, Some(1));
-    assert_eq!(app.state.branch_commits_repository_index, Some(1));
+    assert_eq!(app.state.viewing_repository_index(), Some(1));
     assert_eq!(
-        app.state.branch_commits.items[0].subject,
+        app.state.branch_commit_summaries()[0].subject,
         "second repository commit"
     );
 
     app.dispatch(Action::LoadCommitsForSelectedBranch);
-    assert!(!app.state.repositories[1].expanded);
+    assert!(!app.state.repository_ui[1].expanded);
     assert_eq!(
         app.state
             .visible_tree_nodes()
@@ -1636,11 +1644,11 @@ fn application_loads_and_navigates_multiple_repository_trees() {
     wait_until_idle(&mut app);
     assert_eq!(app.state.active_repository_index, Some(0));
     assert_eq!(
-        app.state.branch_commits.viewing_branch.as_ref().unwrap().0,
+        app.state.viewing_branch_id().unwrap().name.0,
         "first-feature"
     );
     assert_eq!(
-        app.state.branch_commits.items[0].subject,
+        app.state.branch_commit_summaries()[0].subject,
         "first repository commit"
     );
 }
@@ -1700,8 +1708,9 @@ fn selected_repository_fetches_its_remote_and_refreshes_tree() {
     );
     assert_eq!(app.state.last_message.as_deref(), Some("Fetch completed"));
     assert!(
-        app.state.repositories[1]
-            .branches
+        app.state
+            .model
+            .branch_summaries(RepositoryId(1))
             .iter()
             .any(|branch| branch.name.0 == "origin/main" && branch.head.0 == new_head)
     );
@@ -1721,9 +1730,9 @@ fn remote_management_adds_a_shared_url_and_sets_branch_upstream() {
     wait_until_idle(&mut app);
     app.dispatch(Action::OpenRemotes);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.screen, Screen::Remotes);
-    assert_eq!(app.state.focus, FocusPanel::RemoteList);
-    assert!(app.state.remotes.is_empty());
+    assert_eq!(app.state.view_projection().view, ViewId::Remotes);
+    assert_eq!(app.state.view_projection().focused, PanelId::Remotes);
+    assert!(app.state.remotes().is_empty());
 
     app.dispatch(Action::OpenAddRemoteEditor);
     app.dispatch(Action::UpdateRemoteName("origin".into()));
@@ -1750,8 +1759,8 @@ fn remote_management_adds_a_shared_url_and_sets_branch_upstream() {
     app.dispatch(Action::Confirm);
     wait_until_idle(&mut app);
 
-    assert_eq!(app.state.remotes.len(), 1);
-    let origin = &app.state.remotes[0];
+    assert_eq!(app.state.remotes().len(), 1);
+    let origin = &app.state.remotes()[0];
     assert_eq!(origin.name, "origin");
     assert_eq!(origin.fetch_urls, vec![remote_url.clone()]);
     assert_eq!(origin.push_urls, origin.fetch_urls);
@@ -1772,7 +1781,7 @@ fn remote_management_adds_a_shared_url_and_sets_branch_upstream() {
     app.dispatch(Action::Confirm);
     wait_until_idle(&mut app);
 
-    let origin = &app.state.remotes[0];
+    let origin = &app.state.remotes()[0];
     assert!(origin.is_upstream);
     assert!(origin.is_push_target);
     assert_eq!(
@@ -2078,17 +2087,17 @@ fn application_browses_reflog_and_resets_to_a_selected_entry() {
     app.dispatch(Action::OpenReflog);
     app.dispatch(Action::Back);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.screen, Screen::BranchOverview);
+    assert_eq!(app.state.view_projection().view, ViewId::History);
 
     app.dispatch(Action::OpenReflog);
     wait_until_idle(&mut app);
-    assert_eq!(app.state.screen, Screen::Reflog);
-    assert_eq!(app.state.focus, FocusPanel::ReflogList);
+    assert_eq!(app.state.view_projection().view, ViewId::Reflog);
+    assert_eq!(app.state.view_projection().focused, PanelId::Reflog);
     assert_eq!(app.state.reflog_repository_index, Some(0));
 
     let first_index = app
         .state
-        .reflog_entries
+        .reflog_entries()
         .iter()
         .position(|entry| entry.hash.0 == first)
         .unwrap();
@@ -2118,7 +2127,7 @@ fn application_browses_reflog_and_resets_to_a_selected_entry() {
         git(repo.path(), &["diff", "--cached", "--name-only"]),
         "history.txt"
     );
-    assert_eq!(app.state.screen, Screen::BranchOverview);
+    assert_eq!(app.state.view_projection().view, ViewId::History);
 }
 
 #[test]

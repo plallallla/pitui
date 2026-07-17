@@ -3,18 +3,19 @@ use std::collections::HashSet;
 use crate::domain::GitPath;
 
 use super::{
-    Action, AppState, ChangeGroup, ChangesTreeNode, ConfirmDialog, FocusPanel, GlobalMode,
-    PendingJobKind, RemoteEditKind, Screen,
+    Action, AppState, ChangeGroup, ChangesTreeNode, ConfirmDialog, FocusKind, FocusRole,
+    GlobalMode, PendingJobKind, RemoteEditKind, ViewId,
 };
 
 /// A stable, normal-mode operation id. The enum is deliberately `repr(usize)`:
-/// each value indexes [`COMMAND_SPECS`], which is the Rust equivalent of a C++
+/// each value indexes [`OPERATION_SPECS`], which is the Rust equivalent of a C++
 /// function-pointer jump table.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(usize)]
-pub enum CommandId {
+pub enum OperationId {
     AppQuit,
     AppShortcutHelp,
+    AppOperationPalette,
     AppCommandPrompt,
     AppRefresh,
     ViewChangesToggle,
@@ -43,7 +44,6 @@ pub enum CommandId {
     CommitCherryPickSelected,
     CommitReset,
     CommitFileToggleExpanded,
-    CommitFileOpenDiff,
     FileOpenDiff,
     FileNext,
     FilePrevious,
@@ -86,166 +86,69 @@ impl FooterGroup {
     }
 }
 
-/// The exact normal-mode column to which a command table is mounted.
-///
-/// Screen alone is intentionally insufficient: `CommitList`, `FileList`, and
-/// `DiffView` on adjacent hierarchy levels expose different operations even
-/// when they display data from the same commit.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(u8)]
-pub enum ShortcutContext {
-    BranchTree,
-    OverviewCommits,
-    DetailCommits,
-    CommitFiles,
-    DiffFiles,
-    DiffView,
-    Reflog,
-    ChangesTree,
-    ChangesDiff,
-    Remotes,
-}
-
-impl ShortcutContext {
-    pub const ALL: &'static [Self] = &[
-        Self::BranchTree,
-        Self::OverviewCommits,
-        Self::DetailCommits,
-        Self::CommitFiles,
-        Self::DiffFiles,
-        Self::DiffView,
-        Self::Reflog,
-        Self::ChangesTree,
-        Self::ChangesDiff,
-        Self::Remotes,
-    ];
-    pub const ALL_MASK: u16 = (1 << Self::ALL.len()) - 1;
-
-    pub const fn mask(self) -> u16 {
-        1 << self as u8
-    }
-
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::BranchTree => "branch.tree",
-            Self::OverviewCommits => "overview.commits",
-            Self::DetailCommits => "detail.commits",
-            Self::CommitFiles => "commit.files",
-            Self::DiffFiles => "diff.files",
-            Self::DiffView => "diff.view",
-            Self::Reflog => "reflog.list",
-            Self::ChangesTree => "changes.tree",
-            Self::ChangesDiff => "changes.diff",
-            Self::Remotes => "remotes.list",
-        }
-    }
-
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::BranchTree => "Branches · repository / branch column",
-            Self::OverviewCommits => "Commits · overview right column",
-            Self::DetailCommits => "Commits · detail left column",
-            Self::CommitFiles => "Commit · changed-files column",
-            Self::DiffFiles => "Commit · file column beside diff",
-            Self::DiffView => "Diff · file content column",
-            Self::Reflog => "Reflog · entries column",
-            Self::ChangesTree => "Changes · staged / unstaged tree",
-            Self::ChangesDiff => "Changes · diff column",
-            Self::Remotes => "Remote Management · remote list",
-        }
-    }
-
-    pub fn from_view(screen: Screen, focus: FocusPanel) -> Option<Self> {
-        match (screen, focus) {
-            (Screen::BranchOverview, FocusPanel::BranchList) => Some(Self::BranchTree),
-            (Screen::BranchOverview, FocusPanel::CommitList) => Some(Self::OverviewCommits),
-            (Screen::CommitDetail, FocusPanel::CommitList) => Some(Self::DetailCommits),
-            (Screen::CommitDetail, FocusPanel::CommitFileList) => Some(Self::CommitFiles),
-            (Screen::FileDiffDetail, FocusPanel::FileList) => Some(Self::DiffFiles),
-            (Screen::FileDiffDetail, FocusPanel::DiffView) => Some(Self::DiffView),
-            (Screen::Reflog, FocusPanel::ReflogList) => Some(Self::Reflog),
-            (Screen::Changes, FocusPanel::ChangesTree) => Some(Self::ChangesTree),
-            (Screen::Changes, FocusPanel::ChangesDiff) => Some(Self::ChangesDiff),
-            (Screen::Remotes, FocusPanel::RemoteList) => Some(Self::Remotes),
-            _ => None,
-        }
-    }
-
-    pub fn from_app(app: &AppState) -> Option<Self> {
-        Self::from_view(app.screen, app.focus)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CommandMount {
+pub enum OperationMount {
     Global,
     Focus,
 }
 
-pub type CommandHandler = fn(&AppState) -> Option<Action>;
+pub type OperationHandler = fn(&AppState) -> Option<Action>;
 
 /// Metadata and callable behavior for one command. Input resolution, footer
 /// hints, configuration validation, and the help popup all consume this same
 /// table; none of them carries a second screen/focus key map.
 #[derive(Clone, Copy)]
-pub struct CommandSpec {
-    pub id: CommandId,
+pub struct OperationSpec {
+    pub id: OperationId,
     pub name: &'static str,
     pub default_bindings: &'static [&'static str],
     pub default_label: &'static str,
     pub default_visible: bool,
     pub footer_group: FooterGroup,
     pub chord_group: Option<&'static str>,
-    pub mount: CommandMount,
+    pub mount: OperationMount,
     pub contexts: u16,
-    pub invoke: CommandHandler,
+    pub invoke: OperationHandler,
 }
 
-macro_rules! command_spec {
+macro_rules! operation_spec {
     (
         $id:ident, $name:literal, $bindings:expr, $label:literal,
         $visible:expr, $group:ident, $chord:expr, $mount:ident,
         $contexts:expr, $invoke:expr
     ) => {
-        CommandSpec {
-            id: CommandId::$id,
+        OperationSpec {
+            id: OperationId::$id,
             name: $name,
             default_bindings: $bindings,
             default_label: $label,
             default_visible: $visible,
             footer_group: FooterGroup::$group,
             chord_group: $chord,
-            mount: CommandMount::$mount,
+            mount: OperationMount::$mount,
             contexts: $contexts,
             invoke: $invoke,
         }
     };
 }
 
-const BRANCH_TREE: u16 = ShortcutContext::BranchTree.mask();
-const BRANCH_COMMITS: u16 = ShortcutContext::OverviewCommits.mask();
-const DETAIL_COMMITS: u16 = ShortcutContext::DetailCommits.mask();
-const DETAIL_FILES: u16 = ShortcutContext::CommitFiles.mask();
-const FILE_LIST: u16 = ShortcutContext::DiffFiles.mask();
-const FILE_DIFF: u16 = ShortcutContext::DiffView.mask();
-const REFLOG: u16 = ShortcutContext::Reflog.mask();
-const CHANGES_TREE: u16 = ShortcutContext::ChangesTree.mask();
-const CHANGES_DIFF: u16 = ShortcutContext::ChangesDiff.mask();
-const REMOTES: u16 = ShortcutContext::Remotes.mask();
-const ALL_CONTEXTS: u16 = ShortcutContext::ALL_MASK;
-const TWO_PANEL_CONTEXTS: u16 = BRANCH_TREE
-    | BRANCH_COMMITS
-    | DETAIL_COMMITS
-    | DETAIL_FILES
-    | FILE_LIST
-    | FILE_DIFF
-    | CHANGES_TREE
-    | CHANGES_DIFF;
+const REPOSITORY: u16 = FocusKind::Repository.mask();
+const BRANCH: u16 = FocusKind::Branch.mask();
+const COMMIT: u16 = FocusKind::Commit.mask();
+const FILE: u16 = FocusKind::File.mask();
+const DIFF: u16 = FocusKind::Diff.mask();
+const REFLOG: u16 = FocusKind::Reflog.mask();
+const CHANGES: u16 = FocusKind::Changes.mask();
+const CHANGES_DIFF: u16 = FocusKind::ChangesDiff.mask();
+const REMOTE: u16 = FocusKind::Remote.mask();
+const HISTORY_TREE: u16 = REPOSITORY | BRANCH;
+const ALL_CONTEXTS: u16 = FocusKind::ALL_MASK;
+const TWO_PANEL_CONTEXTS: u16 = HISTORY_TREE | COMMIT | FILE | DIFF | CHANGES | CHANGES_DIFF;
 
 /// The single normal-mode command jump table. Its order must match
-/// [`CommandId`]; a unit test enforces that invariant.
-pub static COMMAND_SPECS: &[CommandSpec] = &[
-    command_spec!(
+/// [`OperationId`]; a unit test enforces that invariant.
+pub static OPERATION_SPECS: &[OperationSpec] = &[
+    operation_spec!(
         AppQuit,
         "app.quit",
         &["q", "Ctrl+C"],
@@ -257,7 +160,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         ALL_CONTEXTS,
         |_| Some(Action::Quit)
     ),
-    command_spec!(
+    operation_spec!(
         AppShortcutHelp,
         "app.shortcuts",
         &["h"],
@@ -269,7 +172,19 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         ALL_CONTEXTS,
         |_| Some(Action::OpenShortcutHelp)
     ),
-    command_spec!(
+    operation_spec!(
+        AppOperationPalette,
+        "app.operation_palette",
+        &["Ctrl+P"],
+        "operations",
+        true,
+        Global,
+        None,
+        Global,
+        ALL_CONTEXTS,
+        |_| Some(Action::OpenOperationPalette)
+    ),
+    operation_spec!(
         AppCommandPrompt,
         "app.command_prompt",
         &["Ctrl+`"],
@@ -281,7 +196,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         ALL_CONTEXTS,
         |_| Some(Action::OpenCommandPrompt)
     ),
-    command_spec!(
+    operation_spec!(
         AppRefresh,
         "app.refresh",
         &["Ctrl+R"],
@@ -291,9 +206,9 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         None,
         Global,
         ALL_CONTEXTS,
-        |app| (!app.repositories.is_empty()).then_some(Action::RefreshRepository)
+        |app| (app.repository_count() > 0).then_some(Action::RefreshRepository)
     ),
-    command_spec!(
+    operation_spec!(
         ViewChangesToggle,
         "view.changes.toggle",
         &["Ctrl+G"],
@@ -303,10 +218,11 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         None,
         Global,
         ALL_CONTEXTS,
-        |app| (app.screen == Screen::Changes || app.active_repository_index.is_some())
-            .then_some(Action::ToggleChanges)
+        |app| (app.view_projection().view == ViewId::Changes
+            || app.active_repository_index.is_some())
+        .then_some(Action::ToggleChanges)
     ),
-    command_spec!(
+    operation_spec!(
         FocusNext,
         "focus.next",
         &["Tab"],
@@ -316,9 +232,9 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         None,
         Focus,
         TWO_PANEL_CONTEXTS,
-        |app| has_multiple_panels(app.screen).then_some(Action::FocusNext)
+        |app| has_multiple_panels(app).then_some(Action::FocusNext)
     ),
-    command_spec!(
+    operation_spec!(
         FocusPrevious,
         "focus.previous",
         &["BackTab"],
@@ -328,9 +244,9 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         None,
         Focus,
         TWO_PANEL_CONTEXTS,
-        |app| has_multiple_panels(app.screen).then_some(Action::FocusPrev)
+        |app| has_multiple_panels(app).then_some(Action::FocusPrev)
     ),
-    command_spec!(
+    operation_spec!(
         NavigationBack,
         "navigation.back",
         &["Esc"],
@@ -339,10 +255,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Safety,
         None,
         Focus,
-        ALL_CONTEXTS & !BRANCH_TREE & !BRANCH_COMMITS,
-        |app| (app.screen != Screen::BranchOverview).then_some(Action::Back)
+        ALL_CONTEXTS,
+        |app| (app.view_projection().view != ViewId::History).then_some(Action::Back)
     ),
-    command_spec!(
+    operation_spec!(
         NavigationUp,
         "navigation.up",
         &["w", "Up", "k"],
@@ -354,7 +270,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         ALL_CONTEXTS,
         |app| can_move(app, -1).then_some(Action::MoveUp)
     ),
-    command_spec!(
+    operation_spec!(
         NavigationDown,
         "navigation.down",
         &["s", "Down", "j"],
@@ -366,7 +282,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         ALL_CONTEXTS,
         |app| can_move(app, 1).then_some(Action::MoveDown)
     ),
-    command_spec!(
+    operation_spec!(
         NavigationLeft,
         "navigation.left",
         &["a", "Left"],
@@ -378,7 +294,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         TWO_PANEL_CONTEXTS,
         |app| can_move_horizontal(app, false).then_some(Action::MoveLeft)
     ),
-    command_spec!(
+    operation_spec!(
         NavigationRight,
         "navigation.right",
         &["d", "Right", "l"],
@@ -390,7 +306,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         TWO_PANEL_CONTEXTS,
         |app| can_move_horizontal(app, true).then_some(Action::MoveRight)
     ),
-    command_spec!(
+    operation_spec!(
         NavigationPageUp,
         "navigation.page_up",
         &["PageUp"],
@@ -402,7 +318,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         ALL_CONTEXTS,
         |app| can_move(app, -1).then_some(Action::PageUp)
     ),
-    command_spec!(
+    operation_spec!(
         NavigationPageDown,
         "navigation.page_down",
         &["PageDown"],
@@ -414,7 +330,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         ALL_CONTEXTS,
         |app| can_move(app, 1).then_some(Action::PageDown)
     ),
-    command_spec!(
+    operation_spec!(
         NavigationHome,
         "navigation.home",
         &["Home"],
@@ -426,7 +342,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         ALL_CONTEXTS,
         |app| can_move(app, -1).then_some(Action::Home)
     ),
-    command_spec!(
+    operation_spec!(
         NavigationEnd,
         "navigation.end",
         &["End"],
@@ -438,7 +354,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         ALL_CONTEXTS,
         |app| can_move(app, 1).then_some(Action::End)
     ),
-    command_spec!(
+    operation_spec!(
         RepositoryActivate,
         "repository.activate",
         &["Enter"],
@@ -447,10 +363,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        BRANCH_TREE,
+        HISTORY_TREE,
         |app| (app.selected_tree_node().is_some()).then_some(Action::LoadCommitsForSelectedBranch)
     ),
-    command_spec!(
+    operation_spec!(
         RepositoryFetch,
         "repository.fetch",
         &["f"],
@@ -459,12 +375,12 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        BRANCH_TREE,
+        REPOSITORY,
         |app| (selected_repository_ready(app).is_some()
             && app.selected_repository_node_index().is_some())
         .then_some(Action::OpenFetchRepositoryDialog)
     ),
-    command_spec!(
+    operation_spec!(
         RepositoryPullRebase,
         "repository.pull_rebase",
         &["p"],
@@ -473,12 +389,12 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        BRANCH_TREE,
+        REPOSITORY,
         |app| (selected_repository_ready(app).is_some()
             && app.selected_repository_node_index().is_some())
         .then_some(Action::OpenPullRebaseDialog)
     ),
-    command_spec!(
+    operation_spec!(
         RepositoryPush,
         "repository.push",
         &["P"],
@@ -487,12 +403,12 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        BRANCH_TREE,
+        REPOSITORY,
         |app| (selected_repository_ready(app).is_some()
             && app.selected_repository_node_index().is_some())
         .then_some(Action::OpenPushDialog)
     ),
-    command_spec!(
+    operation_spec!(
         RepositoryRemotesOpen,
         "repository.remotes.open",
         &["o"],
@@ -501,10 +417,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        BRANCH_TREE,
+        HISTORY_TREE,
         |app| (app.selected_tree_repository_index().is_some()).then_some(Action::OpenRemotes)
     ),
-    command_spec!(
+    operation_spec!(
         RepositoryReflogOpen,
         "repository.reflog.open",
         &["g"],
@@ -513,12 +429,12 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        BRANCH_TREE,
+        REPOSITORY,
         |app| (selected_repository_ready(app).is_some()
             && app.selected_repository_node_index().is_some())
         .then_some(Action::OpenReflog)
     ),
-    command_spec!(
+    operation_spec!(
         BranchSwitch,
         "branch.switch",
         &["S"],
@@ -527,13 +443,13 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        BRANCH_TREE,
+        BRANCH,
         |app| app
             .selected_branch()
             .is_some()
             .then_some(Action::OpenSwitchBranchDialog)
     ),
-    command_spec!(
+    operation_spec!(
         BranchRebase,
         "branch.rebase",
         &["b"],
@@ -542,13 +458,13 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        BRANCH_TREE,
+        BRANCH,
         |app| app
             .selected_branch()
             .is_some()
             .then_some(Action::OpenRebaseDialog)
     ),
-    command_spec!(
+    operation_spec!(
         ListFilter,
         "list.filter",
         &["/"],
@@ -557,10 +473,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Contextual,
         None,
         Focus,
-        BRANCH_TREE | BRANCH_COMMITS | DETAIL_COMMITS,
+        HISTORY_TREE | COMMIT,
         |app| can_filter(app).then_some(Action::StartFilter)
     ),
-    command_spec!(
+    operation_spec!(
         CommitOpenDetail,
         "commit.open_detail",
         &["Enter"],
@@ -569,10 +485,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        BRANCH_COMMITS | DETAIL_COMMITS,
+        COMMIT,
         |app| (app.selected_commit().is_some()).then_some(Action::OpenCommitDetail)
     ),
-    command_spec!(
+    operation_spec!(
         CommitToggleSelection,
         "commit.toggle_selection",
         &["Space"],
@@ -581,10 +497,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        BRANCH_COMMITS | DETAIL_COMMITS,
+        COMMIT,
         |app| (app.selected_commit().is_some()).then_some(Action::ToggleCommitSelection)
     ),
-    command_spec!(
+    operation_spec!(
         CommitCherryPickSelected,
         "commit.cherry_pick.selected",
         &["y"],
@@ -593,13 +509,13 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        BRANCH_COMMITS | DETAIL_COMMITS,
+        COMMIT,
         |app| (!app.commit_selection.is_empty()
             && app.commit_selection_repository_index.is_some()
-            && app.commit_selection_repository_index == app.branch_commits_repository_index)
-            .then_some(Action::OpenCherryPickSelectedDialog)
+            && app.commit_selection_repository_index == app.viewing_repository_index())
+        .then_some(Action::OpenCherryPickSelectedDialog)
     ),
-    command_spec!(
+    operation_spec!(
         CommitReset,
         "commit.reset",
         &["R"],
@@ -608,16 +524,16 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        BRANCH_COMMITS | DETAIL_COMMITS | REFLOG,
+        COMMIT | REFLOG,
         |app| {
-            match app.screen {
-                Screen::Reflog => app.selected_reflog().is_some(),
+            match app.focus_context().kind {
+                FocusKind::Reflog => app.selected_reflog().is_some(),
                 _ => app.selected_commit().is_some(),
             }
             .then_some(Action::OpenResetDialog)
         }
     ),
-    command_spec!(
+    operation_spec!(
         CommitFileToggleExpanded,
         "commit.file.toggle_expanded",
         &["Space"],
@@ -626,22 +542,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        DETAIL_FILES,
+        FILE,
         |app| (app.selected_file().is_some()).then_some(Action::ToggleFileExpanded)
     ),
-    command_spec!(
-        CommitFileOpenDiff,
-        "commit.file.open_diff",
-        &["Enter", "v"],
-        "file diff",
-        true,
-        Primary,
-        None,
-        Focus,
-        DETAIL_FILES,
-        |app| (app.selected_file().is_some()).then_some(Action::OpenSelectedFileDiff)
-    ),
-    command_spec!(
+    operation_spec!(
         FileOpenDiff,
         "file.open_diff",
         &["Enter"],
@@ -650,10 +554,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        FILE_LIST,
+        FILE,
         |app| (app.selected_file().is_some()).then_some(Action::OpenSelectedFileDiff)
     ),
-    command_spec!(
+    operation_spec!(
         FileNext,
         "file.next",
         &["n"],
@@ -662,10 +566,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Navigation,
         None,
         Focus,
-        FILE_LIST | FILE_DIFF,
+        FILE | DIFF,
         |app| can_move_file(app, 1).then_some(Action::NextFile)
     ),
-    command_spec!(
+    operation_spec!(
         FilePrevious,
         "file.previous",
         &["p"],
@@ -674,10 +578,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Navigation,
         None,
         Focus,
-        FILE_LIST | FILE_DIFF,
+        FILE | DIFF,
         |app| can_move_file(app, -1).then_some(Action::PrevFile)
     ),
-    command_spec!(
+    operation_spec!(
         DiffModeToggle,
         "diff.mode.toggle",
         &["v"],
@@ -686,10 +590,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Contextual,
         None,
         Focus,
-        FILE_LIST | FILE_DIFF | CHANGES_TREE | CHANGES_DIFF,
+        FILE | DIFF | CHANGES | CHANGES_DIFF,
         |app| active_diff(app).then_some(Action::ToggleDiffMode)
     ),
-    command_spec!(
+    operation_spec!(
         DiffWrapToggle,
         "diff.wrap.toggle",
         &["W"],
@@ -698,10 +602,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Contextual,
         None,
         Focus,
-        FILE_LIST | FILE_DIFF | CHANGES_TREE | CHANGES_DIFF,
+        FILE | DIFF | CHANGES | CHANGES_DIFF,
         |app| active_diff(app).then_some(Action::ToggleWrap)
     ),
-    command_spec!(
+    operation_spec!(
         ChangesActivate,
         "changes.activate",
         &["Enter"],
@@ -710,10 +614,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        CHANGES_TREE,
+        CHANGES,
         |app| (app.selected_changes_node().is_some()).then_some(Action::ActivateSelectedChange)
     ),
-    command_spec!(
+    operation_spec!(
         ChangesToggleSelection,
         "changes.toggle_selection",
         &["Space"],
@@ -722,10 +626,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        CHANGES_TREE | CHANGES_DIFF,
+        CHANGES | CHANGES_DIFF,
         |app| change_node_has_targets(app).then_some(Action::ToggleChangeSelection)
     ),
-    command_spec!(
+    operation_spec!(
         ChangesStage,
         "changes.stage",
         &["S"],
@@ -734,11 +638,11 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        CHANGES_TREE | CHANGES_DIFF,
+        CHANGES | CHANGES_DIFF,
         |app| (!change_operation_paths(app, ChangeGroup::Unstaged).is_empty())
             .then_some(Action::StageSelectedChanges)
     ),
-    command_spec!(
+    operation_spec!(
         ChangesUnstage,
         "changes.unstage",
         &["u"],
@@ -747,11 +651,11 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        CHANGES_TREE | CHANGES_DIFF,
+        CHANGES | CHANGES_DIFF,
         |app| (!change_operation_paths(app, ChangeGroup::Staged).is_empty())
             .then_some(Action::UnstageSelectedChanges)
     ),
-    command_spec!(
+    operation_spec!(
         ChangesCommit,
         "changes.commit",
         &["c"],
@@ -760,10 +664,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        CHANGES_TREE | CHANGES_DIFF,
+        CHANGES | CHANGES_DIFF,
         |app| (app.change_group_count(ChangeGroup::Staged) > 0).then_some(Action::OpenCommitDialog)
     ),
-    command_spec!(
+    operation_spec!(
         RemoteAdd,
         "remote.add",
         &["A"],
@@ -772,13 +676,13 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        REMOTES,
+        REMOTE,
         |app| app
             .remotes_repository_index
             .is_some()
             .then_some(Action::OpenAddRemoteEditor)
     ),
-    command_spec!(
+    operation_spec!(
         RemoteSetSharedUrl,
         "remote.set_shared_url",
         &["e"],
@@ -787,13 +691,13 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        REMOTES,
+        REMOTE,
         |app| app
             .selected_remote()
             .is_some()
             .then_some(Action::OpenSetRemoteUrlEditor)
     ),
-    command_spec!(
+    operation_spec!(
         RemoteSetUpstream,
         "remote.set_upstream",
         &["u"],
@@ -802,13 +706,13 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         None,
         Focus,
-        REMOTES,
+        REMOTE,
         |app| app
             .selected_remote()
             .is_some()
             .then_some(Action::OpenSetUpstreamRemoteDialog)
     ),
-    command_spec!(
+    operation_spec!(
         CommitCopyHash,
         "commit.copy.hash",
         &["Ctrl+C h"],
@@ -817,10 +721,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         Some("commit.copy"),
         Focus,
-        BRANCH_COMMITS | DETAIL_COMMITS,
+        COMMIT,
         |app| (app.selected_commit().is_some()).then_some(Action::CopySelectedCommitHashes)
     ),
-    command_spec!(
+    operation_spec!(
         CommitCopyInfo,
         "commit.copy.info",
         &["Ctrl+C i"],
@@ -829,10 +733,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         Some("commit.copy"),
         Focus,
-        BRANCH_COMMITS | DETAIL_COMMITS,
+        COMMIT,
         |app| (app.selected_commit().is_some()).then_some(Action::CopyCurrentCommitInfo)
     ),
-    command_spec!(
+    operation_spec!(
         CommitCopyMessage,
         "commit.copy.message",
         &["Ctrl+C m"],
@@ -841,10 +745,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         Some("commit.copy"),
         Focus,
-        BRANCH_COMMITS | DETAIL_COMMITS,
+        COMMIT,
         |app| (app.selected_commit().is_some()).then_some(Action::CopyCurrentCommitMessage)
     ),
-    command_spec!(
+    operation_spec!(
         FileCopyName,
         "file.copy.name",
         &["Ctrl+C n"],
@@ -853,10 +757,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         Some("file.copy"),
         Focus,
-        DETAIL_FILES | FILE_LIST,
+        FILE,
         |app| (app.selected_file().is_some()).then_some(Action::CopySelectedFileName)
     ),
-    command_spec!(
+    operation_spec!(
         FileCopyAbsolutePath,
         "file.copy.absolute_path",
         &["Ctrl+C a"],
@@ -865,10 +769,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         Some("file.copy"),
         Focus,
-        DETAIL_FILES | FILE_LIST,
+        FILE,
         |app| (app.selected_file().is_some()).then_some(Action::CopySelectedFileAbsolutePath)
     ),
-    command_spec!(
+    operation_spec!(
         FileCopyRelativePath,
         "file.copy.relative_path",
         &["Ctrl+C r"],
@@ -877,15 +781,16 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         Primary,
         Some("file.copy"),
         Focus,
-        DETAIL_FILES | FILE_LIST,
+        FILE,
         |app| (app.selected_file().is_some()).then_some(Action::CopySelectedFileRelativePath)
     ),
 ];
 
-impl CommandId {
+impl OperationId {
     pub const ALL: &'static [Self] = &[
         Self::AppQuit,
         Self::AppShortcutHelp,
+        Self::AppOperationPalette,
         Self::AppCommandPrompt,
         Self::AppRefresh,
         Self::ViewChangesToggle,
@@ -914,7 +819,6 @@ impl CommandId {
         Self::CommitCherryPickSelected,
         Self::CommitReset,
         Self::CommitFileToggleExpanded,
-        Self::CommitFileOpenDiff,
         Self::FileOpenDiff,
         Self::FileNext,
         Self::FilePrevious,
@@ -937,7 +841,7 @@ impl CommandId {
     ];
 
     pub fn parse(value: &str) -> Option<Self> {
-        COMMAND_SPECS
+        OPERATION_SPECS
             .iter()
             .find(|spec| spec.name == value)
             .map(|spec| spec.id)
@@ -977,11 +881,11 @@ impl CommandId {
         self.spec().chord_group
     }
 
-    pub fn mount(self) -> CommandMount {
+    pub fn mount(self) -> OperationMount {
         self.spec().mount
     }
 
-    /// Exact focus tables used while validating configured key collisions.
+    /// Semantic focus kinds used while validating configured key collisions.
     /// Runtime actionability applies the finer selection/pending predicates.
     pub fn context_mask(self) -> u16 {
         self.spec().contexts
@@ -995,17 +899,17 @@ impl CommandId {
             return None;
         }
         let spec = self.spec();
-        if spec.mount == CommandMount::Focus {
-            let context = ShortcutContext::from_app(app)?;
-            if spec.contexts & context.mask() == 0 {
+        if spec.mount == OperationMount::Focus {
+            let focus = app.semantic_focus_kind()?;
+            if spec.contexts & focus.mask() == 0 {
                 return None;
             }
         }
         (spec.invoke)(app)
     }
 
-    pub fn spec(self) -> &'static CommandSpec {
-        &COMMAND_SPECS[self as usize]
+    pub fn spec(self) -> &'static OperationSpec {
+        &OPERATION_SPECS[self as usize]
     }
 }
 
@@ -1026,6 +930,7 @@ pub enum ModalShortcutSetId {
     Error,
     CommandPrompt,
     ShortcutHelp,
+    OperationPalette,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1055,6 +960,7 @@ impl ModalShortcutSetId {
         Self::Error,
         Self::CommandPrompt,
         Self::ShortcutHelp,
+        Self::OperationPalette,
     ];
 
     pub fn spec(self) -> &'static ModalShortcutSet {
@@ -1182,31 +1088,44 @@ pub static MODAL_SHORTCUT_SETS: &[ModalShortcutSet] = &[
             modal_hint!("h / Enter / Esc / q", "close reference", "Cancel"),
         ],
     },
+    ModalShortcutSet {
+        id: ModalShortcutSetId::OperationPalette,
+        title: "Mode · operation palette",
+        footer: "Text filter | ↑/↓ select | PageUp/PageDown page | Enter run | Esc cancel",
+        hints: &[
+            modal_hint!("text", "filter operations", "UpdateOperationPalette"),
+            modal_hint!("Up / Down", "select operation", "MoveUp/MoveDown"),
+            modal_hint!("PageUp / PageDown", "select page", "PageUp/PageDown"),
+            modal_hint!("Home / End", "select first/last", "Home/End"),
+            modal_hint!("Enter", "run selected operation", "SubmitOperationPalette"),
+            modal_hint!("Esc", "close palette", "Cancel"),
+        ],
+    },
 ];
 
-pub type PromptCommandHandler = fn() -> Action;
+pub type PromptOperationHandler = fn() -> Action;
 
 /// A command accepted by the quick command prompt. Keeping accepted names and
 /// their callable actions in one table makes the prompt expandable without a
 /// second input `match` drifting away from the help reference.
 #[derive(Clone, Copy)]
-pub struct PromptCommandSpec {
+pub struct PromptOperationSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub operation: &'static str,
-    pub invoke: PromptCommandHandler,
+    pub invoke: PromptOperationHandler,
 }
 
-pub static PROMPT_COMMAND_SPECS: &[PromptCommandSpec] = &[PromptCommandSpec {
+pub static PROMPT_OPERATION_SPECS: &[PromptOperationSpec] = &[PromptOperationSpec {
     name: "help",
     description: "open the shortcut guide",
     operation: "OpenShortcutHelp",
     invoke: || Action::OpenShortcutHelp,
 }];
 
-pub fn prompt_command(input: &str) -> Option<&'static PromptCommandSpec> {
+pub fn prompt_command(input: &str) -> Option<&'static PromptOperationSpec> {
     let name = input.trim();
-    PROMPT_COMMAND_SPECS
+    PROMPT_OPERATION_SPECS
         .iter()
         .find(|command| command.name.eq_ignore_ascii_case(name))
 }
@@ -1228,6 +1147,7 @@ pub fn modal_shortcut_set_id(mode: &GlobalMode) -> Option<ModalShortcutSetId> {
         GlobalMode::Error => Some(ModalShortcutSetId::Error),
         GlobalMode::CommandPrompt { .. } => Some(ModalShortcutSetId::CommandPrompt),
         GlobalMode::ShortcutHelp { .. } => Some(ModalShortcutSetId::ShortcutHelp),
+        GlobalMode::OperationPalette { .. } => Some(ModalShortcutSetId::OperationPalette),
         GlobalMode::Normal | GlobalMode::Chord { .. } => None,
     }
 }
@@ -1236,27 +1156,24 @@ pub fn modal_shortcut_set(mode: &GlobalMode) -> Option<&'static ModalShortcutSet
     modal_shortcut_set_id(mode).map(ModalShortcutSetId::spec)
 }
 
-fn has_multiple_panels(screen: Screen) -> bool {
+fn has_multiple_panels(app: &AppState) -> bool {
     matches!(
-        screen,
-        Screen::BranchOverview | Screen::CommitDetail | Screen::FileDiffDetail | Screen::Changes
+        app.view_projection().view,
+        ViewId::History | ViewId::Commit | ViewId::FileDiff | ViewId::Changes
     )
 }
 
 fn can_filter(app: &AppState) -> bool {
     matches!(
-        (app.screen, app.focus),
-        (
-            Screen::BranchOverview,
-            FocusPanel::BranchList | FocusPanel::CommitList
-        ) | (Screen::CommitDetail, FocusPanel::CommitList)
+        app.focus_context().kind,
+        FocusKind::Repository | FocusKind::Branch | FocusKind::Commit
     )
 }
 
 fn active_diff(app: &AppState) -> bool {
-    match app.screen {
-        Screen::FileDiffDetail => app.current_file_diff.is_some(),
-        Screen::Changes => app.current_changes_diff.is_some(),
+    match app.view_projection().view {
+        ViewId::FileDiff => app.current_file_diff().is_some(),
+        ViewId::Changes => app.current_changes_diff.is_some(),
         _ => false,
     }
 }
@@ -1279,48 +1196,44 @@ fn has_pending_repository_command(app: &AppState, repository_index: usize) -> bo
 }
 
 fn can_move_file(app: &AppState, delta: isize) -> bool {
-    let length = app
-        .current_commit_detail
-        .as_ref()
-        .map_or(0, |detail| detail.files.len());
+    let length = app.current_file_count();
     can_move_index(app.selection.selected_file_index, length, delta)
 }
 
 fn can_move(app: &AppState, delta: isize) -> bool {
-    match app.focus {
-        FocusPanel::BranchList => can_move_index(
+    match app.focus_context().kind {
+        FocusKind::Repository | FocusKind::Branch => can_move_index(
             app.selection.selected_branch_index,
             app.visible_tree_nodes().len(),
             delta,
         ),
-        FocusPanel::CommitList => can_move_index(
+        FocusKind::Commit => can_move_index(
             app.selection.selected_commit_index,
             app.visible_commit_indices().len(),
             delta,
         ),
-        FocusPanel::CommitFileList | FocusPanel::FileList => can_move_file(app, delta),
-        FocusPanel::DiffView => can_scroll(app.selection.diff_scroll, app.diff_line_count(), delta),
-        FocusPanel::ReflogList => can_move_index(
+        FocusKind::File => can_move_file(app, delta),
+        FocusKind::Diff => can_scroll(app.selection.diff_scroll, app.diff_line_count(), delta),
+        FocusKind::Reflog => can_move_index(
             app.selection.selected_reflog_index,
-            app.reflog_entries.len(),
+            app.reflog_entries().len(),
             delta,
         ),
-        FocusPanel::RemoteList => can_move_index(
+        FocusKind::Remote => can_move_index(
             app.selection.selected_remote_index,
-            app.remotes.len(),
+            app.remotes().len(),
             delta,
         ),
-        FocusPanel::ChangesTree => can_move_index(
+        FocusKind::Changes => can_move_index(
             app.selection.selected_changes_index,
             app.visible_changes_nodes().len(),
             delta,
         ),
-        FocusPanel::ChangesDiff => can_scroll(
+        FocusKind::ChangesDiff => can_scroll(
             app.selection.changes_diff_scroll,
             app.changes_diff_line_count(),
             delta,
         ),
-        FocusPanel::Popup => false,
     }
 }
 
@@ -1344,7 +1257,8 @@ fn can_scroll(offset: u16, line_count: usize, delta: isize) -> bool {
 }
 
 fn can_move_horizontal(app: &AppState, right: bool) -> bool {
-    if app.screen == Screen::Changes && app.focus == FocusPanel::ChangesTree {
+    let focus = app.focus_context();
+    if focus.kind == FocusKind::Changes {
         return match app.selected_changes_node() {
             Some(ChangesTreeNode::Root) => app.expansion.changes_root_expanded != right,
             Some(ChangesTreeNode::Group(ChangeGroup::Staged)) => {
@@ -1357,34 +1271,32 @@ fn can_move_horizontal(app: &AppState, right: bool) -> bool {
         };
     }
 
-    match (app.screen, app.focus, right) {
+    match (focus.kind, focus.role, right) {
         // Branches | Commits
-        (Screen::BranchOverview, FocusPanel::BranchList, true) => true,
-        (Screen::BranchOverview, FocusPanel::CommitList, false) => true,
-        (Screen::BranchOverview, FocusPanel::CommitList, true) => app.selected_commit().is_some(),
+        (FocusKind::Repository | FocusKind::Branch, _, true) => true,
+        (FocusKind::Commit, FocusRole::Collection, false) => true,
+        (FocusKind::Commit, FocusRole::Collection, true) => app.selected_commit().is_some(),
 
         // Commits | Commit (metadata + files). Crossing either outer edge
         // slides the two-column hierarchy instead of wrapping focus.
-        (Screen::CommitDetail, FocusPanel::CommitList, false) => true,
-        (Screen::CommitDetail, FocusPanel::CommitList, true) => true,
-        (Screen::CommitDetail, FocusPanel::CommitFileList, false) => true,
-        (Screen::CommitDetail, FocusPanel::CommitFileList, true) => app.selected_file().is_some(),
+        (FocusKind::Commit, FocusRole::Entity, _) => true,
+        (FocusKind::File, FocusRole::Collection, false) => true,
+        (FocusKind::File, FocusRole::Collection, true) => app.selected_file().is_some(),
 
         // Commit (metadata + files) | Diff
-        (Screen::FileDiffDetail, FocusPanel::FileList, false) => true,
-        (Screen::FileDiffDetail, FocusPanel::FileList, true) => true,
-        (Screen::FileDiffDetail, FocusPanel::DiffView, false) => true,
+        (FocusKind::File, FocusRole::Entity, _) => true,
+        (FocusKind::Diff, _, false) => true,
 
         // Changes keeps its existing tree expand/collapse semantics; only a
         // focused diff can move back to the tree with Left.
-        (Screen::Changes, FocusPanel::ChangesDiff, false) => true,
+        (FocusKind::ChangesDiff, _, false) => true,
         _ => false,
     }
 }
 
 fn change_node_has_targets(app: &AppState) -> bool {
     match app.selected_changes_node() {
-        Some(ChangesTreeNode::Root) => !app.changes.is_empty(),
+        Some(ChangesTreeNode::Root) => !app.working_tree_changes().is_empty(),
         Some(ChangesTreeNode::Group(group)) => app.change_group_count(group) > 0,
         Some(ChangesTreeNode::File { .. }) => true,
         None => false,
@@ -1392,7 +1304,7 @@ fn change_node_has_targets(app: &AppState) -> bool {
 }
 
 fn change_operation_paths(app: &AppState, group: ChangeGroup) -> Vec<GitPath> {
-    if app.screen != Screen::Changes {
+    if app.view_projection().view != ViewId::Changes {
         return Vec::new();
     }
     let wanted = if app.change_selection.is_empty() {
@@ -1410,7 +1322,7 @@ fn change_operation_paths(app: &AppState, group: ChangeGroup) -> Vec<GitPath> {
     let wanted = wanted.into_iter().collect::<HashSet<_>>();
     let mut seen = HashSet::new();
     let mut paths = Vec::new();
-    for change in &app.changes {
+    for change in app.working_tree_changes() {
         if !wanted.contains(&AppState::change_selection_key(group, change)) {
             continue;
         }
@@ -1428,19 +1340,18 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        Action, COMMAND_SPECS, CommandId, MODAL_SHORTCUT_SETS, ModalShortcutSetId,
-        PROMPT_COMMAND_SPECS, prompt_command,
+        Action, MODAL_SHORTCUT_SETS, ModalShortcutSetId, OPERATION_SPECS, OperationId,
+        PROMPT_OPERATION_SPECS, prompt_command,
     };
 
     #[test]
     fn registry_lists_every_command_once_and_ids_round_trip() {
-        assert_eq!(CommandId::ALL.len(), 50);
-        assert_eq!(COMMAND_SPECS.len(), CommandId::ALL.len());
+        assert_eq!(OPERATION_SPECS.len(), OperationId::ALL.len());
         let mut ids = HashSet::new();
-        for (index, command) in CommandId::ALL.iter().copied().enumerate() {
-            assert_eq!(COMMAND_SPECS[index].id, command, "jump-table order drift");
+        for (index, command) in OperationId::ALL.iter().copied().enumerate() {
+            assert_eq!(OPERATION_SPECS[index].id, command, "jump-table order drift");
             assert!(ids.insert(command.as_str()), "duplicate command id");
-            assert_eq!(CommandId::parse(command.as_str()), Some(command));
+            assert_eq!(OperationId::parse(command.as_str()), Some(command));
             assert!(!command.default_bindings().is_empty());
         }
     }
@@ -1456,7 +1367,7 @@ mod tests {
 
     #[test]
     fn prompt_commands_are_callable_and_resolved_case_insensitively() {
-        assert_eq!(PROMPT_COMMAND_SPECS.len(), 1);
+        assert_eq!(PROMPT_OPERATION_SPECS.len(), 1);
         let help = prompt_command("  HELP ").expect("help command");
         assert_eq!(help.name, "help");
         assert_eq!((help.invoke)(), Action::OpenShortcutHelp);
@@ -1465,14 +1376,17 @@ mod tests {
 
     #[test]
     fn wasd_navigation_keeps_conflicting_operations_on_uppercase_keys() {
-        assert_eq!(CommandId::NavigationUp.default_bindings()[0], "w");
-        assert_eq!(CommandId::NavigationLeft.default_bindings()[0], "a");
-        assert_eq!(CommandId::NavigationDown.default_bindings()[0], "s");
-        assert_eq!(CommandId::NavigationRight.default_bindings()[0], "d");
-        assert_eq!(CommandId::BranchSwitch.default_bindings(), &["S"]);
-        assert_eq!(CommandId::ChangesStage.default_bindings(), &["S"]);
-        assert_eq!(CommandId::DiffWrapToggle.default_bindings(), &["W"]);
-        assert_eq!(CommandId::RemoteAdd.default_bindings(), &["A"]);
-        assert_eq!(CommandId::AppCommandPrompt.default_bindings(), &["Ctrl+`"]);
+        assert_eq!(OperationId::NavigationUp.default_bindings()[0], "w");
+        assert_eq!(OperationId::NavigationLeft.default_bindings()[0], "a");
+        assert_eq!(OperationId::NavigationDown.default_bindings()[0], "s");
+        assert_eq!(OperationId::NavigationRight.default_bindings()[0], "d");
+        assert_eq!(OperationId::BranchSwitch.default_bindings(), &["S"]);
+        assert_eq!(OperationId::ChangesStage.default_bindings(), &["S"]);
+        assert_eq!(OperationId::DiffWrapToggle.default_bindings(), &["W"]);
+        assert_eq!(OperationId::RemoteAdd.default_bindings(), &["A"]);
+        assert_eq!(
+            OperationId::AppCommandPrompt.default_bindings(),
+            &["Ctrl+`"]
+        );
     }
 }

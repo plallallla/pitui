@@ -14,7 +14,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
 use crate::app::{
-    Action, AppState, CommandId, CommandMount, DiffViewMode, FooterGroup, ShortcutContext,
+    Action, AppState, DiffViewMode, FocusKind, FooterGroup, OperationId, OperationMount, ViewId,
 };
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -186,7 +186,8 @@ fn display_sequence(sequence: &[KeyStroke]) -> String {
 
 #[derive(Clone, Debug)]
 pub struct ResolvedKeymap {
-    bindings: HashMap<CommandId, Vec<KeySequence>>,
+    bindings: HashMap<OperationId, Vec<KeySequence>>,
+    view_bindings: HashMap<(ViewId, OperationId), Vec<KeySequence>>,
     pub chord_timeout: Option<Duration>,
 }
 
@@ -215,20 +216,20 @@ pub struct ShortcutHelpItem {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShortcutHelpSection {
     pub title: String,
-    pub context: Option<ShortcutContext>,
+    pub context: Option<FocusKind>,
     pub items: Vec<ShortcutHelpItem>,
 }
 
 #[derive(Clone, Debug)]
 struct Transition {
     stroke: KeyStroke,
-    leaves: Vec<CommandId>,
-    descendants: Vec<CommandId>,
+    leaves: Vec<OperationId>,
+    descendants: Vec<OperationId>,
 }
 
 impl ResolvedKeymap {
     pub fn default_keymap() -> Self {
-        let bindings = CommandId::ALL
+        let bindings = OperationId::ALL
             .iter()
             .copied()
             .map(|command| {
@@ -245,12 +246,45 @@ impl ResolvedKeymap {
             .collect();
         Self {
             bindings,
+            view_bindings: HashMap::new(),
             chord_timeout: None,
         }
     }
 
-    pub fn bindings_for(&self, command: CommandId) -> &[KeySequence] {
+    pub fn bindings_for(&self, command: OperationId) -> &[KeySequence] {
         self.bindings.get(&command).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn display_bindings_for(&self, command: OperationId) -> String {
+        let bindings = self.bindings_for(command);
+        if bindings.is_empty() {
+            "(unbound)".into()
+        } else {
+            bindings
+                .iter()
+                .map(|binding| display_sequence(binding))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        }
+    }
+
+    pub fn bindings_for_view(&self, view: ViewId, operation: OperationId) -> &[KeySequence] {
+        self.view_bindings
+            .get(&(view, operation))
+            .map_or_else(|| self.bindings_for(operation), Vec::as_slice)
+    }
+
+    pub fn display_bindings_for_view(&self, view: ViewId, operation: OperationId) -> String {
+        let bindings = self.bindings_for_view(view, operation);
+        if bindings.is_empty() {
+            "(unbound)".into()
+        } else {
+            bindings
+                .iter()
+                .map(|binding| display_sequence(binding))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        }
     }
 
     pub fn resolve(
@@ -362,13 +396,11 @@ impl ResolvedKeymap {
         primary_only: bool,
     ) -> Vec<Transition> {
         let mut transitions = HashMap::<KeyStroke, Transition>::new();
-        for command in CommandId::ALL.iter().copied() {
+        for command in OperationId::ALL.iter().copied() {
             if command.action(app).is_none() {
                 continue;
             }
-            let Some(sequences) = self.bindings.get(&command) else {
-                continue;
-            };
+            let sequences = self.bindings_for_view(app.view_projection().view, command);
             for (index, sequence) in sequences.iter().enumerate() {
                 if primary_only && index > 0 {
                     continue;
@@ -433,7 +465,7 @@ pub struct ResolvedFooterConfig {
     pub default_visibility: FooterVisibilityMode,
     pub separator: String,
     pub overflow: FooterOverflow,
-    commands: HashMap<CommandId, FooterPresentationOverride>,
+    commands: HashMap<OperationId, FooterPresentationOverride>,
     groups: HashMap<String, FooterPresentationOverride>,
 }
 
@@ -461,7 +493,7 @@ impl Default for ResolvedFooterConfig {
 }
 
 impl ResolvedFooterConfig {
-    fn command_presentation(&self, command: CommandId) -> FooterPresentation {
+    fn command_presentation(&self, command: OperationId) -> FooterPresentation {
         let defaults_visible = match self.default_visibility {
             FooterVisibilityMode::Registry => command.default_visible(),
             FooterVisibilityMode::All => true,
@@ -578,12 +610,73 @@ pub struct ResolvedDiffConfig {
     pub default_mode: DiffViewMode,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitListDensityConfig {
+    Compact,
+    Detailed,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedViewConfig {
+    pub left_width_percent: u16,
+    pub commit_density: CommitListDensityConfig,
+    pub show_commit_author: bool,
+    pub show_commit_datetime: bool,
+    pub show_commit_tags: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedViewsConfig {
+    views: HashMap<ViewId, ResolvedViewConfig>,
+}
+
+impl Default for ResolvedViewsConfig {
+    fn default() -> Self {
+        let views = ViewId::ALL
+            .iter()
+            .copied()
+            .map(|view| {
+                (
+                    view,
+                    ResolvedViewConfig {
+                        left_width_percent: 36,
+                        commit_density: if view == ViewId::History {
+                            CommitListDensityConfig::Detailed
+                        } else {
+                            CommitListDensityConfig::Compact
+                        },
+                        show_commit_author: true,
+                        show_commit_datetime: true,
+                        show_commit_tags: true,
+                    },
+                )
+            })
+            .collect();
+        Self { views }
+    }
+}
+
+impl ResolvedViewsConfig {
+    pub fn view(&self, view: ViewId) -> &ResolvedViewConfig {
+        self.views
+            .get(&view)
+            .expect("every compiled view has resolved configuration")
+    }
+
+    fn view_mut(&mut self, view: ViewId) -> &mut ResolvedViewConfig {
+        self.views
+            .get_mut(&view)
+            .expect("every compiled view has resolved configuration")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ResolvedConfig {
     pub source_path: Option<PathBuf>,
     pub keymap: ResolvedKeymap,
     pub footer: ResolvedFooterConfig,
     pub diff: ResolvedDiffConfig,
+    pub views: ResolvedViewsConfig,
     pub logging: ResolvedLoggingConfig,
 }
 
@@ -596,6 +689,7 @@ impl Default for ResolvedConfig {
             diff: ResolvedDiffConfig {
                 default_mode: DiffViewMode::Unified,
             },
+            views: ResolvedViewsConfig::default(),
             logging: ResolvedLoggingConfig {
                 enabled: true,
                 level: LogLevel::Info,
@@ -621,27 +715,25 @@ impl ResolvedConfig {
         Arc::new(Self::default())
     }
 
+    pub fn operation_label(&self, command: OperationId) -> String {
+        self.footer.command_presentation(command).label
+    }
+
     /// Builds the shortcut reference for one originating normal-mode focus.
     /// Only global commands and that focus's mounted operation table are
     /// included. Empty bindings remain visible as `(unbound)` so the popup is
     /// also an effective-configuration inspector for the current interface.
-    pub fn shortcut_help_sections(
+    pub fn shortcut_help_sections(&self, context: Option<FocusKind>) -> Vec<ShortcutHelpSection> {
+        self.shortcut_help_sections_for_view(ViewId::History, context)
+    }
+
+    pub fn shortcut_help_sections_for_view(
         &self,
-        context: Option<ShortcutContext>,
+        view: ViewId,
+        context: Option<FocusKind>,
     ) -> Vec<ShortcutHelpSection> {
-        let command_item = |command: CommandId| ShortcutHelpItem {
-            key: {
-                let bindings = self.keymap.bindings_for(command);
-                if bindings.is_empty() {
-                    "(unbound)".into()
-                } else {
-                    bindings
-                        .iter()
-                        .map(|binding| display_sequence(binding))
-                        .collect::<Vec<_>>()
-                        .join(" / ")
-                }
-            },
+        let command_item = |command: OperationId| ShortcutHelpItem {
+            key: self.keymap.display_bindings_for_view(view, command),
             label: self.footer.command_presentation(command).label,
             operation: command.as_str().into(),
         };
@@ -650,10 +742,10 @@ impl ResolvedConfig {
         sections.push(ShortcutHelpSection {
             title: "Global · mounted in every normal focus".into(),
             context: None,
-            items: CommandId::ALL
+            items: OperationId::ALL
                 .iter()
                 .copied()
-                .filter(|command| command.mount() == CommandMount::Global)
+                .filter(|command| command.mount() == OperationMount::Global)
                 .map(command_item)
                 .collect(),
         });
@@ -661,10 +753,10 @@ impl ResolvedConfig {
             sections.push(ShortcutHelpSection {
                 title: format!("{}  [{}]", context.title(), context.id()),
                 context: Some(context),
-                items: CommandId::ALL
+                items: OperationId::ALL
                     .iter()
                     .copied()
-                    .filter(|command| command.mount() == CommandMount::Focus)
+                    .filter(|command| command.mount() == OperationMount::Focus)
                     .filter(|command| command.context_mask() & context.mask() != 0)
                     .map(command_item)
                     .collect(),
@@ -673,9 +765,17 @@ impl ResolvedConfig {
         sections
     }
 
-    pub fn shortcut_help_line_count(&self, context: Option<ShortcutContext>) -> usize {
+    pub fn shortcut_help_line_count(&self, context: Option<FocusKind>) -> usize {
+        self.shortcut_help_line_count_for_view(ViewId::History, context)
+    }
+
+    pub fn shortcut_help_line_count_for_view(
+        &self,
+        view: ViewId,
+        context: Option<FocusKind>,
+    ) -> usize {
         3 + self
-            .shortcut_help_sections(context)
+            .shortcut_help_sections_for_view(view, context)
             .iter()
             .map(|section| section.items.len() + 2)
             .sum::<usize>()
@@ -713,7 +813,7 @@ impl ResolvedConfig {
                 group.priority
             ));
         }
-        for command in CommandId::ALL.iter().copied() {
+        for command in OperationId::ALL.iter().copied() {
             let presentation = self.footer.command_presentation(command);
             output.push_str(&format!(
                 "\n[ui.footer.commands.{}]\nvisible = {}\nlabel = {}\npriority = {}\n",
@@ -729,7 +829,7 @@ impl ResolvedConfig {
                 .chord_timeout
                 .map_or(0, |duration| duration.as_millis())
         ));
-        for command in CommandId::ALL.iter().copied() {
+        for command in OperationId::ALL.iter().copied() {
             output.push_str(&format!(
                 "\n[keybindings.commands.{}]\nbindings = [{}]\n",
                 quote(command.as_str()),
@@ -748,6 +848,34 @@ impl ResolvedConfig {
                 DiffViewMode::SideBySide => "side-by-side",
             })
         ));
+        for view in ViewId::ALL.iter().copied() {
+            let config = self.views.view(view);
+            output.push_str(&format!(
+                "\n[views.{}]\nleft_width_percent = {}\ncommit_density = {}\nshow_commit_author = {}\nshow_commit_datetime = {}\nshow_commit_tags = {}\n",
+                quote(view.id()),
+                config.left_width_percent,
+                quote(match config.commit_density {
+                    CommitListDensityConfig::Compact => "compact",
+                    CommitListDensityConfig::Detailed => "detailed",
+                }),
+                config.show_commit_author,
+                config.show_commit_datetime,
+                config.show_commit_tags,
+            ));
+            for operation in OperationId::ALL.iter().copied() {
+                output.push_str(&format!(
+                    "\n[views.{}.operations.{}]\nbindings = [{}]\n",
+                    quote(view.id()),
+                    quote(operation.as_str()),
+                    self.keymap
+                        .bindings_for_view(view, operation)
+                        .iter()
+                        .map(|sequence| quote(&display_sequence(sequence)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
         output.push_str(&format!(
             "\n[logging]\nenabled = {}\nlevel = {}\npath = {}\nformat = \"jsonl\"\nflush_interval_ms = {}\nbuffer_capacity = {}\nmax_detail_chars = {}\nfail_on_open_error = {}\n",
             self.logging.enabled,
@@ -872,8 +1000,92 @@ fn apply_raw_config(
             }
         };
     }
+    apply_views(&mut resolved.views, &mut resolved.keymap, raw.views)?;
     apply_logging(&mut resolved.logging, raw.logging, source_path)?;
     Ok(())
+}
+
+fn apply_views(
+    resolved: &mut ResolvedViewsConfig,
+    keymap: &mut ResolvedKeymap,
+    raw_views: BTreeMap<String, RawView>,
+) -> Result<(), ConfigError> {
+    for (view_id, raw) in raw_views {
+        let view = ViewId::parse(&view_id).ok_or_else(|| {
+            ConfigError::new(format!(
+                "unknown view `{view_id}`; known views: {}",
+                ViewId::ALL
+                    .iter()
+                    .map(|view| view.id())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+        let view_config = resolved.view_mut(view);
+        if let Some(width) = raw.left_width_percent {
+            if !(20..=80).contains(&width) {
+                return Err(ConfigError::new(format!(
+                    "views.{view_id}.left_width_percent must be between 20 and 80"
+                )));
+            }
+            view_config.left_width_percent = width;
+        }
+        if let Some(density) = raw.commit_density {
+            view_config.commit_density = match density.as_str() {
+                "compact" => CommitListDensityConfig::Compact,
+                "detailed" => CommitListDensityConfig::Detailed,
+                _ => {
+                    return Err(ConfigError::new(format!(
+                        "invalid views.{view_id}.commit_density `{density}`; expected compact or detailed"
+                    )));
+                }
+            };
+        }
+        if let Some(value) = raw.show_commit_author {
+            view_config.show_commit_author = value;
+        }
+        if let Some(value) = raw.show_commit_datetime {
+            view_config.show_commit_datetime = value;
+        }
+        if let Some(value) = raw.show_commit_tags {
+            view_config.show_commit_tags = value;
+        }
+        for (operation_id, operation_config) in raw.operations {
+            let operation = parse_command_id(&operation_id)?;
+            if let Some(bindings) = operation_config.bindings {
+                let parsed = parse_binding_list(
+                    &format!("views.{view_id}.operations.{operation_id}"),
+                    bindings,
+                )?;
+                keymap.view_bindings.insert((view, operation), parsed);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_binding_list(field: &str, bindings: Vec<String>) -> Result<Vec<KeySequence>, ConfigError> {
+    let mut parsed = Vec::new();
+    for binding in bindings {
+        let sequence =
+            parse_sequence(&binding).map_err(|error| error.context(field.to_string()))?;
+        if sequence
+            .iter()
+            .skip(1)
+            .any(|stroke| stroke.code == KeyCode::Esc)
+        {
+            return Err(ConfigError::new(format!(
+                "{field}: `Esc` is reserved for cancelling an active chord"
+            )));
+        }
+        if parsed.contains(&sequence) {
+            return Err(ConfigError::new(format!(
+                "duplicate binding `{binding}` for `{field}`"
+            )));
+        }
+        parsed.push(sequence);
+    }
+    Ok(parsed)
 }
 
 fn apply_footer(resolved: &mut ResolvedFooterConfig, raw: RawFooter) -> Result<(), ConfigError> {
@@ -1079,34 +1291,49 @@ fn apply_logging(
 }
 
 fn validate_keymap(keymap: &ResolvedKeymap) -> Result<(), ConfigError> {
-    let quit_bindings = keymap.bindings_for(CommandId::AppQuit);
-    if quit_bindings.is_empty() {
-        return Err(ConfigError::new(
-            "`app.quit` must keep at least one binding so Normal mode cannot trap the user",
-        ));
+    validate_keymap_scope(keymap, None)?;
+    for view in ViewId::ALL.iter().copied() {
+        validate_keymap_scope(keymap, Some(view))?;
     }
-    let commands = CommandId::ALL;
+    Ok(())
+}
+
+fn validate_keymap_scope(keymap: &ResolvedKeymap, view: Option<ViewId>) -> Result<(), ConfigError> {
+    let bindings = |operation| {
+        view.map_or_else(
+            || keymap.bindings_for(operation),
+            |view| keymap.bindings_for_view(view, operation),
+        )
+    };
+    let scope = view.map_or_else(String::new, |view| format!(" in view `{}`", view.id()));
+    let quit_bindings = bindings(OperationId::AppQuit);
+    if quit_bindings.is_empty() {
+        return Err(ConfigError::new(format!(
+            "`app.quit` must keep at least one binding{scope} so Normal mode cannot trap the user"
+        )));
+    }
+    let commands = OperationId::ALL;
     let has_unshadowed_quit = quit_bindings.iter().any(|quit| {
         !commands
             .iter()
             .copied()
-            .filter(|command| *command != CommandId::AppQuit)
-            .filter(|command| command.context_mask() & CommandId::AppQuit.context_mask() != 0)
-            .flat_map(|command| keymap.bindings_for(command))
+            .filter(|command| *command != OperationId::AppQuit)
+            .filter(|command| command.context_mask() & OperationId::AppQuit.context_mask() != 0)
+            .flat_map(&bindings)
             .any(|binding| binding.len() > quit.len() && binding.starts_with(quit))
     });
     if !has_unshadowed_quit {
-        return Err(ConfigError::new(
-            "`app.quit` must keep one binding that is not shadowed by a chord prefix",
-        ));
+        return Err(ConfigError::new(format!(
+            "`app.quit` must keep one binding{scope} that is not shadowed by a chord prefix"
+        )));
     }
     for command in commands.iter().copied() {
-        let sequences = keymap.bindings_for(command);
+        let sequences = bindings(command);
         for (index, left) in sequences.iter().enumerate() {
             for right in sequences.iter().skip(index + 1) {
                 if left.starts_with(right) || right.starts_with(left) {
                     return Err(ConfigError::new(format!(
-                        "keybinding prefix conflict within `{}`: `{}` and `{}`",
+                        "keybinding prefix conflict within `{}`{scope}: `{}` and `{}`",
                         command.as_str(),
                         display_sequence(left),
                         display_sequence(right)
@@ -1121,10 +1348,10 @@ fn validate_keymap(keymap: &ResolvedKeymap) -> Result<(), ConfigError> {
             if overlap == 0 {
                 continue;
             }
-            for left_sequence in keymap.bindings_for(left) {
-                for right_sequence in keymap.bindings_for(right) {
+            for left_sequence in bindings(left) {
+                for right_sequence in bindings(right) {
                     if left_sequence == right_sequence {
-                        return Err(binding_conflict(left, right, left_sequence));
+                        return Err(binding_conflict(left, right, left_sequence, &scope));
                     }
                     let (shorter, shorter_command, longer, longer_command) =
                         if left_sequence.len() < right_sequence.len() {
@@ -1140,7 +1367,7 @@ fn validate_keymap(keymap: &ResolvedKeymap) -> Result<(), ConfigError> {
                         if longer_scope != shorter_scope && longer_scope & !shorter_scope == 0 {
                             continue;
                         }
-                        return Err(binding_conflict(left, right, shorter));
+                        return Err(binding_conflict(left, right, shorter, &scope));
                     }
                 }
             }
@@ -1149,18 +1376,23 @@ fn validate_keymap(keymap: &ResolvedKeymap) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn binding_conflict(left: CommandId, right: CommandId, sequence: &[KeyStroke]) -> ConfigError {
+fn binding_conflict(
+    left: OperationId,
+    right: OperationId,
+    sequence: &[KeyStroke],
+    scope: &str,
+) -> ConfigError {
     ConfigError::new(format!(
-        "keybinding conflict `{}` between `{}` and `{}` in overlapping contexts",
+        "keybinding conflict `{}` between `{}` and `{}` in overlapping contexts{scope}",
         display_sequence(sequence),
         left.as_str(),
         right.as_str()
     ))
 }
 
-fn parse_command_id(id: &str) -> Result<CommandId, ConfigError> {
-    CommandId::parse(id).ok_or_else(|| {
-        let candidates = CommandId::ALL
+fn parse_command_id(id: &str) -> Result<OperationId, ConfigError> {
+    OperationId::parse(id).ok_or_else(|| {
+        let candidates = OperationId::ALL
             .iter()
             .map(|command| command.as_str())
             .filter(|candidate| candidate.starts_with(id.split('.').next().unwrap_or_default()))
@@ -1393,6 +1625,8 @@ struct RawConfig {
     #[serde(default)]
     diff: RawDiff,
     #[serde(default)]
+    views: BTreeMap<String, RawView>,
+    #[serde(default)]
     logging: RawLogging,
 }
 
@@ -1441,6 +1675,17 @@ struct RawCommandBinding {
 #[serde(default, deny_unknown_fields)]
 struct RawDiff {
     default_mode: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawView {
+    left_width_percent: Option<u16>,
+    commit_density: Option<String>,
+    show_commit_author: Option<bool>,
+    show_commit_datetime: Option<bool>,
+    show_commit_tags: Option<bool>,
+    operations: BTreeMap<String, RawCommandBinding>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1520,9 +1765,21 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::{FocusPanel, GlobalMode, Screen, ShortcutContext},
-        domain::{ChangedFile, Commit, CommitDetail, CommitHash, FileChangeKind, GitPath},
+        app::{BranchId, FocusKind, FocusRole, GlobalMode, RepositoryId},
+        domain::{
+            BranchName, ChangedFile, Commit, CommitDetail, CommitHash, FileChangeKind, GitPath,
+        },
     };
+
+    fn seed_commits(state: &mut AppState, commits: Vec<Commit>) {
+        let branch = BranchId {
+            repository: RepositoryId(0),
+            name: BranchName("main".into()),
+        };
+        state.model.replace_branch_commits(&branch, commits);
+        state.viewing_branch = Some(branch);
+        state.ensure_valid_commit_selection();
+    }
 
     #[test]
     fn parses_and_formats_key_sequences() {
@@ -1596,12 +1853,82 @@ keep_files = 4
         assert_eq!(
             config
                 .keymap
-                .bindings_for(CommandId::AppRefresh)
+                .bindings_for(OperationId::AppRefresh)
                 .first()
                 .map(|sequence| display_sequence(sequence)),
             Some("Alt+R".into())
         );
         toml::from_str::<toml::Value>(&config.effective_toml()).unwrap();
+    }
+
+    #[test]
+    fn loads_view_layout_detail_and_operation_binding_overrides() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+schema_version = 1
+
+[views.history]
+left_width_percent = 42
+commit_density = "compact"
+show_commit_author = false
+show_commit_datetime = true
+show_commit_tags = false
+
+[views.history.operations."app.refresh"]
+bindings = ["Alt+R"]
+"#,
+        )
+        .unwrap();
+
+        let config = load(&ConfigLoadOptions {
+            path: Some(path),
+            ..ConfigLoadOptions::default()
+        })
+        .unwrap();
+        let history = config.views.view(ViewId::History);
+        assert_eq!(history.left_width_percent, 42);
+        assert_eq!(history.commit_density, CommitListDensityConfig::Compact);
+        assert!(!history.show_commit_author);
+        assert!(!history.show_commit_tags);
+        assert_eq!(
+            config
+                .keymap
+                .display_bindings_for_view(ViewId::History, OperationId::AppRefresh),
+            "Alt+R"
+        );
+        assert_eq!(
+            config
+                .keymap
+                .display_bindings_for_view(ViewId::Commit, OperationId::AppRefresh),
+            "Ctrl+R"
+        );
+
+        let mut state = AppState::with_config(vec![PathBuf::from("/repo")], Arc::new(config));
+        assert_eq!(
+            state
+                .config
+                .keymap
+                .resolve(&state, &[], KeyStroke::parse("Alt+R").unwrap()),
+            Some(KeyResolution::Action(Action::RefreshRepository))
+        );
+        assert_eq!(
+            state
+                .config
+                .keymap
+                .resolve(&state, &[], KeyStroke::parse("Ctrl+R").unwrap()),
+            None
+        );
+        state.set_focus_layer(FocusKind::Commit, FocusRole::Entity);
+        assert_eq!(
+            state
+                .config
+                .keymap
+                .resolve(&state, &[], KeyStroke::parse("Ctrl+R").unwrap()),
+            Some(KeyResolution::Action(Action::RefreshRepository))
+        );
     }
 
     #[test]
@@ -1733,19 +2060,19 @@ bindings = ["Alt+R"]
 
     #[test]
     fn chord_footer_reveals_only_the_current_level() {
-        let mut state = AppState {
-            focus: FocusPanel::CommitList,
-            ..AppState::default()
-        };
-        state.branch_commits.items.push(Commit {
-            hash: CommitHash("0123456789abcdef".into()),
-            short_hash: "01234567".into(),
-            author: "Ada".into(),
-            authored_at: "2026-07-16".into(),
-            decorations: String::new(),
-            subject: "copy me".into(),
-        });
-        state.ensure_valid_commit_selection();
+        let mut state = AppState::with_repository_paths(vec![PathBuf::from("/repo")]);
+        state.set_focus_layer(FocusKind::Commit, FocusRole::Collection);
+        seed_commits(
+            &mut state,
+            vec![Commit {
+                hash: CommitHash("0123456789abcdef".into()),
+                short_hash: "01234567".into(),
+                author: "Ada".into(),
+                authored_at: "2026-07-16".into(),
+                decorations: String::new(),
+                subject: "copy me".into(),
+            }],
+        );
 
         let root = state
             .config
@@ -1801,10 +2128,11 @@ bindings = ["Alt+R"]
             decorations: String::new(),
             subject: "file palette".into(),
         };
-        let mut state = AppState {
-            screen: Screen::CommitDetail,
-            focus: FocusPanel::CommitFileList,
-            current_commit_detail: Some(CommitDetail {
+        let mut state = AppState::with_repository_paths(vec![PathBuf::from("/repo")]);
+        seed_commits(&mut state, vec![commit.clone()]);
+        state.model.set_commit_detail(
+            RepositoryId(0),
+            CommitDetail {
                 commit,
                 author_email: "ada@example.invalid".into(),
                 committer: "Ada".into(),
@@ -1820,9 +2148,9 @@ bindings = ["Alt+R"]
                     hunks: Vec::new(),
                     is_binary: false,
                 }],
-            }),
-            ..AppState::default()
-        };
+            },
+        );
+        state.set_focus_layer(FocusKind::File, FocusRole::Collection);
         state.ensure_valid_file_selection();
         let root = state
             .config
@@ -1853,11 +2181,11 @@ bindings = ["Alt+R"]
     #[test]
     fn shortcut_reference_contains_only_global_and_current_focus_operations() {
         let config = ResolvedConfig::default();
-        let sections = config.shortcut_help_sections(Some(ShortcutContext::DetailCommits));
+        let sections = config.shortcut_help_sections(Some(FocusKind::Commit));
         assert_eq!(sections.len(), 2);
         let commit = sections
             .iter()
-            .find(|section| section.context == Some(ShortcutContext::DetailCommits))
+            .find(|section| section.context == Some(FocusKind::Commit))
             .unwrap();
         assert!(
             commit
@@ -1872,14 +2200,14 @@ bindings = ["Alt+R"]
                 .all(|item| !item.operation.starts_with("file.copy."))
         );
         assert!(sections.iter().all(|section| {
-            section.context.is_none() || section.context == Some(ShortcutContext::DetailCommits)
+            section.context.is_none() || section.context == Some(FocusKind::Commit)
         }));
 
-        let sections = config.shortcut_help_sections(Some(ShortcutContext::CommitFiles));
+        let sections = config.shortcut_help_sections(Some(FocusKind::File));
         assert_eq!(sections.len(), 2);
         let files = sections
             .iter()
-            .find(|section| section.context == Some(ShortcutContext::CommitFiles))
+            .find(|section| section.context == Some(FocusKind::File))
             .unwrap();
         assert!(
             files
@@ -1894,7 +2222,7 @@ bindings = ["Alt+R"]
                 .all(|item| !item.operation.starts_with("commit.copy."))
         );
         assert!(sections.iter().all(|section| {
-            section.context.is_none() || section.context == Some(ShortcutContext::CommitFiles)
+            section.context.is_none() || section.context == Some(FocusKind::File)
         }));
         assert_eq!(config.shortcut_help_sections(None).len(), 1);
     }

@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::Instant,
 };
@@ -8,37 +8,15 @@ use std::{
 use crate::{
     config::{KeyStroke, ResolvedConfig},
     domain::{
-        Branch, BranchName, Commit, CommitDetail, CommitHash, CommitList, FileDiff, GitPath,
-        ReflogEntry, RemoteInfo, Repository, WorkingTreeChange,
+        Branch, BranchName, Commit, CommitDetail, CommitHash, FileDiff, GitPath, ReflogEntry,
+        RemoteInfo, Repository, WorkingTreeChange,
     },
     git::{GitJobId, ResetMode},
 };
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum Screen {
-    #[default]
-    BranchOverview,
-    CommitDetail,
-    FileDiffDetail,
-    Reflog,
-    Changes,
-    Remotes,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum FocusPanel {
-    #[default]
-    BranchList,
-    CommitList,
-    CommitFileList,
-    FileList,
-    DiffView,
-    ReflogList,
-    ChangesTree,
-    ChangesDiff,
-    RemoteList,
-    Popup,
-}
+use super::{
+    BranchId, CommitId, FileId, FocusContext, GitModel, NavigationState, OperationId, RepositoryId,
+};
 
 /// The two Git boundaries represented in the Changes tree. A path can appear
 /// in both groups when it has an indexed change and a newer working-tree
@@ -193,6 +171,14 @@ pub enum GlobalMode {
     },
     ShortcutHelp {
         scroll: u16,
+    },
+    /// Searchable projection of the currently resolved normal-mode operation
+    /// set. IDs are captured before opening the popup so availability and
+    /// invocation come from the same registry/focus snapshot.
+    OperationPalette {
+        query: String,
+        selected: usize,
+        operations: Vec<OperationId>,
     },
     CommandPrompt {
         input: String,
@@ -367,11 +353,11 @@ impl BranchTreeNode {
     }
 }
 
-#[derive(Debug)]
-pub struct RepositoryState {
-    pub requested_path: PathBuf,
-    pub repository: Option<Repository>,
-    pub branches: Vec<Branch>,
+/// UI/async state keyed by the same numeric `RepositoryId` position as
+/// `GitModel::repository_ids`. Core repository and branch data never lives in
+/// this structure.
+#[derive(Debug, Default)]
+pub struct RepositoryUiState {
     pub expanded: bool,
     pub last_error: Option<AppError>,
     pub viewing_branch: Option<BranchName>,
@@ -379,102 +365,15 @@ pub struct RepositoryState {
     pub latest_branches_job: Option<GitJobId>,
 }
 
-impl RepositoryState {
-    pub fn new(requested_path: PathBuf) -> Self {
+impl RepositoryUiState {
+    pub fn new() -> Self {
         Self {
-            requested_path,
-            repository: None,
-            branches: Vec::new(),
             expanded: true,
             last_error: None,
             viewing_branch: None,
             latest_status_job: None,
             latest_branches_job: None,
         }
-    }
-
-    pub fn git_cwd(&self) -> &Path {
-        self.repository
-            .as_ref()
-            .map_or(self.requested_path.as_path(), |repository| {
-                repository.root.as_path()
-            })
-    }
-
-    pub fn display_name(&self) -> String {
-        self.repository.as_ref().map_or_else(
-            || {
-                self.requested_path
-                    .file_name()
-                    .filter(|name| !name.is_empty())
-                    .map_or_else(
-                        || self.requested_path.display().to_string(),
-                        |name| name.to_string_lossy().into_owned(),
-                    )
-            },
-            |repository| repository.name.clone(),
-        )
-    }
-
-    pub fn display_path(&self) -> &Path {
-        self.repository
-            .as_ref()
-            .map_or(self.requested_path.as_path(), |repository| {
-                repository.root.as_path()
-            })
-    }
-
-    /// `git for-each-ref refs/heads` cannot return an unborn branch because
-    /// the ref does not exist yet. Repository status still knows its name, so
-    /// synthesize that current branch as a real tree child until the first
-    /// commit creates the ref.
-    pub fn ensure_current_branch_visible(&mut self) {
-        let Some(repository) = self.repository.as_ref() else {
-            return;
-        };
-        let Some(current_branch) = repository.current_branch.as_ref() else {
-            for branch in &mut self.branches {
-                branch.is_current = false;
-            }
-            return;
-        };
-
-        let mut found = false;
-        for branch in &mut self.branches {
-            branch.is_current = branch.name == *current_branch;
-            if branch.is_current && branch.head.0.is_empty() && !repository.head.0.is_empty() {
-                branch.head = repository.head.clone();
-                branch.short_head = repository.head.short().to_string();
-                branch.subject.clear();
-            }
-            found |= branch.is_current;
-        }
-        if found {
-            return;
-        }
-
-        let short_head = if repository.head.0.is_empty() {
-            "unborn".to_string()
-        } else {
-            repository.head.short().to_string()
-        };
-        self.branches.insert(
-            0,
-            Branch {
-                name: current_branch.clone(),
-                full_ref: format!("refs/heads/{}", current_branch.0),
-                kind: crate::domain::BranchKind::Local,
-                head: repository.head.clone(),
-                short_head,
-                commit_date: String::new(),
-                subject: if repository.head.0.is_empty() {
-                    "Unborn branch (no commits yet)".into()
-                } else {
-                    String::new()
-                },
-                is_current: true,
-            },
-        );
     }
 }
 
@@ -483,35 +382,32 @@ pub struct AppState {
     /// Immutable effective configuration snapshot shared by input and
     /// rendering, so hints can never disagree with the active bindings.
     pub config: Arc<ResolvedConfig>,
-    pub repositories: Vec<RepositoryState>,
+    /// Authoritative normalized Repository -> Branch -> Commit -> File model.
+    /// Core Git entities and collection contents live nowhere else.
+    pub model: GitModel,
+    pub navigation: NavigationState,
+    pub repository_ui: Vec<RepositoryUiState>,
     /// Persistent JSONL audit trail written by the Git worker. The value is
     /// exposed to the UI so users can discover the effective path, including
     /// a temporary fallback when the platform default cannot be opened.
     pub backend_log_path: Option<PathBuf>,
     pub backend_logging_warning: Option<String>,
     pub active_repository_index: Option<usize>,
-    pub branch_commits_repository_index: Option<usize>,
-    pub branch_commits: CommitList,
+    /// Branch whose commit collection is projected into the History/Commit
+    /// views. The commits themselves live only in `GitModel`.
+    pub viewing_branch: Option<BranchId>,
     pub reflog_repository_index: Option<usize>,
-    pub reflog_entries: Vec<ReflogEntry>,
     pub remotes_repository_index: Option<usize>,
-    pub remotes: Vec<RemoteInfo>,
     pub changes_repository_index: Option<usize>,
-    pub changes: Vec<WorkingTreeChange>,
     pub current_changes_diff: Option<FileDiff>,
     pub current_changes_diff_group: Option<ChangeGroup>,
     /// File/group selections used by stage and unstage. The group is part of
     /// the key because an `MM` path intentionally appears twice.
     pub change_selection: HashSet<ChangeSelection>,
-    /// Screen/focus to restore when Changes was opened through the global
+    /// Semantic focus to restore when Changes was opened through the global
     /// shortcut. This makes Changes an overlay-like destination rather than a
-    /// child of Branch Overview.
-    pub changes_return_context: Option<(Screen, FocusPanel)>,
-    pub current_commit_detail: Option<CommitDetail>,
-    pub current_file_diff: Option<FileDiff>,
-    pub screen: Screen,
-    pub focus: FocusPanel,
-    pub previous_focus: Option<FocusPanel>,
+    /// child of History.
+    pub changes_return_context: Option<FocusContext>,
     pub mode: GlobalMode,
     pub selection: SelectionState,
     pub expansion: ExpansionState,
@@ -551,35 +447,29 @@ impl AppState {
     }
 
     pub fn with_config(paths: Vec<PathBuf>, config: Arc<ResolvedConfig>) -> Self {
-        let repositories = paths
+        let model = GitModel::from_paths(paths.iter().cloned());
+        let repository_ui = paths
             .into_iter()
-            .map(RepositoryState::new)
+            .map(|_| RepositoryUiState::new())
             .collect::<Vec<_>>();
-        let active_repository_index = (!repositories.is_empty()).then_some(0);
-        Self {
+        let active_repository_index = (!repository_ui.is_empty()).then_some(0);
+        let mut state = Self {
             diff_mode: config.diff.default_mode,
             config,
-            repositories,
+            model,
+            navigation: NavigationState::default(),
+            repository_ui,
             backend_log_path: None,
             backend_logging_warning: None,
             active_repository_index,
-            branch_commits_repository_index: active_repository_index,
-            branch_commits: CommitList::empty(),
+            viewing_branch: None,
             reflog_repository_index: None,
-            reflog_entries: Vec::new(),
             remotes_repository_index: None,
-            remotes: Vec::new(),
             changes_repository_index: None,
-            changes: Vec::new(),
             current_changes_diff: None,
             current_changes_diff_group: None,
             change_selection: HashSet::new(),
             changes_return_context: None,
-            current_commit_detail: None,
-            current_file_diff: None,
-            screen: Screen::BranchOverview,
-            focus: FocusPanel::BranchList,
-            previous_focus: None,
             mode: GlobalMode::Normal,
             selection: SelectionState {
                 selected_branch_index: active_repository_index,
@@ -604,7 +494,9 @@ impl AppState {
             branch_filter: String::new(),
             commit_filter: String::new(),
             tick_count: 0,
-        }
+        };
+        state.reconcile_focus();
+        state
     }
 
     pub fn chord_expired(&self, now: Instant) -> bool {
@@ -621,20 +513,53 @@ impl AppState {
         !self.pending_jobs.is_empty()
     }
 
-    pub fn active_repository_state(&self) -> Option<&RepositoryState> {
-        self.repositories.get(self.active_repository_index?)
+    pub fn repository_count(&self) -> usize {
+        self.model.repository_ids().len()
     }
 
-    pub fn active_repository_state_mut(&mut self) -> Option<&mut RepositoryState> {
-        self.repositories.get_mut(self.active_repository_index?)
+    pub fn repository_ui(&self, id: RepositoryId) -> Option<&RepositoryUiState> {
+        self.repository_ui.get(id.0)
+    }
+
+    pub fn repository_ui_mut(&mut self, id: RepositoryId) -> Option<&mut RepositoryUiState> {
+        self.repository_ui.get_mut(id.0)
+    }
+
+    pub fn active_repository_ui(&self) -> Option<&RepositoryUiState> {
+        self.repository_ui(RepositoryId(self.active_repository_index?))
+    }
+
+    pub fn active_repository_ui_mut(&mut self) -> Option<&mut RepositoryUiState> {
+        self.repository_ui_mut(RepositoryId(self.active_repository_index?))
     }
 
     pub fn active_repository(&self) -> Option<&Repository> {
-        self.active_repository_state()?.repository.as_ref()
+        self.repository(self.active_repository_index?)
     }
 
     pub fn repository(&self, index: usize) -> Option<&Repository> {
-        self.repositories.get(index)?.repository.as_ref()
+        self.model.repository_summary(RepositoryId(index))
+    }
+
+    pub fn repository_node(&self, index: usize) -> Option<&super::RepositoryNode> {
+        self.model.repository(RepositoryId(index))
+    }
+
+    pub fn repository_display_name(&self, index: usize) -> Option<String> {
+        Some(self.repository_node(index)?.display_name())
+    }
+
+    pub fn repository_display_path(&self, index: usize) -> Option<&std::path::Path> {
+        Some(self.repository_node(index)?.display_path())
+    }
+
+    pub fn repository_branch(
+        &self,
+        repository_index: usize,
+        branch_index: usize,
+    ) -> Option<&Branch> {
+        self.repository_node(repository_index)?
+            .branch_at(branch_index)
     }
 
     pub fn effective_branch_filter(&self) -> &str {
@@ -661,7 +586,11 @@ impl AppState {
         let query = self.effective_branch_filter().to_lowercase();
         let mut nodes = Vec::new();
 
-        for (repository_index, repository) in self.repositories.iter().enumerate() {
+        for repository_id in self.model.repository_ids() {
+            let repository_index = repository_id.0;
+            let Some(repository) = self.model.repository(*repository_id) else {
+                continue;
+            };
             let repository_matches = query.is_empty()
                 || repository.display_name().to_lowercase().contains(&query)
                 || repository
@@ -669,9 +598,10 @@ impl AppState {
                     .to_string_lossy()
                     .to_lowercase()
                     .contains(&query);
-            let matching_branches = repository
-                .branches
-                .iter()
+            let matching_branches = self
+                .model
+                .branch_summaries(*repository_id)
+                .into_iter()
                 .enumerate()
                 .filter(|(_, branch)| {
                     query.is_empty()
@@ -687,7 +617,11 @@ impl AppState {
             }
 
             nodes.push(BranchTreeNode::Repository { repository_index });
-            if repository.expanded || !query.is_empty() {
+            if self
+                .repository_ui(*repository_id)
+                .is_some_and(|state| state.expanded)
+                || !query.is_empty()
+            {
                 nodes.extend(matching_branches.into_iter().map(|branch_index| {
                     BranchTreeNode::Branch {
                         repository_index,
@@ -728,10 +662,7 @@ impl AppState {
         };
         Some((
             repository_index,
-            self.repositories
-                .get(repository_index)?
-                .branches
-                .get(branch_index)?,
+            self.repository_branch(repository_index, branch_index)?,
         ))
     }
 
@@ -740,17 +671,25 @@ impl AppState {
             .map(|(_, branch)| branch)
     }
 
+    pub fn selected_branch_id(&self) -> Option<BranchId> {
+        let (repository, branch) = self.selected_branch_with_repository()?;
+        Some(BranchId {
+            repository: RepositoryId(repository),
+            name: branch.name.clone(),
+        })
+    }
+
     /// Branches of the active repository, retained as a convenient read-only view.
     pub fn visible_branches(&self) -> Vec<&Branch> {
-        self.active_repository_state()
-            .map(|repository| repository.branches.iter().collect())
+        self.active_repository_index
+            .map(RepositoryId)
+            .map(|repository| self.model.branch_summaries(repository))
             .unwrap_or_default()
     }
 
     pub fn visible_commit_indices(&self) -> Vec<usize> {
         let query = self.effective_commit_filter().to_lowercase();
-        self.branch_commits
-            .items
+        self.branch_commit_summaries()
             .iter()
             .enumerate()
             .filter(|(_, commit)| {
@@ -764,33 +703,105 @@ impl AppState {
             .collect()
     }
 
+    pub fn branch_commit_summaries(&self) -> Vec<&Commit> {
+        self.viewing_branch
+            .as_ref()
+            .and_then(|branch| self.model.branch_commits(branch))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|node| &node.summary)
+            .collect()
+    }
+
     pub fn visible_commits(&self) -> Vec<&Commit> {
+        let commits = self.branch_commit_summaries();
         self.visible_commit_indices()
             .into_iter()
-            .filter_map(|index| self.branch_commits.items.get(index))
+            .filter_map(|index| commits.get(index).copied())
             .collect()
     }
 
     pub fn selected_commit(&self) -> Option<&Commit> {
-        let source_index = *self
-            .visible_commit_indices()
-            .get(self.selection.selected_commit_index?)?;
-        self.branch_commits.items.get(source_index)
+        self.visible_commits()
+            .get(self.selection.selected_commit_index?)
+            .copied()
+    }
+
+    pub fn selected_commit_id(&self) -> Option<CommitId> {
+        Some(CommitId {
+            repository: self.viewing_branch.as_ref()?.repository,
+            hash: self.selected_commit()?.hash.clone(),
+        })
+    }
+
+    pub fn viewing_branch_id(&self) -> Option<BranchId> {
+        self.viewing_branch.clone()
+    }
+
+    pub fn viewing_repository_index(&self) -> Option<usize> {
+        self.viewing_branch
+            .as_ref()
+            .map(|branch| branch.repository.0)
+    }
+
+    pub fn current_commit_id(&self) -> Option<CommitId> {
+        self.selected_commit_id()
+    }
+
+    pub fn current_commit_detail(&self) -> Option<CommitDetail> {
+        self.model.commit_detail(&self.current_commit_id()?)
+    }
+
+    pub fn current_file_count(&self) -> usize {
+        self.current_commit_id()
+            .and_then(|commit| self.model.commit(&commit))
+            .map_or(0, |commit| commit.file_order.len())
     }
 
     pub fn selected_file(&self) -> Option<&crate::domain::ChangedFile> {
-        self.current_commit_detail
-            .as_ref()?
-            .file(self.selection.selected_file_index)
+        let commit = self.model.commit(&self.current_commit_id()?)?;
+        let file = commit.file_order.get(self.selection.selected_file_index?)?;
+        commit.files.get(file).map(|file| &file.summary)
+    }
+
+    pub fn selected_file_id(&self) -> Option<FileId> {
+        let commit_id = self.current_commit_id()?;
+        let commit = self.model.commit(&commit_id)?;
+        commit
+            .file_order
+            .get(self.selection.selected_file_index?)
+            .cloned()
+    }
+
+    pub fn current_file_diff(&self) -> Option<&FileDiff> {
+        self.model.file_diff(&self.selected_file_id()?)
+    }
+
+    pub fn reflog_entries(&self) -> &[ReflogEntry] {
+        self.reflog_repository_index
+            .and_then(|index| self.model.reflog(RepositoryId(index)))
+            .unwrap_or_default()
+    }
+
+    pub fn remotes(&self) -> &[RemoteInfo] {
+        self.remotes_repository_index
+            .and_then(|index| self.model.remotes(RepositoryId(index)))
+            .unwrap_or_default()
+    }
+
+    pub fn working_tree_changes(&self) -> &[WorkingTreeChange] {
+        self.changes_repository_index
+            .and_then(|index| self.model.working_tree(RepositoryId(index)))
+            .unwrap_or_default()
     }
 
     pub fn selected_reflog(&self) -> Option<&ReflogEntry> {
-        self.reflog_entries
+        self.reflog_entries()
             .get(self.selection.selected_reflog_index?)
     }
 
     pub fn selected_remote(&self) -> Option<&RemoteInfo> {
-        self.remotes.get(self.selection.selected_remote_index?)
+        self.remotes().get(self.selection.selected_remote_index?)
     }
 
     pub fn change_belongs_to_group(change: &WorkingTreeChange, group: ChangeGroup) -> bool {
@@ -806,7 +817,7 @@ impl AppState {
     }
 
     pub fn change_group_count(&self, group: ChangeGroup) -> usize {
-        self.changes
+        self.working_tree_changes()
             .iter()
             .filter(|change| Self::change_belongs_to_group(change, group))
             .count()
@@ -826,7 +837,7 @@ impl AppState {
             };
             if expanded {
                 nodes.extend(
-                    self.changes
+                    self.working_tree_changes()
                         .iter()
                         .enumerate()
                         .filter(|(_, change)| Self::change_belongs_to_group(change, group))
@@ -854,7 +865,7 @@ impl AppState {
         else {
             return None;
         };
-        Some((group, self.changes.get(change_index)?))
+        Some((group, self.working_tree_changes().get(change_index)?))
     }
 
     pub fn selected_change_identity(&self) -> Option<(ChangeGroup, GitPath)> {
@@ -870,7 +881,7 @@ impl AppState {
     }
 
     pub fn change_selections_in_group(&self, group: ChangeGroup) -> Vec<ChangeSelection> {
-        self.changes
+        self.working_tree_changes()
             .iter()
             .filter(|change| Self::change_belongs_to_group(change, group))
             .map(|change| Self::change_selection_key(group, change))
@@ -900,8 +911,7 @@ impl AppState {
 
     pub fn selected_commit_hashes_for_copy(&self) -> Vec<CommitHash> {
         let selected = self
-            .branch_commits
-            .items
+            .branch_commit_summaries()
             .iter()
             .filter(|commit| self.commit_selection.contains(&commit.hash))
             .map(|commit| commit.hash.clone())
@@ -919,8 +929,7 @@ impl AppState {
     /// lists newest commits first, while cherry-pick should normally replay a
     /// dependent series from oldest to newest.
     pub fn selected_commit_hashes_for_cherry_pick(&self) -> Vec<CommitHash> {
-        self.branch_commits
-            .items
+        self.branch_commit_summaries()
             .iter()
             .rev()
             .filter(|commit| self.commit_selection.contains(&commit.hash))
@@ -933,8 +942,7 @@ impl AppState {
         let mut author = commit.author.clone();
         let mut message = commit.subject.clone();
         if let Some(detail) = self
-            .current_commit_detail
-            .as_ref()
+            .current_commit_detail()
             .filter(|detail| detail.commit.hash == commit.hash)
         {
             author = format!("{} <{}>", detail.commit.author, detail.author_email);
@@ -956,8 +964,7 @@ impl AppState {
     /// message from Git instead of silently degrading to the one-line subject.
     pub fn selected_commit_message_for_copy(&self) -> Option<String> {
         let commit = self.selected_commit()?;
-        self.current_commit_detail
-            .as_ref()
+        self.current_commit_detail()
             .filter(|detail| detail.commit.hash == commit.hash)
             .map(|detail| detail.message.clone())
     }
@@ -973,25 +980,18 @@ impl AppState {
     }
 
     pub fn ensure_valid_file_selection(&mut self) {
-        let length = self
-            .current_commit_detail
-            .as_ref()
-            .map_or(0, |detail| detail.files.len());
+        let length = self.current_file_count();
         ensure_index(&mut self.selection.selected_file_index, length);
     }
 
     pub fn ensure_valid_reflog_selection(&mut self) {
-        ensure_index(
-            &mut self.selection.selected_reflog_index,
-            self.reflog_entries.len(),
-        );
+        let length = self.reflog_entries().len();
+        ensure_index(&mut self.selection.selected_reflog_index, length);
     }
 
     pub fn ensure_valid_remote_selection(&mut self) {
-        ensure_index(
-            &mut self.selection.selected_remote_index,
-            self.remotes.len(),
-        );
+        let length = self.remotes().len();
+        ensure_index(&mut self.selection.selected_remote_index, length);
     }
 
     pub fn ensure_valid_changes_selection(&mut self) {
@@ -1012,30 +1012,42 @@ impl AppState {
             ));
     }
 
-    pub fn default_focus_for_screen(&self) -> FocusPanel {
-        match self.screen {
-            Screen::BranchOverview => FocusPanel::BranchList,
-            Screen::CommitDetail => FocusPanel::CommitFileList,
-            Screen::FileDiffDetail => FocusPanel::DiffView,
-            Screen::Reflog => FocusPanel::ReflogList,
-            Screen::Changes => FocusPanel::ChangesTree,
-            Screen::Remotes => FocusPanel::RemoteList,
-        }
-    }
-
-    pub fn open_popup(&mut self) {
-        if self.focus != FocusPanel::Popup {
-            self.previous_focus = Some(self.focus);
-        }
-        self.focus = FocusPanel::Popup;
-    }
+    /// Opening a modal deliberately leaves semantic focus untouched. The
+    /// active `GlobalMode` owns modal input; closing it returns to the exact
+    /// same model entity and operation scope without a parallel popup focus.
+    pub fn open_popup(&mut self) {}
 
     pub fn close_popup(&mut self) {
-        self.focus = self
-            .previous_focus
-            .take()
-            .unwrap_or_else(|| self.default_focus_for_screen());
         self.mode = GlobalMode::Normal;
+    }
+
+    pub fn operation_palette_matches(&self) -> Vec<OperationId> {
+        let GlobalMode::OperationPalette {
+            query, operations, ..
+        } = &self.mode
+        else {
+            return Vec::new();
+        };
+        let query = query.trim().to_lowercase();
+        operations
+            .iter()
+            .copied()
+            .filter(|operation| {
+                query.is_empty()
+                    || operation.as_str().to_lowercase().contains(&query)
+                    || self
+                        .config
+                        .operation_label(*operation)
+                        .to_lowercase()
+                        .contains(&query)
+                    || self
+                        .config
+                        .keymap
+                        .display_bindings_for_view(self.view_projection().view, *operation)
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .collect()
     }
 
     pub fn set_error(&mut self, command: String, message: String) {
@@ -1050,7 +1062,7 @@ impl AppState {
     }
 
     pub fn diff_line_count(&self) -> usize {
-        file_diff_line_count(self.current_file_diff.as_ref())
+        file_diff_line_count(self.current_file_diff())
     }
 
     pub fn changes_diff_line_count(&self) -> usize {
@@ -1108,8 +1120,12 @@ mod tests {
     #[test]
     fn builds_and_filters_repository_branch_tree() {
         let mut state = AppState::with_repository_paths(vec!["one".into(), "two".into()]);
-        state.repositories[0].branches = vec![branch("main"), branch("feature")];
-        state.repositories[1].branches = vec![branch("release")];
+        state
+            .model
+            .replace_branches(RepositoryId(0), vec![branch("main"), branch("feature")]);
+        state
+            .model
+            .replace_branches(RepositoryId(1), vec![branch("release")]);
         assert_eq!(state.visible_tree_nodes().len(), 5);
         assert_eq!(
             state.visible_tree_nodes()[3],
@@ -1118,7 +1134,7 @@ mod tests {
             }
         );
 
-        state.repositories[0].expanded = false;
+        state.repository_ui[0].expanded = false;
         assert_eq!(state.visible_tree_nodes().len(), 3);
 
         state.branch_filter = "release".into();
@@ -1139,19 +1155,22 @@ mod tests {
     #[test]
     fn exposes_an_unborn_current_branch_as_a_tree_child() {
         let mut state = AppState::with_repository_paths(vec!["repo".into()]);
-        state.repositories[0].repository = Some(Repository {
-            root: "repo".into(),
-            name: "repo".into(),
-            current_branch: Some(BranchName("main".into())),
-            head: CommitHash(String::new()),
-            status: crate::domain::WorkingTreeStatus::default(),
-        });
-        state.repositories[0].ensure_current_branch_visible();
+        state.model.set_repository_summary(
+            RepositoryId(0),
+            Repository {
+                root: "repo".into(),
+                name: "repo".into(),
+                current_branch: Some(BranchName("main".into())),
+                head: CommitHash(String::new()),
+                status: crate::domain::WorkingTreeStatus::default(),
+            },
+        );
 
-        assert_eq!(state.repositories[0].branches.len(), 1);
-        assert_eq!(state.repositories[0].branches[0].name.0, "main");
-        assert_eq!(state.repositories[0].branches[0].short_head, "unborn");
-        assert!(state.repositories[0].branches[0].is_current);
+        assert_eq!(state.model.branch_summaries(RepositoryId(0)).len(), 1);
+        let main = state.repository_branch(0, 0).unwrap();
+        assert_eq!(main.name.0, "main");
+        assert_eq!(main.short_head, "unborn");
+        assert!(main.is_current);
         assert_eq!(
             state.visible_tree_nodes(),
             vec![
@@ -1168,35 +1187,35 @@ mod tests {
 
     #[test]
     fn builds_a_three_level_changes_tree_and_duplicates_mm_across_groups() {
-        let mut state = AppState {
-            changes: vec![
-                WorkingTreeChange {
-                    index_status: 'M',
-                    worktree_status: 'M',
-                    path: GitPath::from("both.txt"),
-                    old_path: None,
-                },
-                WorkingTreeChange {
-                    index_status: 'A',
-                    worktree_status: ' ',
-                    path: GitPath::from("staged.txt"),
-                    old_path: None,
-                },
-                WorkingTreeChange {
-                    index_status: '?',
-                    worktree_status: '?',
-                    path: GitPath::from("new.txt"),
-                    old_path: None,
-                },
-                WorkingTreeChange {
-                    index_status: 'U',
-                    worktree_status: 'U',
-                    path: GitPath::from("conflict.txt"),
-                    old_path: None,
-                },
-            ],
-            ..AppState::default()
-        };
+        let changes = vec![
+            WorkingTreeChange {
+                index_status: 'M',
+                worktree_status: 'M',
+                path: GitPath::from("both.txt"),
+                old_path: None,
+            },
+            WorkingTreeChange {
+                index_status: 'A',
+                worktree_status: ' ',
+                path: GitPath::from("staged.txt"),
+                old_path: None,
+            },
+            WorkingTreeChange {
+                index_status: '?',
+                worktree_status: '?',
+                path: GitPath::from("new.txt"),
+                old_path: None,
+            },
+            WorkingTreeChange {
+                index_status: 'U',
+                worktree_status: 'U',
+                path: GitPath::from("conflict.txt"),
+                old_path: None,
+            },
+        ];
+        let mut state = AppState::with_repository_paths(vec![PathBuf::from("/repo")]);
+        state.changes_repository_index = Some(0);
+        state.model.set_working_tree(RepositoryId(0), changes);
 
         assert_eq!(state.change_group_count(ChangeGroup::Staged), 2);
         assert_eq!(state.change_group_count(ChangeGroup::Unstaged), 3);
@@ -1242,8 +1261,8 @@ mod tests {
 
     #[test]
     fn formats_selected_commit_hashes_and_current_info_for_clipboard() {
-        let mut state = AppState::default();
-        state.branch_commits.items = vec![
+        let mut state = AppState::with_repository_paths(vec![PathBuf::from("/repo")]);
+        let commits = vec![
             Commit {
                 hash: CommitHash("aaaaaaaa".into()),
                 short_hash: "aaaaaaaa".into(),
@@ -1261,6 +1280,12 @@ mod tests {
                 subject: "second".into(),
             },
         ];
+        let branch = BranchId {
+            repository: RepositoryId(0),
+            name: BranchName("main".into()),
+        };
+        state.model.replace_branch_commits(&branch, commits.clone());
+        state.viewing_branch = Some(branch);
         state.ensure_valid_commit_selection();
         state.commit_selection.insert(CommitHash("bbbbbbbb".into()));
         state.commit_selection.insert(CommitHash("aaaaaaaa".into()));
@@ -1280,15 +1305,18 @@ mod tests {
         assert!(info.ends_with("first"));
 
         assert_eq!(state.selected_commit_message_for_copy(), None);
-        state.current_commit_detail = Some(CommitDetail {
-            commit: state.branch_commits.items[0].clone(),
-            author_email: "ada@example.invalid".into(),
-            committer: "Ada".into(),
-            committer_email: "ada@example.invalid".into(),
-            committed_at: "2026-07-16".into(),
-            message: "first\n\nfull body".into(),
-            files: Vec::new(),
-        });
+        state.model.set_commit_detail(
+            RepositoryId(0),
+            CommitDetail {
+                commit: commits[0].clone(),
+                author_email: "ada@example.invalid".into(),
+                committer: "Ada".into(),
+                committer_email: "ada@example.invalid".into(),
+                committed_at: "2026-07-16".into(),
+                message: "first\n\nfull body".into(),
+                files: Vec::new(),
+            },
+        );
         assert_eq!(
             state.selected_commit_message_for_copy().as_deref(),
             Some("first\n\nfull body")

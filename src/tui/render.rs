@@ -10,15 +10,24 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     app::{
         AppState, BranchTreeNode, ChangeGroup, ChangesTreeNode, ConfirmDialog, DiffViewMode,
-        FilterTarget, FocusPanel, GlobalMode, PROMPT_COMMAND_SPECS, RemoteEditKind,
-        RemoteInputField, Screen, ShortcutContext, modal_shortcut_set,
+        FilterTarget, GlobalMode, PROMPT_OPERATION_SPECS, PanelId, RemoteEditKind,
+        RemoteInputField, RepositoryId, Resource, ViewId, modal_shortcut_set,
     },
-    config::{FooterMode, FooterOverflow},
+    config::{CommitListDensityConfig, FooterMode, FooterOverflow},
     domain::{DiffCellKind, DiffLineKind, FileDiff, side_by_side_rows},
 };
 
 const FOCUSED_BORDER: Color = Color::Yellow;
 const NORMAL_BORDER: Color = Color::DarkGray;
+
+fn resource_message<T>(resource: Option<&Resource<T>>, loading: &str, empty: &str) -> String {
+    match resource {
+        Some(Resource::Loading) => loading.into(),
+        Some(Resource::Failed(error)) => format!("Load failed: {error}"),
+        Some(Resource::NotLoaded) => "Not loaded".into(),
+        Some(Resource::Ready(_)) | None => empty.into(),
+    }
+}
 
 /// Git metadata and file contents are untrusted terminal input. Never let C0
 /// controls, escape sequences, or bidi overrides reach the backend verbatim.
@@ -59,13 +68,13 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
         .split(area);
 
     render_status_bar(frame, app, rows[0]);
-    match app.screen {
-        Screen::BranchOverview => render_branch_overview(frame, app, rows[1]),
-        Screen::CommitDetail => render_commit_detail(frame, app, rows[1]),
-        Screen::FileDiffDetail => render_file_diff(frame, app, rows[1], area.width),
-        Screen::Reflog => render_reflog(frame, app, rows[1]),
-        Screen::Changes => render_changes(frame, app, rows[1], area.width),
-        Screen::Remotes => render_remotes(frame, app, rows[1]),
+    match app.view_projection().view {
+        ViewId::History => render_branch_overview(frame, app, rows[1]),
+        ViewId::Commit => render_commit_detail(frame, app, rows[1]),
+        ViewId::FileDiff => render_file_diff(frame, app, rows[1], area.width),
+        ViewId::Reflog => render_reflog(frame, app, rows[1]),
+        ViewId::Changes => render_changes(frame, app, rows[1], area.width),
+        ViewId::Remotes => render_remotes(frame, app, rows[1]),
     }
     if footer_height > 0 {
         render_hotkeys(frame, app, rows[2]);
@@ -118,20 +127,21 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             )
         },
     );
-    let selected_commit = match app.screen {
-        Screen::Reflog => app
+    let view = app.view_projection().view;
+    let selected_commit = match view {
+        ViewId::Reflog => app
             .selected_reflog()
             .map_or("—", |entry| entry.short_hash.as_str()),
-        Screen::Changes | Screen::Remotes => "—",
+        ViewId::Changes | ViewId::Remotes => "—",
         _ => app
             .selected_commit()
             .map_or("—", |commit| commit.short_hash.as_str()),
     };
-    let selected_file = match app.screen {
-        Screen::Changes => app
+    let selected_file = match view {
+        ViewId::Changes => app
             .selected_change()
             .map_or("—", |(_, change)| change.path.as_str()),
-        Screen::Remotes => "—",
+        ViewId::Remotes => "—",
         _ => app.selected_file().map_or("—", |file| file.path.as_str()),
     };
     let mode = match app.mode {
@@ -144,6 +154,7 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         GlobalMode::Chord { .. } => "SHORTCUT",
         GlobalMode::CommandPrompt { .. } => "COMMAND",
         GlobalMode::ShortcutHelp { .. } => "HELP",
+        GlobalMode::OperationPalette { .. } => "OPERATIONS",
         GlobalMode::Error => "ERROR",
     };
     let spinner = if app.is_loading() {
@@ -158,7 +169,7 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         format!(
             " {repo} [{}/{}] | {branch} | {mode}{spinner} | S{} M{} U{} C{} | ↑{}↓{} ",
             app.active_repository_index.map_or(0, |index| index + 1),
-            app.repositories.len(),
+            app.repository_count(),
             active_repository.map_or(0, |repo| repo.status.staged),
             active_repository.map_or(0, |repo| repo.status.modified),
             active_repository.map_or(0, |repo| repo.status.untracked),
@@ -170,14 +181,14 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         format!(
             " repo={repo} ({}/{}) | branch={branch} | op={mode}{spinner} | {counts} | {tracking} | selected={} ",
             app.active_repository_index.map_or(0, |index| index + 1),
-            app.repositories.len(),
+            app.repository_count(),
             app.commit_selection.len()
         )
     } else {
         format!(
             " repo={repo} ({}/{}) | branch={branch} | head={head} | commit={selected_commit} | file={selected_file} | op={mode}{spinner} | {counts} | {tracking} | selected={} ",
             app.active_repository_index.map_or(0, |index| index + 1),
-            app.repositories.len(),
+            app.repository_count(),
             app.commit_selection.len()
         )
     };
@@ -188,10 +199,18 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     );
 }
 
-fn columns(area: Rect) -> [Rect; 2] {
+fn columns(area: Rect, app: &AppState) -> [Rect; 2] {
+    let left = app
+        .config
+        .views
+        .view(app.view_projection().view)
+        .left_width_percent;
     let split = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .constraints([
+            Constraint::Percentage(left),
+            Constraint::Percentage(100 - left),
+        ])
         .split(area);
     [split[0], split[1]]
 }
@@ -203,20 +222,33 @@ fn list_state(selected: Option<usize>) -> ListState {
 }
 
 fn render_branch_overview(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let [left, right] = columns(area);
+    let [left, right] = columns(area, app);
     render_branches(frame, app, left);
-    render_commits(frame, app, right, CommitListDensity::Detailed);
+    render_commits(
+        frame,
+        app,
+        right,
+        app.config.views.view(ViewId::History).commit_density,
+    );
 }
 
 fn render_reflog(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let [left, right] = columns(area);
-    let items = if app.reflog_entries.is_empty() {
-        vec![ListItem::new(Line::styled(
+    let [left, right] = columns(area, app);
+    let entries = app.reflog_entries();
+    let items = if entries.is_empty() {
+        let message = resource_message(
+            app.reflog_repository_index
+                .and_then(|index| app.model.repository(RepositoryId(index)))
+                .map(|repository| &repository.reflog),
+            "Loading reflog…",
             "No reflog entries",
+        );
+        vec![ListItem::new(Line::styled(
+            terminal_safe(&message),
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        app.reflog_entries
+        entries
             .iter()
             .map(|entry| {
                 ListItem::new(Line::from(vec![
@@ -240,7 +272,10 @@ fn render_reflog(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             .collect()
     };
     let list = List::new(items)
-        .block(panel_block("Reflog", app.focus == FocusPanel::ReflogList))
+        .block(panel_block(
+            "Reflog",
+            app.view_projection().focused == PanelId::Reflog,
+        ))
         .highlight_symbol("▶ ")
         .highlight_style(
             Style::default()
@@ -248,7 +283,7 @@ fn render_reflog(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         );
-    let selected = (!app.reflog_entries.is_empty())
+    let selected = (!entries.is_empty())
         .then_some(app.selection.selected_reflog_index)
         .flatten();
     frame.render_stateful_widget(list, left, &mut list_state(selected));
@@ -299,14 +334,22 @@ fn render_reflog(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 fn render_remotes(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let [left, right] = columns(area);
-    let items = if app.remotes.is_empty() {
-        vec![ListItem::new(Line::styled(
+    let [left, right] = columns(area, app);
+    let remotes = app.remotes();
+    let items = if remotes.is_empty() {
+        let message = resource_message(
+            app.remotes_repository_index
+                .and_then(|index| app.model.repository(RepositoryId(index)))
+                .map(|repository| &repository.remotes),
+            "Loading remotes…",
             "No remotes configured — press A to add one",
+        );
+        vec![ListItem::new(Line::styled(
+            terminal_safe(&message),
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        app.remotes
+        remotes
             .iter()
             .map(|remote| {
                 let routing = match (remote.is_upstream, remote.is_push_target) {
@@ -332,13 +375,13 @@ fn render_remotes(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             })
             .collect()
     };
-    let selected = (!app.remotes.is_empty())
+    let selected = (!remotes.is_empty())
         .then_some(app.selection.selected_remote_index)
         .flatten();
     let list = List::new(items)
         .block(panel_block(
             "Remotes  ★ upstream · F fetch · P push · ! blocked",
-            app.focus == FocusPanel::RemoteList,
+            app.view_projection().focused == PanelId::Remotes,
         ))
         .highlight_symbol("▶ ")
         .highlight_style(
@@ -475,7 +518,7 @@ fn change_checkbox(selected: usize, total: usize) -> &'static str {
 }
 
 fn render_changes(frame: &mut Frame<'_>, app: &AppState, area: Rect, terminal_width: u16) {
-    let [left, right] = columns(area);
+    let [left, right] = columns(area, app);
     let nodes = app.visible_changes_nodes();
     let staged_count = app.change_group_count(ChangeGroup::Staged);
     let unstaged_count = app.change_group_count(ChangeGroup::Unstaged);
@@ -547,7 +590,7 @@ fn render_changes(frame: &mut Frame<'_>, app: &AppState, area: Rect, terminal_wi
                 group,
                 change_index,
             } => {
-                let change = &app.changes[change_index];
+                let change = &app.working_tree_changes()[change_index];
                 let is_last = !nodes.iter().skip(position + 1).any(|candidate| {
                     matches!(candidate, ChangesTreeNode::File { group: candidate_group, .. } if *candidate_group == group)
                 });
@@ -600,7 +643,7 @@ fn render_changes(frame: &mut Frame<'_>, app: &AppState, area: Rect, terminal_wi
                 "Changes  S:{staged_count} U:{unstaged_count} · {} selected",
                 app.change_selection.len()
             ),
-            app.focus == FocusPanel::ChangesTree,
+            app.view_projection().focused == PanelId::Changes,
         ))
         .highlight_symbol("▶ ")
         .highlight_style(
@@ -635,7 +678,11 @@ fn render_changes(frame: &mut Frame<'_>, app: &AppState, area: Rect, terminal_wi
             group,
             change_index,
         }) => (
-            format!("{} — {}", group.title(), app.changes[change_index].path),
+            format!(
+                "{} — {}",
+                group.title(),
+                app.working_tree_changes()[change_index].path
+            ),
             "Loading selected file diff…".to_string(),
             Some(group),
         ),
@@ -654,7 +701,7 @@ fn render_changes(frame: &mut Frame<'_>, app: &AppState, area: Rect, terminal_wi
         app.diff_mode,
         app.wrap_diff,
         app.selection.changes_diff_scroll,
-        app.focus == FocusPanel::ChangesDiff,
+        app.view_projection().focused == PanelId::ChangesDiff,
         right,
         terminal_width,
         &title,
@@ -675,14 +722,17 @@ fn render_branches(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             .enumerate()
             .map(|(node_position, node)| match *node {
                 BranchTreeNode::Repository { repository_index } => {
-                    let repository = &app.repositories[repository_index];
+                    let repository = app
+                        .repository_node(repository_index)
+                        .expect("tree repository must exist in GitModel");
+                    let ui = app
+                        .repository_ui(RepositoryId(repository_index))
+                        .expect("tree repository must have UI state");
                     let active = app.active_repository_index == Some(repository_index);
-                    let disclosure = if repository.expanded { "▼" } else { "▶" };
-                    let state_marker = if repository.last_error.is_some() {
+                    let disclosure = if ui.expanded { "▼" } else { "▶" };
+                    let state_marker = if ui.last_error.is_some() {
                         " !"
-                    } else if repository.latest_status_job.is_some()
-                        || repository.latest_branches_job.is_some()
-                    {
+                    } else if ui.latest_status_job.is_some() || ui.latest_branches_job.is_some() {
                         " …"
                     } else {
                         ""
@@ -711,7 +761,7 @@ fn render_branches(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                                 "  {}{state_marker}",
                                 repository.display_path().display()
                             )),
-                            Style::default().fg(if repository.last_error.is_some() {
+                            Style::default().fg(if ui.last_error.is_some() {
                                 Color::Red
                             } else {
                                 Color::DarkGray
@@ -723,7 +773,9 @@ fn render_branches(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                     repository_index,
                     branch_index,
                 } => {
-                    let branch = &app.repositories[repository_index].branches[branch_index];
+                    let branch = app
+                        .repository_branch(repository_index, branch_index)
+                        .expect("tree branch must exist in GitModel");
                     let is_last_child = !matches!(
                         nodes.get(node_position + 1),
                         Some(BranchTreeNode::Branch {
@@ -764,7 +816,10 @@ fn render_branches(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         ))
     };
     let list = List::new(items)
-        .block(panel_block(title, app.focus == FocusPanel::BranchList))
+        .block(panel_block(
+            title,
+            app.view_projection().focused == PanelId::RepositoryBranches,
+        ))
         .highlight_symbol("▶ ")
         .highlight_style(
             Style::default()
@@ -776,12 +831,6 @@ fn render_branches(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         .then_some(app.selection.selected_branch_index)
         .flatten();
     frame.render_stateful_widget(list, area, &mut list_state(selected));
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CommitListDensity {
-    Compact,
-    Detailed,
 }
 
 fn commit_tags(decorations: &str) -> String {
@@ -813,16 +862,22 @@ fn commit_date_time(authored_at: &str) -> String {
     }
 }
 
-fn commit_items(app: &AppState, density: CommitListDensity) -> (Vec<ListItem<'static>>, bool) {
+fn commit_items(
+    app: &AppState,
+    density: CommitListDensityConfig,
+) -> (Vec<ListItem<'static>>, bool) {
     let commits = app.visible_commits();
     if commits.is_empty() {
+        let message = resource_message(
+            app.viewing_branch_id()
+                .as_ref()
+                .and_then(|branch| app.model.branch_commits_resource(branch)),
+            "Loading selected branch commits…",
+            "No commits",
+        );
         return (
             vec![ListItem::new(Line::styled(
-                if app.latest_commits_job.is_some() {
-                    "Loading selected branch commits…"
-                } else {
-                    "No commits"
-                },
+                terminal_safe(&message),
                 Style::default().fg(Color::DarkGray),
             ))],
             true,
@@ -845,7 +900,7 @@ fn commit_items(app: &AppState, density: CommitListDensity) -> (Vec<ListItem<'st
                 Span::raw(terminal_safe(&commit.subject)),
             ];
             match density {
-                CommitListDensity::Compact => {
+                CommitListDensityConfig::Compact => {
                     summary.push(Span::styled(
                         if commit.decorations.is_empty() {
                             String::new()
@@ -856,23 +911,30 @@ fn commit_items(app: &AppState, density: CommitListDensity) -> (Vec<ListItem<'st
                     ));
                     ListItem::new(Line::from(summary))
                 }
-                CommitListDensity::Detailed => {
+                CommitListDensityConfig::Detailed => {
                     let tags = commit_tags(&commit.decorations);
-                    let mut metadata = vec![
-                        Span::raw("  "),
-                        Span::styled("Date: ", Style::default().fg(Color::Cyan)),
-                        Span::styled(
-                            terminal_safe(&commit_date_time(&commit.authored_at)),
-                            Style::default().fg(Color::Gray),
-                        ),
-                        Span::raw("  "),
-                        Span::styled("Author: ", Style::default().fg(Color::Cyan)),
-                        Span::styled(
-                            terminal_safe(&commit.author),
-                            Style::default().fg(Color::Green),
-                        ),
-                    ];
-                    if !tags.is_empty() {
+                    let view = app.config.views.view(app.view_projection().view);
+                    let mut metadata = vec![Span::raw("  ")];
+                    if view.show_commit_datetime {
+                        metadata.extend([
+                            Span::styled("Date: ", Style::default().fg(Color::Cyan)),
+                            Span::styled(
+                                terminal_safe(&commit_date_time(&commit.authored_at)),
+                                Style::default().fg(Color::Gray),
+                            ),
+                        ]);
+                    }
+                    if view.show_commit_author {
+                        metadata.extend([
+                            Span::raw("  "),
+                            Span::styled("Author: ", Style::default().fg(Color::Cyan)),
+                            Span::styled(
+                                terminal_safe(&commit.author),
+                                Style::default().fg(Color::Green),
+                            ),
+                        ]);
+                    }
+                    if view.show_commit_tags && !tags.is_empty() {
                         metadata.extend([
                             Span::raw("  "),
                             Span::styled("Tags: ", Style::default().fg(Color::Cyan)),
@@ -887,7 +949,12 @@ fn commit_items(app: &AppState, density: CommitListDensity) -> (Vec<ListItem<'st
     (items, false)
 }
 
-fn render_commits(frame: &mut Frame<'_>, app: &AppState, area: Rect, density: CommitListDensity) {
+fn render_commits(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    area: Rect,
+    density: CommitListDensityConfig,
+) {
     let (items, empty) = commit_items(app, density);
     let selection_count = app.commit_selection.len();
     let title = if app.effective_commit_filter().is_empty() {
@@ -899,7 +966,10 @@ fn render_commits(frame: &mut Frame<'_>, app: &AppState, area: Rect, density: Co
         ))
     };
     let list = List::new(items)
-        .block(panel_block(title, app.focus == FocusPanel::CommitList))
+        .block(panel_block(
+            title,
+            app.view_projection().focused == PanelId::Commits,
+        ))
         .highlight_symbol("▶ ")
         .highlight_style(
             Style::default()
@@ -914,36 +984,46 @@ fn render_commits(frame: &mut Frame<'_>, app: &AppState, area: Rect, density: Co
 }
 
 fn render_commit_detail(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let [left, right] = columns(area);
-    render_commits(frame, app, left, CommitListDensity::Compact);
-    render_commit_column(frame, app, right, FocusPanel::CommitFileList);
+    let [left, right] = columns(area, app);
+    render_commits(
+        frame,
+        app,
+        left,
+        app.config.views.view(ViewId::Commit).commit_density,
+    );
+    render_commit_column(frame, app, right);
 }
 
 /// Shared Commit column used on both sides of the hierarchical transition:
 /// `Commits | Commit` -> `Commit | Diff`.
-fn render_commit_column(
-    frame: &mut Frame<'_>,
-    app: &AppState,
-    area: Rect,
-    files_focus: FocusPanel,
-) {
+fn render_commit_column(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(8), Constraint::Min(3)])
         .split(area);
     render_commit_metadata(frame, app, sections[0]);
-    render_changed_files(frame, app, sections[1], app.focus == files_focus);
+    render_changed_files(
+        frame,
+        app,
+        sections[1],
+        app.view_projection().focused == PanelId::Commit,
+    );
 }
 
 fn render_commit_metadata(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let lines = app.current_commit_detail.as_ref().map_or_else(
+    let detail = app.current_commit_detail();
+    let lines = detail.as_ref().map_or_else(
         || {
+            let message = resource_message(
+                app.selected_commit_id()
+                    .or_else(|| app.current_commit_id())
+                    .as_ref()
+                    .and_then(|commit| app.model.commit_metadata_resource(commit)),
+                "Loading selected commit…",
+                "No commit selected",
+            );
             vec![Line::styled(
-                if app.latest_commit_detail_job.is_some() {
-                    "Loading selected commit…"
-                } else {
-                    "No commit selected"
-                },
+                terminal_safe(&message),
                 Style::default().fg(Color::DarkGray),
             )]
         },
@@ -984,18 +1064,22 @@ fn render_commit_metadata(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 fn render_changed_files(frame: &mut Frame<'_>, app: &AppState, area: Rect, focused: bool) {
-    let files = app
-        .current_commit_detail
+    let detail = app.current_commit_detail();
+    let files = detail
         .as_ref()
         .map(|detail| detail.files.as_slice())
         .unwrap_or_default();
     let items = if files.is_empty() {
+        let message = resource_message(
+            app.selected_commit_id()
+                .or_else(|| app.current_commit_id())
+                .as_ref()
+                .and_then(|commit| app.model.commit_metadata_resource(commit)),
+            "Loading changed files…",
+            "No changed files",
+        );
         vec![ListItem::new(Line::styled(
-            if app.latest_commit_detail_job.is_some() {
-                "Loading changed files…"
-            } else {
-                "No changed files"
-            },
+            terminal_safe(&message),
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
@@ -1067,24 +1151,26 @@ fn file_kind_style(marker: &str) -> Style {
 }
 
 fn render_file_diff(frame: &mut Frame<'_>, app: &AppState, area: Rect, terminal_width: u16) {
-    let [left, right] = columns(area);
-    render_commit_column(frame, app, left, FocusPanel::FileList);
-    let empty_message = if app.latest_file_diff_job.is_some() {
-        "Loading selected file diff…"
-    } else {
-        "No diff loaded"
-    };
+    let [left, right] = columns(area, app);
+    render_commit_column(frame, app, left);
+    let empty_message = resource_message(
+        app.selected_file_id()
+            .as_ref()
+            .and_then(|file| app.model.file_diff_resource(file)),
+        "Loading selected file diff…",
+        "No diff loaded",
+    );
     render_diff_panel(
         frame,
-        app.current_file_diff.as_ref(),
+        app.current_file_diff(),
         app.diff_mode,
         app.wrap_diff,
         app.selection.diff_scroll,
-        app.focus == FocusPanel::DiffView,
+        app.view_projection().focused == PanelId::FileDiff,
         right,
         terminal_width,
         "Changes",
-        empty_message,
+        &empty_message,
     );
 }
 
@@ -1310,6 +1396,7 @@ fn render_hotkeys(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         | GlobalMode::EditingCommitMessage { .. }
         | GlobalMode::CommandPrompt { .. }
         | GlobalMode::ShortcutHelp { .. }
+        | GlobalMode::OperationPalette { .. }
         | GlobalMode::Error => format!(" {} ", modal_footer()),
         GlobalMode::EditingRemote { kind, field, .. } => match kind {
             RemoteEditKind::Add => format!(
@@ -1464,6 +1551,80 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let (title, lines, height) = match &app.mode {
+        GlobalMode::OperationPalette {
+            query, selected, ..
+        } => {
+            let operations = app.operation_palette_matches();
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled("Filter: ", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        terminal_safe(&format!("> {query}_")),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]),
+                Line::styled(
+                    format!(
+                        "{} available operation(s) for the originating focus",
+                        operations.len()
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Line::raw(""),
+            ];
+            if operations.is_empty() {
+                lines.push(Line::styled(
+                    "No operation matches this filter",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            } else {
+                let window = 18usize;
+                let start = selected
+                    .saturating_sub(window / 2)
+                    .min(operations.len().saturating_sub(window));
+                for (index, operation) in operations.iter().enumerate().skip(start).take(window) {
+                    let active = index == *selected;
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            if active { "▶ " } else { "  " },
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(
+                            format!(
+                                "{:<22}",
+                                terminal_safe(&app.config.keymap.display_bindings_for_view(
+                                    app.view_projection().view,
+                                    *operation,
+                                ))
+                            ),
+                            Style::default().fg(Color::Green),
+                        ),
+                        Span::styled(
+                            format!(
+                                "{:<22}",
+                                terminal_safe(&app.config.operation_label(*operation))
+                            ),
+                            if active {
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::Gray)
+                            },
+                        ),
+                        Span::styled(
+                            terminal_safe(operation.as_str()),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+            }
+            lines.extend([
+                Line::raw(""),
+                Line::raw("↑/↓ select · Enter run · Esc cancel"),
+            ]);
+            ("Operations — resolved for the originating focus", lines, 72)
+        }
         GlobalMode::CommandPrompt {
             input,
             validation_error,
@@ -1477,7 +1638,7 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 Line::raw(""),
                 Line::styled("Available commands:", Style::default().fg(Color::Cyan)),
             ];
-            lines.extend(PROMPT_COMMAND_SPECS.iter().map(|command| {
+            lines.extend(PROMPT_OPERATION_SPECS.iter().map(|command| {
                 Line::from(vec![
                     Span::styled(
                         format!("  {:<12}", terminal_safe(command.name)),
@@ -1504,7 +1665,7 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         ),
         GlobalMode::Confirming { dialog } => match dialog {
             ConfirmDialog::FetchRepository { repository_index } => {
-                let repository = app.repositories.get(*repository_index);
+                let repository = app.repository_node(*repository_index);
                 (
                     "Fetch repository",
                     vec![
@@ -1539,7 +1700,7 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 repository_index,
                 branch,
             } => {
-                let repository = app.repositories.get(*repository_index);
+                let repository = app.repository_node(*repository_index);
                 (
                     "Pull with rebase",
                     vec![
@@ -1577,7 +1738,7 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 repository_index,
                 branch,
             } => {
-                let repository = app.repositories.get(*repository_index);
+                let repository = app.repository_node(*repository_index);
                 (
                     "Push current branch",
                     vec![
@@ -1729,8 +1890,7 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 ];
                 for (index, commit) in commits.iter().enumerate() {
                     let subject = app
-                        .branch_commits
-                        .items
+                        .branch_commit_summaries()
                         .iter()
                         .find(|item| item.hash == *commit)
                         .map_or("", |item| item.subject.as_str());
@@ -1873,7 +2033,7 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         } => {
             let repository = app
                 .changes_repository_index
-                .and_then(|index| app.repositories.get(index))
+                .and_then(|index| app.repository_node(index))
                 .map_or_else(|| "—".to_string(), |repository| repository.display_name());
             let mut lines = vec![
                 Line::from(vec![
@@ -1985,7 +2145,18 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     };
 
     let help_popup = matches!(app.mode, GlobalMode::ShortcutHelp { .. });
-    let popup = centered_rect(if help_popup { 94 } else { 72 }, height, area);
+    let palette_popup = matches!(app.mode, GlobalMode::OperationPalette { .. });
+    let popup = centered_rect(
+        if help_popup {
+            94
+        } else if palette_popup {
+            88
+        } else {
+            72
+        },
+        height,
+        area,
+    );
     let popup_scroll = match app.mode {
         GlobalMode::ShortcutHelp { scroll } => {
             let viewport = usize::from(popup.height.saturating_sub(2)).max(1);
@@ -2014,10 +2185,7 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 fn shortcut_help_lines(app: &AppState) -> Vec<Line<'static>> {
-    let origin_focus = app
-        .previous_focus
-        .unwrap_or_else(|| app.default_focus_for_screen());
-    let current_context = ShortcutContext::from_view(app.screen, origin_focus);
+    let current_context = Some(app.focus_context().kind);
     let mut lines = vec![
         Line::styled(
             "Only global commands and the originating focus are shown.",
@@ -2029,7 +2197,10 @@ fn shortcut_help_lines(app: &AppState) -> Vec<Line<'static>> {
         ),
         Line::raw(""),
     ];
-    for section in app.config.shortcut_help_sections(current_context) {
+    for section in app
+        .config
+        .shortcut_help_sections_for_view(app.view_projection().view, current_context)
+    {
         let current = section.context.is_some() && section.context == current_context;
         lines.push(Line::styled(
             terminal_safe(&format!(
@@ -2069,12 +2240,29 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
-    use crate::config::{KeyStroke, ResolvedConfig};
     use crate::domain::{
-        ChangedFile, Commit, CommitDetail, CommitHash, DiffHunk, DiffLine, FileChangeKind,
-        FileDiff, GitPath, ReflogEntry, RemoteInfo, Repository, WorkingTreeChange,
+        BranchName, ChangedFile, Commit, CommitDetail, CommitHash, DiffHunk, DiffLine,
+        FileChangeKind, FileDiff, GitPath, ReflogEntry, RemoteInfo, Repository, WorkingTreeChange,
         WorkingTreeStatus,
     };
+    use crate::{
+        app::{BranchId, FocusKind, FocusRole, OperationId, RepositoryId},
+        config::{KeyStroke, ResolvedConfig},
+    };
+
+    fn focus(state: &mut AppState, kind: FocusKind, role: FocusRole) {
+        state.set_focus_layer(kind, role);
+    }
+
+    fn seed_commits(state: &mut AppState, commits: Vec<Commit>) {
+        let branch = BranchId {
+            repository: RepositoryId(0),
+            name: BranchName("main".into()),
+        };
+        state.model.replace_branch_commits(&branch, commits);
+        state.viewing_branch = Some(branch);
+        state.ensure_valid_commit_selection();
+    }
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         terminal
@@ -2119,16 +2307,18 @@ mod tests {
 
     #[test]
     fn renders_detailed_commits_on_the_right_and_compact_commits_on_the_left() {
-        let mut state = AppState::default();
-        state.branch_commits.items.push(Commit {
-            hash: CommitHash("0123456789abcdef".into()),
-            short_hash: "0123456".into(),
-            author: "Ada Lovelace".into(),
-            authored_at: "2026-07-16T10:20:30+08:00".into(),
-            decorations: "HEAD -> main, tag: v1.2.3, origin/main".into(),
-            subject: "show rich commit metadata".into(),
-        });
-        state.ensure_valid_commit_selection();
+        let mut state = AppState::with_repository_paths(vec!["/repo".into()]);
+        seed_commits(
+            &mut state,
+            vec![Commit {
+                hash: CommitHash("0123456789abcdef".into()),
+                short_hash: "0123456".into(),
+                author: "Ada Lovelace".into(),
+                authored_at: "2026-07-16T10:20:30+08:00".into(),
+                decorations: "HEAD -> main, tag: v1.2.3, origin/main".into(),
+                subject: "show rich commit metadata".into(),
+            }],
+        );
 
         let backend = TestBackend::new(160, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2138,8 +2328,7 @@ mod tests {
         assert!(rendered.contains("Author: Ada Lovelace"));
         assert!(rendered.contains("Tags: v1.2.3"));
 
-        state.screen = Screen::CommitDetail;
-        state.focus = FocusPanel::CommitList;
+        focus(&mut state, FocusKind::Commit, FocusRole::Entity);
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let rendered = buffer_text(&terminal);
         assert!(!rendered.contains("Date: 2026-07-16 10:20"));
@@ -2150,16 +2339,18 @@ mod tests {
 
     #[test]
     fn detailed_commit_omits_the_tag_field_when_no_git_tag_exists() {
-        let mut state = AppState::default();
-        state.branch_commits.items.push(Commit {
-            hash: CommitHash("0123456789abcdef".into()),
-            short_hash: "0123456".into(),
-            author: "Ada Lovelace".into(),
-            authored_at: "2026-07-16T09:05:30Z".into(),
-            decorations: "HEAD -> main, origin/main".into(),
-            subject: "no tag on this commit".into(),
-        });
-        state.ensure_valid_commit_selection();
+        let mut state = AppState::with_repository_paths(vec!["/repo".into()]);
+        seed_commits(
+            &mut state,
+            vec![Commit {
+                hash: CommitHash("0123456789abcdef".into()),
+                short_hash: "0123456".into(),
+                author: "Ada Lovelace".into(),
+                authored_at: "2026-07-16T09:05:30Z".into(),
+                decorations: "HEAD -> main, origin/main".into(),
+                subject: "no tag on this commit".into(),
+            }],
+        );
 
         let backend = TestBackend::new(160, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2172,19 +2363,19 @@ mod tests {
 
     #[test]
     fn renders_only_the_current_chord_level_in_the_footer() {
-        let mut state = AppState {
-            focus: FocusPanel::CommitList,
-            ..AppState::default()
-        };
-        state.branch_commits.items.push(Commit {
-            hash: CommitHash("0123456789abcdef".into()),
-            short_hash: "01234567".into(),
-            author: "Ada".into(),
-            authored_at: "2026-07-16".into(),
-            decorations: String::new(),
-            subject: "copy this commit".into(),
-        });
-        state.ensure_valid_commit_selection();
+        let mut state = AppState::with_repository_paths(vec!["/repo".into()]);
+        focus(&mut state, FocusKind::Commit, FocusRole::Collection);
+        seed_commits(
+            &mut state,
+            vec![Commit {
+                hash: CommitHash("0123456789abcdef".into()),
+                short_hash: "01234567".into(),
+                author: "Ada".into(),
+                authored_at: "2026-07-16".into(),
+                decorations: String::new(),
+                subject: "copy this commit".into(),
+            }],
+        );
 
         let backend = TestBackend::new(200, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2210,12 +2401,9 @@ mod tests {
 
     #[test]
     fn renders_current_focus_shortcut_reference_from_effective_operation_tables() {
-        let state = AppState {
-            focus: FocusPanel::Popup,
-            previous_focus: Some(FocusPanel::CommitList),
-            mode: GlobalMode::ShortcutHelp { scroll: 0 },
-            ..AppState::default()
-        };
+        let mut state = AppState::default();
+        focus(&mut state, FocusKind::Commit, FocusRole::Collection);
+        state.mode = GlobalMode::ShortcutHelp { scroll: 0 };
         let backend = TestBackend::new(180, 80);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &state)).unwrap();
@@ -2224,19 +2412,16 @@ mod tests {
         assert!(rendered.contains("app.shortcuts"));
         assert!(rendered.contains("app.command_prompt"));
         assert!(!rendered.contains("Ctrl+?"));
-        assert!(rendered.contains("overview.commits"));
+        assert!(rendered.contains("[commit]"));
         assert!(rendered.contains("commit.copy.message"));
-        assert!(rendered.contains("▶ Commits"));
-        assert!(!rendered.contains("branch.tree"));
+        assert!(rendered.contains("▶ Commit"));
+        assert!(!rendered.contains("[branch]"));
         assert!(!rendered.contains("file.copy.absolute_path"));
         assert!(!rendered.contains("commit submission"));
 
-        let state = AppState {
-            focus: FocusPanel::Popup,
-            previous_focus: Some(FocusPanel::CommitList),
-            mode: GlobalMode::ShortcutHelp { scroll: u16::MAX },
-            ..AppState::default()
-        };
+        let mut state = AppState::default();
+        focus(&mut state, FocusKind::Commit, FocusRole::Collection);
+        state.mode = GlobalMode::ShortcutHelp { scroll: u16::MAX };
         let backend = TestBackend::new(180, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &state)).unwrap();
@@ -2251,8 +2436,6 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let state = AppState {
-            focus: FocusPanel::Popup,
-            previous_focus: Some(FocusPanel::BranchList),
             mode: GlobalMode::CommandPrompt {
                 input: "unknown".into(),
                 validation_error: Some(
@@ -2271,20 +2454,47 @@ mod tests {
     }
 
     #[test]
+    fn renders_searchable_operation_palette_from_registry_ids() {
+        let backend = TestBackend::new(150, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            mode: GlobalMode::OperationPalette {
+                query: "help".into(),
+                selected: 0,
+                operations: vec![
+                    OperationId::AppShortcutHelp,
+                    OperationId::AppRefresh,
+                    OperationId::NavigationDown,
+                ],
+            },
+            ..AppState::default()
+        };
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("Operations"));
+        assert!(rendered.contains("> help_"));
+        assert!(rendered.contains("app.shortcuts"));
+        assert!(rendered.contains("h"));
+        assert!(!rendered.contains("app.refresh"));
+    }
+
+    #[test]
     fn configured_footer_rows_do_not_replace_the_status_bar() {
         let mut config = ResolvedConfig::default();
         config.footer.max_rows = 2;
         let mut state = AppState::with_config(vec!["/repo".into()], Arc::new(config));
-        state.focus = FocusPanel::CommitList;
-        state.branch_commits.items.push(Commit {
-            hash: CommitHash("0123456789abcdef".into()),
-            short_hash: "01234567".into(),
-            author: "Ada".into(),
-            authored_at: "2026-07-16".into(),
-            decorations: String::new(),
-            subject: "many footer actions".into(),
-        });
-        state.ensure_valid_commit_selection();
+        focus(&mut state, FocusKind::Commit, FocusRole::Collection);
+        seed_commits(
+            &mut state,
+            vec![Commit {
+                hash: CommitHash("0123456789abcdef".into()),
+                short_hash: "01234567".into(),
+                author: "Ada".into(),
+                authored_at: "2026-07-16".into(),
+                decorations: String::new(),
+                subject: "many footer actions".into(),
+            }],
+        );
 
         let backend = TestBackend::new(42, 15);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2343,10 +2553,12 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = AppState {
-            screen: Screen::Reflog,
-            focus: FocusPanel::ReflogList,
             reflog_repository_index: Some(0),
-            reflog_entries: vec![ReflogEntry {
+            ..AppState::with_repository_paths(vec!["/repo".into()])
+        };
+        state.model.set_reflog(
+            RepositoryId(0),
+            vec![ReflogEntry {
                 hash: CommitHash("0123456789abcdef".into()),
                 short_hash: "0123456".into(),
                 selector: "HEAD@{0}".into(),
@@ -2355,9 +2567,9 @@ mod tests {
                 author: "Ada".into(),
                 authored_at: "2026-07-16T00:00:00Z".into(),
             }],
-            ..AppState::default()
-        };
+        );
         state.ensure_valid_reflog_selection();
+        focus(&mut state, FocusKind::Reflog, FocusRole::Entity);
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let rendered = buffer_text(&terminal);
         assert!(rendered.contains("HEAD@{0}"));
@@ -2371,19 +2583,21 @@ mod tests {
         let backend = TestBackend::new(160, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = AppState {
-            screen: Screen::Remotes,
-            focus: FocusPanel::RemoteList,
             remotes_repository_index: Some(0),
-            remotes: vec![RemoteInfo {
+            ..AppState::with_repository_paths(vec!["/repo".into()])
+        };
+        state.model.set_remotes(
+            RepositoryId(0),
+            vec![RemoteInfo {
                 name: "origin".into(),
                 fetch_urls: vec!["ssh://fetch.example/repo.git".into()],
                 push_urls: vec!["ssh://push.example/repo.git".into()],
                 is_upstream: true,
                 is_push_target: false,
             }],
-            ..AppState::default()
-        };
+        );
         state.ensure_valid_remote_selection();
+        focus(&mut state, FocusKind::Remote, FocusRole::Entity);
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let rendered = buffer_text(&terminal);
         assert!(rendered.contains("Remotes"));
@@ -2400,18 +2614,10 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let path = GitPath::from("src/main.rs");
         let mut state = AppState {
-            screen: Screen::Changes,
-            focus: FocusPanel::ChangesTree,
             changes_repository_index: Some(0),
-            changes: vec![WorkingTreeChange {
-                index_status: 'M',
-                worktree_status: ' ',
-                path: path.clone(),
-                old_path: None,
-            }],
             current_changes_diff: Some(FileDiff {
                 commit: CommitHash("INDEX".into()),
-                path,
+                path: path.clone(),
                 old_path: None,
                 header: Vec::new(),
                 hunks: vec![DiffHunk {
@@ -2440,11 +2646,21 @@ mod tests {
             current_changes_diff_group: Some(ChangeGroup::Staged),
             change_selection: std::collections::HashSet::from([crate::app::ChangeSelection {
                 group: ChangeGroup::Staged,
-                path: GitPath::from("src/main.rs"),
+                path: path.clone(),
             }]),
-            ..AppState::default()
+            ..AppState::with_repository_paths(vec!["/repo".into()])
         };
+        state.model.set_working_tree(
+            RepositoryId(0),
+            vec![WorkingTreeChange {
+                index_status: 'M',
+                worktree_status: ' ',
+                path,
+                old_path: None,
+            }],
+        );
         state.ensure_valid_changes_selection();
+        focus(&mut state, FocusKind::Changes, FocusRole::Entity);
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let rendered = buffer_text(&terminal);
         assert!(rendered.contains("Changes  S:1 U:0"));
@@ -2468,21 +2684,24 @@ mod tests {
     fn renders_commit_message_editor_and_validation() {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        let state = AppState {
-            screen: Screen::Changes,
-            focus: FocusPanel::Popup,
-            changes: vec![WorkingTreeChange {
+        let mut state = AppState {
+            changes_repository_index: Some(0),
+            mode: GlobalMode::EditingCommitMessage {
+                input: "add selected files".into(),
+                validation_error: Some("example validation".into()),
+            },
+            ..AppState::with_repository_paths(vec!["/repo".into()])
+        };
+        state.model.set_working_tree(
+            RepositoryId(0),
+            vec![WorkingTreeChange {
                 index_status: 'A',
                 worktree_status: ' ',
                 path: GitPath::from("new.txt"),
                 old_path: None,
             }],
-            mode: GlobalMode::EditingCommitMessage {
-                input: "add selected files".into(),
-                validation_error: Some("example validation".into()),
-            },
-            ..AppState::default()
-        };
+        );
+        focus(&mut state, FocusKind::Changes, FocusRole::Entity);
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let rendered = buffer_text(&terminal);
         assert!(rendered.contains("Create commit"));
@@ -2497,14 +2716,16 @@ mod tests {
         let backend = TestBackend::new(140, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = AppState::with_repository_paths(vec!["/tmp/example".into()]);
-        state.repositories[0].repository = Some(Repository {
-            root: "/tmp/example".into(),
-            name: "example".into(),
-            current_branch: Some(crate::domain::BranchName("main".into())),
-            head: CommitHash(String::new()),
-            status: WorkingTreeStatus::default(),
-        });
-        state.repositories[0].ensure_current_branch_visible();
+        state.model.set_repository_summary(
+            RepositoryId(0),
+            Repository {
+                root: "/tmp/example".into(),
+                name: "example".into(),
+                current_branch: Some(crate::domain::BranchName("main".into())),
+                head: CommitHash(String::new()),
+                status: WorkingTreeStatus::default(),
+            },
+        );
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let rendered = buffer_text(&terminal);
         assert!(rendered.contains("example"));
@@ -2520,8 +2741,6 @@ mod tests {
             let state = AppState::default();
             terminal.draw(|frame| render(frame, &state)).unwrap();
             let help = AppState {
-                focus: FocusPanel::Popup,
-                previous_focus: Some(FocusPanel::BranchList),
                 mode: GlobalMode::ShortcutHelp { scroll: u16::MAX },
                 ..AppState::default()
             };
@@ -2549,50 +2768,50 @@ mod tests {
             hunks: Vec::new(),
             is_binary: false,
         };
-        let mut state = AppState {
-            screen: Screen::FileDiffDetail,
-            focus: FocusPanel::DiffView,
-            diff_mode: DiffViewMode::SideBySide,
-            current_commit_detail: Some(CommitDetail {
-                commit: commit.clone(),
-                author_email: "test@example.invalid".into(),
-                committer: "Test".into(),
-                committer_email: "test@example.invalid".into(),
-                committed_at: "2026-07-16T00:00:00Z".into(),
-                message: "change".into(),
-                files: vec![file],
-            }),
-            current_file_diff: Some(FileDiff {
-                commit: commit.hash,
-                path,
-                old_path: None,
-                header: vec!["diff --git a/file.rs b/file.rs".into()],
-                hunks: vec![DiffHunk {
-                    header: "@@ -1 +1 @@".into(),
-                    old_start: 1,
-                    old_count: 1,
-                    new_start: 1,
-                    new_count: 1,
-                    lines: vec![
-                        DiffLine {
-                            old_line_no: Some(1),
-                            new_line_no: None,
-                            kind: DiffLineKind::Deletion,
-                            text: "old".into(),
-                        },
-                        DiffLine {
-                            old_line_no: None,
-                            new_line_no: Some(1),
-                            kind: DiffLineKind::Addition,
-                            text: "new".into(),
-                        },
-                    ],
-                }],
-                is_binary: false,
-            }),
-            ..AppState::default()
+        let detail = CommitDetail {
+            commit: commit.clone(),
+            author_email: "test@example.invalid".into(),
+            committer: "Test".into(),
+            committer_email: "test@example.invalid".into(),
+            committed_at: "2026-07-16T00:00:00Z".into(),
+            message: "change".into(),
+            files: vec![file],
         };
+        let diff = FileDiff {
+            commit: commit.hash.clone(),
+            path,
+            old_path: None,
+            header: vec!["diff --git a/file.rs b/file.rs".into()],
+            hunks: vec![DiffHunk {
+                header: "@@ -1 +1 @@".into(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![
+                    DiffLine {
+                        old_line_no: Some(1),
+                        new_line_no: None,
+                        kind: DiffLineKind::Deletion,
+                        text: "old".into(),
+                    },
+                    DiffLine {
+                        old_line_no: None,
+                        new_line_no: Some(1),
+                        kind: DiffLineKind::Addition,
+                        text: "new".into(),
+                    },
+                ],
+            }],
+            is_binary: false,
+        };
+        let mut state = AppState::with_repository_paths(vec!["/repo".into()]);
+        state.diff_mode = DiffViewMode::SideBySide;
+        seed_commits(&mut state, vec![commit]);
+        state.model.set_commit_detail(RepositoryId(0), detail);
+        state.model.set_file_diff(RepositoryId(0), diff);
         state.selection.selected_file_index = Some(0);
+        focus(&mut state, FocusKind::Diff, FocusRole::Content);
 
         let backend = TestBackend::new(160, 30);
         let mut terminal = Terminal::new(backend).unwrap();

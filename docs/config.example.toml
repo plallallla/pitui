@@ -31,6 +31,11 @@ visible = true
 label = "command"
 priority = 100
 
+[ui.footer.commands."app.operation_palette"]
+visible = true
+label = "operations"
+priority = 100
+
 [ui.footer.commands."app.refresh"]
 visible = true
 label = "refresh"
@@ -59,6 +64,9 @@ bindings = ["h"]
 
 [keybindings.commands."app.command_prompt"]
 bindings = ["Ctrl+`"]
+
+[keybindings.commands."app.operation_palette"]
+bindings = ["Ctrl+P"]
 
 [keybindings.commands."navigation.up"]
 bindings = ["w", "Up", "k"]
@@ -110,6 +118,23 @@ bindings = ["Ctrl+C r"]
 
 [diff]
 default_mode = "unified" # unified | side-by-side
+
+# Per-view layout/detail settings. Known ids: history, commit, file-diff,
+# changes, reflog, remotes. Width must be 20..80.
+[views.history]
+left_width_percent = 36
+commit_density = "detailed" # compact | detailed
+show_commit_author = true
+show_commit_datetime = true
+show_commit_tags = true
+
+[views.commit]
+left_width_percent = 36
+commit_density = "compact"
+
+# A view-scoped binding replaces the global binding only in this view.
+[views.history.operations."app.refresh"]
+bindings = ["Ctrl+R"]
 
 [logging]
 enabled = true

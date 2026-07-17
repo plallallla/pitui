@@ -38,6 +38,7 @@ Any main view -- Ctrl+G --> Changes -> Staged / Unstaged -> Files + Diff
 - commit 支持统一多选：可复制一个或多个完整 commit hash，也可按历史顺序确认并 cherry-pick 所选 commits；当前 commit info 和完整 message 仍可单独复制。
 - `Ctrl-C` 二级快捷键按 focus 挂载：Commits 复制 hash/info/message，文件列复制文件名/绝对路径/仓库相对路径；Diff 等其他列不会误挂载复制操作。
 - `h` 打开只包含全局命令与当前 focus 操作的快捷键参考框；Ctrl+Backtick 打开快捷命令框，输入 `help` 可进入同一指南。
+- `Ctrl-P` 打开当前 focus 的可搜索操作面板；面板与快捷键、footer、帮助共用同一 `OperationRegistry`，危险操作仍进入原确认流程。
 - 顶部状态栏只保留仓库、分支、选中对象、操作、工作区计数与 tracking 等信息，不再显示 `view`、`viewing`、`focus`。
 - 不进行定时 Git 状态轮询；所有主界面统一使用 `Ctrl-R` 手动刷新，避免状态栏周期性闪烁。
 - cherry-pick 只操作 Commits 中通过 `Space` 明确多选的 commits，不维护额外队列。
@@ -144,6 +145,9 @@ bindings = ["h"]
 [keybindings.commands."app.command_prompt"]
 bindings = ["Ctrl+`"]
 
+[keybindings.commands."app.operation_palette"]
+bindings = ["Ctrl+P"]
+
 [keybindings.commands."navigation.up"]
 bindings = ["w", "Up", "k"]
 
@@ -161,6 +165,17 @@ bindings = ["Ctrl+C h"]
 
 [keybindings.commands."file.copy.relative_path"]
 bindings = ["Ctrl+C r"]
+
+[views.history]
+left_width_percent = 42
+commit_density = "detailed" # compact | detailed
+show_commit_author = true
+show_commit_datetime = true
+show_commit_tags = true
+
+# 同一 operation 可在某个 view 使用不同绑定；未配置时继承全局绑定。
+[views.history.operations."app.refresh"]
+bindings = ["Ctrl+R"]
 
 [logging]
 enabled = true
@@ -180,12 +195,12 @@ rotate_on_start = false
 
 未出现的 command 继承默认绑定，`bindings = []` 才会解除绑定。隐藏 footer 提示不会解除
 按键；确认弹窗、hard reset 二次确认和文本编辑按键属于安全保留交互，不能通过配置绕过。
-完整字段和示例见 [`docs/config.example.toml`](docs/config.example.toml)，全部稳定 command id
+完整字段和示例见 [`docs/config.example.toml`](docs/config.example.toml)，全部稳定 operation id
 可通过 `--print-effective-config` 查看；设计与约束见
-[`docs/global-configuration-design.md`](docs/global-configuration-design.md)。按 Branch Overview、
-Commit Detail、File Diff、Changes、Reflog、Remotes 分层的 Schema v2 方案见
-[`docs/view-configuration-design.md`](docs/view-configuration-design.md)；该文档目前是设计稿，
-尚未作为可解析配置开放。
+[`docs/global-configuration-design.md`](docs/global-configuration-design.md)。`views.history`、
+`views.commit`、`views.file-diff`、`views.changes`、`views.reflog`、`views.remotes` 已支持独立
+栏宽、commit density/字段开关及 operation binding 覆盖；完整分层演进方案见
+[`docs/view-configuration-design.md`](docs/view-configuration-design.md)。
 
 ## 后台操作日志
 
@@ -214,11 +229,12 @@ PITUI_LOG=/path/to/pitui.jsonl pitui /repo
 
 ## 快捷键
 
-下表是内置默认绑定。普通模式由 `CommandSpec` 可调用跳表按 `screen + focus` 挂载命令；
+下表是内置默认绑定。普通模式由 `OperationSpec` 可调用跳表按语义 `FocusKind` 挂载操作；
 底部提示、输入解析、配置冲突检查和全局帮助框读取同一张表，只显示当前状态下按下后确实
 会有动作的“下一键”。二级/三级快捷键只在按下当前前缀后逐级显示后续键。commit 提交、
 remote 编辑、确认框等 modal 模式使用独占的可调用输入表，普通 focus 表不会穿透进去。
-绑定、提示是否可见、label、priority、行数和 overflow 均可由全局配置独立控制。
+`Ctrl-P` 操作面板也从相同的 resolved operation set 生成。绑定、提示是否可见、label、
+priority、行数、overflow 以及 view 局部绑定均可配置。
 
 ### 全局
 
@@ -226,6 +242,7 @@ remote 编辑、确认框等 modal 模式使用独占的可调用输入表，普
 |---|---|
 | `q` | 普通模式退出；普通确认/错误弹窗中取消或关闭；哈希输入弹窗中作为输入字符 |
 | `h` | 从任意普通 focus 打开快捷键参考框，只显示全局命令和来源 focus 的操作；`w/s`、`↑/↓`、PageUp/PageDown、Home/End 滚动，`h` / `Enter` / `Esc` / `q` 关闭 |
+| `Ctrl-P` | 打开当前 focus 的操作面板；输入过滤，`↑/↓` 选择，`Enter` 执行，`Esc` 关闭 |
 | <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> | 打开快捷命令框；输入 `help` 并按 `Enter` 返回当前 focus 的快捷键指南；`Ctrl-Space` 不绑定任何操作 |
 | `Ctrl-G` | 从任意主界面打开独立 Changes；再次按下或按 `Esc` 返回原界面和原焦点 |
 | `Ctrl-C` | Commits focus 进入 commit 复制表；Commit/File 列 focus 进入文件路径复制表；其他 focus 退出 |
@@ -257,7 +274,7 @@ remote 编辑、确认框等 modal 模式使用独占的可调用输入表，普
 | Commits | `Space` | 加入/移出 commit 多选集合（复制 hash 与 cherry-pick 共用） |
 | Commits | `Ctrl-C` → `h` | 按当前列表顺序复制所有多选 commit 的完整 hash；无多选时复制当前 hash |
 | Commits | `Ctrl-C` → `i` | 复制当前 commit info（hash、author、date、refs 和 message） |
-| Commits | `Ctrl-C` → `m` | 复制当前完整 commit message；需要时后台加载 body，但不改变 screen/focus |
+| Commits | `Ctrl-C` → `m` | 复制当前完整 commit message；需要时后台加载 body，但不改变语义 focus |
 | Commits | `/` | 过滤 commits |
 | Commits | `y` | 对已多选 commits 打开 cherry-pick 确认弹窗；未多选时不可执行 |
 | Commits | `R` | 选择 soft/mixed/hard reset 模式并确认 |
@@ -395,25 +412,31 @@ Stage 使用 path-limited `git add --all -- <paths>`；unstage 使用 path-limit
 ## 架构
 
 ```text
-Keyboard Event
-  -> Action
-  -> App Controller / Store
-  -> GitRequest + Job ID + Repository cwd
-  -> Git Worker
-  -> Backend JSONL Log (queued / started / completed)
-  -> Parser / Domain Model
-  -> GitResponse
-  -> AppState
-  -> Renderer
+Git Worker -> GitResponse -> Model reducer -> normalized GitModel
+                                            Repository
+                                              ├─ Branch -> [CommitId]
+                                              ├─ Commit -> [FileId]
+                                              └─ Changes/Reflog/Remotes facets
+
+Input / Ctrl-P palette -> OperationId -> shared executor -> state/effects
+GitModel + FocusPath + ViewConfig -> ViewProjection -> reusable panels -> Renderer
+OperationRegistry + FocusContext -> key resolver / footer / help / palette
+Focus/View change -> DataRequirement reconcile -> deduplicated GitRequest
 ```
 
 实现严格分为：
 
 - `src/tui`：终端生命周期、输入和渲染。
-- `src/app`：Action、状态、选择修正、请求调度和状态转移。
+- `src/app/model.rs`：带类型 ID、`Resource<T>` 加载状态和规范化 Repository→Branch→Commit→File 模型。
+- `src/app/focus.rs`：语义 `FocusContext` / `FocusPath`、稳定 ID cursor 与层级导航。
+- `src/app/view.rs`：完全由 `FocusKind + FocusRole` 派生的 `ViewProjection`，不维护独立页面状态。
+- `src/app/command.rs`：唯一 `OperationId -> OperationSpec` 可调用注册表；快捷键、提示、帮助和操作面板共用。
+- `src/app/requirement.rs`：由 view/focus 声明数据依赖，Controller 统一 reconcile。
+- `src/app/controller.rs`：operation executor、Git effect 调度、model reducer 和声明式数据需求 reconcile。
 - `src/domain`：仓库、分支、commit、reflog、文件和 diff 纯模型。
 - `src/git`：Git 协议、Worker、命令执行、后台操作日志和解析器。
 
+模型驱动架构不变量见 [`docs/model-driven-architecture.md`](docs/model-driven-architecture.md)，
 完整产品设计见 [`docs/git-tui-design.md`](docs/git-tui-design.md)。
 
 ## 开发验证

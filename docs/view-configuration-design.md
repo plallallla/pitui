@@ -1,8 +1,9 @@
 # Pitui 按 Data View 分层的配置设计
 
-> 状态：**Schema v2 设计稿，尚未实现**。当前可用的 Schema v1、快捷键、footer、diff 与日志
-> 配置以 [`global-configuration-design.md`](global-configuration-design.md) 和
-> [`config.example.toml`](config.example.toml) 为准。
+> 状态：**基础 view 配置已实现，panel 级 Schema 继续演进**。当前 Schema v1 已解析
+> `views.<view_id>` 的栏宽、commit density/字段开关，以及
+> `views.<view_id>.operations.<operation_id>.bindings`；更细的 panel fields、footer/help
+> presentation 仍是后续扩展。可运行示例以 [`config.example.toml`](config.example.toml) 为准。
 
 ## 1. 目标
 
@@ -20,7 +21,7 @@ Global
 
 1. 同一种数据在不同 View 中可以采用不同密度。例如 Overview 右侧 Commit 显示两行，
    Commit Detail 左侧 Commit 只显示一行。
-2. 操作通过稳定 `CommandId` 配置，不允许 TOML 注入 shell 或 Git 命令。
+2. 操作通过稳定 `OperationId` 配置，不允许 TOML 注入 shell 或 Git 命令。
 3. `h` 帮助只读取 Global 与来源 focus 的有效 Operations，不显示其他 View 的快捷键。
 4. 字段、绑定、footer 与帮助使用同一份 resolved view model，不能各维护一套字符串。
 5. hard reset 双确认、safe rebase 自动 abort、remote 同 fetch/push URL 等安全规则不可配置关闭。
@@ -29,10 +30,10 @@ Global
 
 | 层级 | 稳定标识 | 当前代码映射 |
 |---|---|---|
-| View | `branch_overview`、`commit_detail`、`file_diff`、`reflog`、`changes`、`remotes` | `Screen` |
-| Panel | `branch_tree`、`commits`、`commit_files`、`diff` 等 | `FocusPanel` |
-| Shortcut context | `branch.tree`、`overview.commits` 等 | `ShortcutContext` |
-| Operation | `branch.switch`、`commit.copy.info` 等 | `CommandId` |
+| View | `history`、`commit`、`file-diff`、`reflog`、`changes`、`remotes` | `ViewId` |
+| Panel | `repository-branches`、`commits`、`commit`、`file-diff` 等 | `PanelId` |
+| Focus context | `repository`、`branch`、`commit`、`file`、`diff` 等 | `FocusKind` |
+| Operation | `branch.switch`、`commit.copy.info` 等 | `OperationId` |
 | Field | `subject`、`author`、`tags`、`path` 等 | 各 domain model 的只读字段 |
 
 配置只接受 registry 中存在的标识。重命名必须通过 schema migration，不能静默忽略。
@@ -43,7 +44,7 @@ Global
 
 | 配置组 | 选项 | 状态 | 说明 |
 |---|---|---|---|
-| 根 | `schema_version` | v1 已实现 | v2 View 配置启用后升级为 `2` |
+| 根 | `schema_version` | v1 已实现 | 基础 View 配置已兼容加入 v1；破坏性变更才升级 |
 | `general` | `timezone` | v2 | `commit-offset`、`local`、`utc` |
 | `general` | `date_time_format` | v2 | 全局默认时间格式；View 可覆盖 |
 | `general` | `empty_value`、`truncate_marker` | v2 | 空值与截断标记 |
@@ -131,7 +132,7 @@ priority = 90
 Operation 字段全部可省略。省略时依次继承：
 
 ```text
-compiled CommandSpec default
+compiled OperationSpec default
   -> [keybindings.commands] / [ui.footer.commands|groups]
   -> views.<view>.panels.<panel>.operations.<command>
   -> runtime actionability（selection / pending job / scroll boundary）
@@ -309,7 +310,7 @@ height_percent = 90
 scope 固定为：
 
 ```text
-Global operations + originating ShortcutContext operations
+Global operations + originating FocusKind operations
 ```
 
 不提供 `all-views` 开关，避免再次把帮助框变成无法阅读的全量手册。
@@ -322,7 +323,7 @@ show_available_commands = true
 max_input_chars = 256
 ```
 
-只允许 `PROMPT_COMMAND_SPECS` 中的命令。不得配置任意 shell、Git argv 或脚本。
+只允许 `PROMPT_OPERATION_SPECS` 中的命令。不得配置任意 shell、Git argv 或脚本。
 
 ### 11.3 Safety / Editor Modals
 
@@ -361,9 +362,9 @@ enabled = false
 
 启动进入 raw mode 前必须完成：
 
-1. View、Panel、Field、CommandId 全部存在且层级匹配。
+1. View、Panel、Field、OperationId 全部存在且层级匹配。
 2. `fields` 顺序去重；format、行数、百分比、limit 在合法范围内。
-3. Operation 必须已挂载到该 `ShortcutContext`，不能跨 panel 注入。
+3. Operation 必须已挂载到该 `FocusKind`，不能跨 panel 注入。
 4. 合并全局与 View override 后，按 exact context 检测单键/chord 冲突。
 5. Global `app.quit` 至少保留一个不被 chord 遮蔽的路径。
 6. `Ctrl+Space` 默认无绑定；用户显式配置时仍执行正常冲突校验。
@@ -381,10 +382,10 @@ binding conflict `s` with `navigation.down` in context changes.tree
 
 ```text
 src/config.rs
-  RawViewConfig / ResolvedViewConfig / validation / schema migration
+  RawView / ResolvedViewConfig / validation / effective config
 
 src/app/command.rs
-  ViewId + PanelId + CommandId/ShortcutContext registry（handler 仍由程序定义）
+  ViewId + PanelId + OperationId/FocusKind registry（handler 仍由程序定义）
 
 src/tui/render.rs
   只消费 typed ResolvedPanelConfig，不解析 TOML 字符串
@@ -404,26 +405,34 @@ struct ResolvedViewConfig {
 struct ResolvedPanelConfig {
     density: Density,
     fields: Vec<ResolvedField>,
-    operations: HashMap<CommandId, ResolvedOperationPresentation>,
+    operations: HashMap<OperationId, ResolvedOperationPresentation>,
 }
 ```
 
-## 15. 分阶段实现
+## 15. 实现状态与后续顺序
 
-1. **Schema v2 + typed resolver**：只解析、校验、打印 effective config，不改变 UI。
-2. **Status / Branch Overview / Commit Detail**：先实现字段顺序、density、时间格式和布局比例。
-3. **File Diff / Changes / Reflog / Remotes**：补齐每个数据 View 的专属字段。
-4. **Scoped Operations**：实现 View/Panel 绑定、footer label/priority 覆盖和冲突诊断。
-5. **运行时 reload（可选）**：仅在完整校验成功后原子替换 resolved generation。
+已完成的基础层：
 
-每阶段都必须保证无配置时保持当前默认 UI、WASD、当前-focus 帮助和 Git 安全语义。
+1. 六个 typed `ViewId` 的严格解析、校验和 effective-config 输出。
+2. 每个 View 的左右栏比例、commit compact/detailed density，以及 author/datetime/tag 开关。
+3. View-scoped operation bindings、合并后的逐 context 冲突诊断，以及 input/footer/help/palette
+   共用同一 effective keymap。
+
+后续按以下顺序扩展：
+
+1. **Panel schema**：把 View 内的可复用 panel、字段顺序和格式提升为 typed config。
+2. **View-specific fields**：补齐 Status、Diff、Changes、Reflog、Remotes 专属展示选项。
+3. **Operation presentation**：增加 panel 级 footer label/priority/visibility 覆盖。
+4. **运行时 reload（可选）**：仅在完整校验成功后原子替换 resolved generation。
+
+每一步都必须保证无配置时保持当前 UI、WASD、current-focus 帮助和 Git 安全语义。
 
 ## 16. 验收矩阵
 
 - 同一 Commit 在 Overview/Detail 使用不同 fields 与 density，互不串配置。
 - 无 tag 且 `omit_empty=["tags"]` 时不出现 `Tags:`；时间格式可覆盖且默认精确到分钟。
 - `h` 只显示 Global + 来源 focus，切 focus 后立即使用另一 operation 表。
-- 同一 CommandId 可在两个互斥 panel 使用不同绑定；同 context 冲突启动前报错。
+- 同一 OperationId 可在两个互斥 panel 使用不同绑定；同 context 冲突启动前报错。
 - 禁用某 panel operation 后 input、footer、help 三处同时消失。
 - status 的 compact/normal/wide 字段顺序正确，默认永不显示 view/viewing/focus。
 - unknown View/Panel/Field/Operation、非法比例/limit/format 均被拒绝。

@@ -60,6 +60,10 @@ static MODE_KEY_TABLES: &[ModeKeyTable] = &[
         id: ModalShortcutSetId::ShortcutHelp,
         handle: map_shortcut_help_table,
     },
+    ModeKeyTable {
+        id: ModalShortcutSetId::OperationPalette,
+        handle: map_operation_palette_table,
+    },
 ];
 
 pub fn map_key(app: &AppState, event: KeyEvent) -> Option<Action> {
@@ -185,6 +189,37 @@ fn map_shortcut_help_table(_app: &AppState, event: KeyEvent) -> Option<Action> {
         | KeyCode::Char('q')
         | KeyCode::Char('h')
         | KeyCode::Char('H') => Some(Action::Cancel),
+        _ => None,
+    }
+}
+
+fn map_operation_palette_table(app: &AppState, event: KeyEvent) -> Option<Action> {
+    let GlobalMode::OperationPalette { query, .. } = &app.mode else {
+        return None;
+    };
+    match event.code {
+        KeyCode::Char(character)
+            if !event
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            let mut next = query.clone();
+            next.push(character);
+            Some(Action::UpdateOperationPalette(next))
+        }
+        KeyCode::Backspace => {
+            let mut next = query.clone();
+            next.pop();
+            Some(Action::UpdateOperationPalette(next))
+        }
+        KeyCode::Up => Some(Action::MoveUp),
+        KeyCode::Down => Some(Action::MoveDown),
+        KeyCode::PageUp => Some(Action::PageUp),
+        KeyCode::PageDown => Some(Action::PageDown),
+        KeyCode::Home => Some(Action::Home),
+        KeyCode::End => Some(Action::End),
+        KeyCode::Enter => Some(Action::SubmitOperationPalette),
+        KeyCode::Esc => Some(Action::Cancel),
         _ => None,
     }
 }
@@ -323,13 +358,35 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::{ChangeGroup, ChangeSelection, FocusPanel, ModalShortcutSetId, Screen},
+        app::{
+            BranchId, ChangeGroup, ChangeSelection, FocusKind, FocusRole, ModalShortcutSetId,
+            OperationId, RepositoryId,
+        },
         config::KeyStroke,
         domain::{
-            ChangedFile, Commit, CommitDetail, CommitHash, FileChangeKind, GitPath,
+            BranchName, ChangedFile, Commit, CommitDetail, CommitHash, FileChangeKind, GitPath,
             WorkingTreeChange,
         },
     };
+
+    fn focus(state: &mut AppState, kind: FocusKind, role: FocusRole) {
+        state.set_focus_layer(kind, role);
+    }
+
+    fn seed_commits(state: &mut AppState, commits: Vec<Commit>) {
+        let branch = BranchId {
+            repository: RepositoryId(0),
+            name: BranchName("main".into()),
+        };
+        state.model.replace_branch_commits(&branch, commits);
+        state.viewing_branch = Some(branch);
+        state.ensure_valid_commit_selection();
+    }
+
+    fn seed_commit_detail(state: &mut AppState, detail: CommitDetail) {
+        state.model.set_commit_detail(RepositoryId(0), detail);
+        state.ensure_valid_file_selection();
+    }
 
     #[test]
     fn modal_input_jump_table_covers_every_documented_operation_set() {
@@ -352,19 +409,17 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_r_refreshes_from_every_normal_screen_but_plain_r_is_unbound() {
-        for screen in [
-            Screen::BranchOverview,
-            Screen::CommitDetail,
-            Screen::FileDiffDetail,
-            Screen::Reflog,
-            Screen::Changes,
-            Screen::Remotes,
+    fn ctrl_r_refreshes_from_every_normal_view_but_plain_r_is_unbound() {
+        for (kind, role) in [
+            (FocusKind::Repository, FocusRole::Entity),
+            (FocusKind::Commit, FocusRole::Entity),
+            (FocusKind::Diff, FocusRole::Content),
+            (FocusKind::Reflog, FocusRole::Entity),
+            (FocusKind::Changes, FocusRole::Entity),
+            (FocusKind::Remote, FocusRole::Entity),
         ] {
-            let state = AppState {
-                screen,
-                ..AppState::with_repository_paths(vec![PathBuf::from("/repo")])
-            };
+            let mut state = AppState::with_repository_paths(vec![PathBuf::from("/repo")]);
+            focus(&mut state, kind, role);
             assert_eq!(
                 map_key(
                     &state,
@@ -384,17 +439,14 @@ mod tests {
 
     #[test]
     fn file_detail_navigation_is_not_exposed_without_actionable_content() {
-        for (screen, focus) in [
-            (Screen::CommitDetail, FocusPanel::CommitFileList),
-            (Screen::FileDiffDetail, FocusPanel::FileList),
-            (Screen::FileDiffDetail, FocusPanel::DiffView),
-            (Screen::Changes, FocusPanel::ChangesDiff),
+        for (kind, role) in [
+            (FocusKind::File, FocusRole::Collection),
+            (FocusKind::File, FocusRole::Entity),
+            (FocusKind::Diff, FocusRole::Content),
+            (FocusKind::ChangesDiff, FocusRole::Content),
         ] {
-            let state = AppState {
-                screen,
-                focus,
-                ..AppState::default()
-            };
+            let mut state = AppState::default();
+            focus(&mut state, kind, role);
             for (key, action) in [
                 (KeyCode::Home, Action::Home),
                 (KeyCode::End, Action::End),
@@ -404,7 +456,7 @@ mod tests {
                 assert_eq!(
                     map_key(&state, KeyEvent::new(key, KeyModifiers::NONE)),
                     None,
-                    "inactive {key:?}/{action:?} should not map for empty {screen:?}/{focus:?}"
+                    "inactive {key:?}/{action:?} should not map for empty {kind:?}/{role:?}"
                 );
             }
         }
@@ -420,60 +472,58 @@ mod tests {
             decorations: String::new(),
             subject: "navigation".into(),
         };
-        let mut state = AppState::default();
-        state.branch_commits.items.push(commit.clone());
-        state.ensure_valid_commit_selection();
+        let mut state = AppState::with_repository_paths(vec![PathBuf::from("/repo")]);
+        seed_commits(&mut state, vec![commit.clone()]);
 
         let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         assert_eq!(map_key(&state, left), None);
         assert_eq!(map_key(&state, right), Some(Action::MoveRight));
 
-        state.focus = FocusPanel::CommitList;
+        focus(&mut state, FocusKind::Commit, FocusRole::Collection);
         assert_eq!(map_key(&state, left), Some(Action::MoveLeft));
         assert_eq!(map_key(&state, right), Some(Action::MoveRight));
 
-        state.screen = Screen::CommitDetail;
-        state.current_commit_detail = Some(CommitDetail {
-            commit,
-            author_email: "ada@example.invalid".into(),
-            committer: "Ada".into(),
-            committer_email: "ada@example.invalid".into(),
-            committed_at: "2026-07-16".into(),
-            message: "navigation".into(),
-            files: vec![ChangedFile {
-                kind: FileChangeKind::Modified,
-                path: GitPath::from("src/main.rs"),
-                old_path: None,
-                additions: Some(1),
-                deletions: Some(1),
-                hunks: Vec::new(),
-                is_binary: false,
-            }],
-        });
-        state.ensure_valid_file_selection();
-        state.focus = FocusPanel::CommitFileList;
+        seed_commit_detail(
+            &mut state,
+            CommitDetail {
+                commit,
+                author_email: "ada@example.invalid".into(),
+                committer: "Ada".into(),
+                committer_email: "ada@example.invalid".into(),
+                committed_at: "2026-07-16".into(),
+                message: "navigation".into(),
+                files: vec![ChangedFile {
+                    kind: FileChangeKind::Modified,
+                    path: GitPath::from("src/main.rs"),
+                    old_path: None,
+                    additions: Some(1),
+                    deletions: Some(1),
+                    hunks: Vec::new(),
+                    is_binary: false,
+                }],
+            },
+        );
+        focus(&mut state, FocusKind::File, FocusRole::Collection);
         assert_eq!(map_key(&state, left), Some(Action::MoveLeft));
         assert_eq!(map_key(&state, right), Some(Action::MoveRight));
 
-        state.screen = Screen::FileDiffDetail;
-        state.focus = FocusPanel::FileList;
+        focus(&mut state, FocusKind::File, FocusRole::Entity);
         assert_eq!(map_key(&state, left), Some(Action::MoveLeft));
         assert_eq!(map_key(&state, right), Some(Action::MoveRight));
 
-        state.focus = FocusPanel::DiffView;
+        focus(&mut state, FocusKind::Diff, FocusRole::Content);
         assert_eq!(map_key(&state, left), Some(Action::MoveLeft));
         assert_eq!(map_key(&state, right), None);
     }
 
     #[test]
     fn wasd_maps_to_up_left_down_right_in_the_current_focus() {
-        let mut state = AppState {
-            focus: FocusPanel::CommitList,
-            ..AppState::default()
-        };
+        let mut state = AppState::with_repository_paths(vec![PathBuf::from("/repo")]);
+        focus(&mut state, FocusKind::Commit, FocusRole::Collection);
+        let mut commits = Vec::new();
         for index in 0..3 {
-            state.branch_commits.items.push(Commit {
+            commits.push(Commit {
                 hash: CommitHash(format!("{index:040x}")),
                 short_hash: format!("{index:07x}"),
                 author: "Ada".into(),
@@ -482,6 +532,7 @@ mod tests {
                 subject: format!("commit {index}"),
             });
         }
+        seed_commits(&mut state, commits);
         state.selection.selected_commit_index = Some(1);
 
         for (key, action) in [
@@ -580,19 +631,17 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_g_opens_changes_from_every_normal_screen() {
-        for screen in [
-            Screen::BranchOverview,
-            Screen::CommitDetail,
-            Screen::FileDiffDetail,
-            Screen::Reflog,
-            Screen::Changes,
-            Screen::Remotes,
+    fn ctrl_g_opens_changes_from_every_normal_view() {
+        for (kind, role) in [
+            (FocusKind::Repository, FocusRole::Entity),
+            (FocusKind::Commit, FocusRole::Entity),
+            (FocusKind::Diff, FocusRole::Content),
+            (FocusKind::Reflog, FocusRole::Entity),
+            (FocusKind::Changes, FocusRole::Entity),
+            (FocusKind::Remote, FocusRole::Entity),
         ] {
-            let state = AppState {
-                screen,
-                ..AppState::with_repository_paths(vec![PathBuf::from("/repo")])
-            };
+            let mut state = AppState::with_repository_paths(vec![PathBuf::from("/repo")]);
+            focus(&mut state, kind, role);
             assert_eq!(
                 map_key(
                     &state,
@@ -606,18 +655,20 @@ mod tests {
     #[test]
     fn remote_management_maps_add_edit_upstream_and_two_field_input() {
         let mut state = AppState {
-            screen: Screen::Remotes,
-            focus: FocusPanel::RemoteList,
             remotes_repository_index: Some(0),
-            remotes: vec![crate::domain::RemoteInfo {
+            ..AppState::with_repository_paths(vec![PathBuf::from("/repo")])
+        };
+        state.model.set_remotes(
+            RepositoryId(0),
+            vec![crate::domain::RemoteInfo {
                 name: "origin".into(),
                 fetch_urls: vec!["ssh://example/repo.git".into()],
                 push_urls: vec!["ssh://example/repo.git".into()],
                 is_upstream: false,
                 is_push_target: false,
             }],
-            ..AppState::with_repository_paths(vec![PathBuf::from("/repo")])
-        };
+        );
+        focus(&mut state, FocusKind::Remote, FocusRole::Entity);
         state.ensure_valid_remote_selection();
         assert_eq!(
             map_key(
@@ -674,19 +725,19 @@ mod tests {
 
     #[test]
     fn commit_keys_toggle_selection_and_copy_hash_info_or_message() {
-        let mut state = AppState {
-            focus: FocusPanel::CommitList,
-            ..AppState::default()
-        };
-        state.branch_commits.items.push(crate::domain::Commit {
-            hash: crate::domain::CommitHash("0123456789abcdef".into()),
-            short_hash: "01234567".into(),
-            author: "Ada".into(),
-            authored_at: "2026-07-16".into(),
-            decorations: String::new(),
-            subject: "copy me".into(),
-        });
-        state.ensure_valid_commit_selection();
+        let mut state = AppState::with_repository_paths(vec![PathBuf::from("/repo")]);
+        focus(&mut state, FocusKind::Commit, FocusRole::Collection);
+        seed_commits(
+            &mut state,
+            vec![crate::domain::Commit {
+                hash: crate::domain::CommitHash("0123456789abcdef".into()),
+                short_hash: "01234567".into(),
+                author: "Ada".into(),
+                authored_at: "2026-07-16".into(),
+                decorations: String::new(),
+                subject: "copy me".into(),
+            }],
+        );
 
         assert_eq!(
             map_key(
@@ -703,7 +754,6 @@ mod tests {
             None,
             "cherry-pick must stay unavailable until a commit is explicitly selected"
         );
-        state.branch_commits_repository_index = Some(0);
         state.commit_selection_repository_index = Some(0);
         state
             .commit_selection
@@ -784,31 +834,29 @@ mod tests {
             decorations: String::new(),
             subject: "context tables".into(),
         };
-        let mut state = AppState {
-            screen: Screen::CommitDetail,
-            focus: FocusPanel::CommitFileList,
-            ..AppState::default()
-        };
-        state.branch_commits.items.push(commit.clone());
-        state.ensure_valid_commit_selection();
-        state.current_commit_detail = Some(CommitDetail {
-            commit,
-            author_email: "ada@example.invalid".into(),
-            committer: "Ada".into(),
-            committer_email: "ada@example.invalid".into(),
-            committed_at: "2026-07-16".into(),
-            message: "context tables".into(),
-            files: vec![ChangedFile {
-                kind: FileChangeKind::Modified,
-                path: GitPath::from("src/nested/main.rs"),
-                old_path: None,
-                additions: Some(1),
-                deletions: Some(1),
-                hunks: Vec::new(),
-                is_binary: false,
-            }],
-        });
-        state.ensure_valid_file_selection();
+        let mut state = AppState::with_repository_paths(vec![PathBuf::from("/repo")]);
+        seed_commits(&mut state, vec![commit.clone()]);
+        seed_commit_detail(
+            &mut state,
+            CommitDetail {
+                commit,
+                author_email: "ada@example.invalid".into(),
+                committer: "Ada".into(),
+                committer_email: "ada@example.invalid".into(),
+                committed_at: "2026-07-16".into(),
+                message: "context tables".into(),
+                files: vec![ChangedFile {
+                    kind: FileChangeKind::Modified,
+                    path: GitPath::from("src/nested/main.rs"),
+                    old_path: None,
+                    additions: Some(1),
+                    deletions: Some(1),
+                    hunks: Vec::new(),
+                    is_binary: false,
+                }],
+            },
+        );
+        focus(&mut state, FocusKind::File, FocusRole::Collection);
 
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(
@@ -837,18 +885,14 @@ mod tests {
         }
 
         state.mode = GlobalMode::Normal;
-        state.screen = Screen::FileDiffDetail;
-        state.focus = FocusPanel::DiffView;
+        focus(&mut state, FocusKind::Diff, FocusRole::Content);
         assert_eq!(map_key(&state, ctrl_c), Some(Action::Quit));
     }
 
     #[test]
     fn global_shortcut_reference_opens_and_uses_its_own_modal_table() {
-        let state = AppState {
-            screen: Screen::CommitDetail,
-            focus: FocusPanel::CommitFileList,
-            ..AppState::default()
-        };
+        let mut state = AppState::default();
+        focus(&mut state, FocusKind::File, FocusRole::Collection);
         let ctrl_question = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL);
         assert_eq!(
             map_key(
@@ -865,8 +909,6 @@ mod tests {
 
         let help = AppState {
             mode: GlobalMode::ShortcutHelp { scroll: 0 },
-            focus: FocusPanel::Popup,
-            previous_focus: Some(FocusPanel::BranchList),
             ..AppState::default()
         };
         assert_eq!(
@@ -913,7 +955,6 @@ mod tests {
                 input: "hel".into(),
                 validation_error: Some("old error".into()),
             },
-            focus: FocusPanel::Popup,
             ..AppState::default()
         };
         assert_eq!(
@@ -941,6 +982,46 @@ mod tests {
     }
 
     #[test]
+    fn operation_palette_uses_ctrl_p_and_owns_search_and_selection_keys() {
+        let state = AppState::default();
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
+            ),
+            Some(Action::OpenOperationPalette)
+        );
+
+        let palette = AppState {
+            mode: GlobalMode::OperationPalette {
+                query: "cop".into(),
+                selected: 0,
+                operations: vec![OperationId::AppQuit, OperationId::AppShortcutHelp],
+            },
+            ..AppState::default()
+        };
+        assert_eq!(
+            map_key(
+                &palette,
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)
+            ),
+            Some(Action::UpdateOperationPalette("copy".into()))
+        );
+        assert_eq!(
+            map_key(&palette, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Some(Action::MoveDown)
+        );
+        assert_eq!(
+            map_key(&palette, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::SubmitOperationPalette)
+        );
+        assert_eq!(
+            map_key(&palette, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(Action::Cancel)
+        );
+    }
+
+    #[test]
     fn changes_keys_select_stage_unstage_and_open_commit() {
         let change = WorkingTreeChange {
             index_status: 'M',
@@ -949,13 +1030,12 @@ mod tests {
             old_path: None,
         };
         let mut state = AppState {
-            screen: Screen::Changes,
-            focus: FocusPanel::ChangesDiff,
             changes_repository_index: Some(0),
-            changes: vec![change],
             ..AppState::with_repository_paths(vec![PathBuf::from("/repo")])
         };
+        state.model.set_working_tree(RepositoryId(0), vec![change]);
         state.ensure_valid_changes_selection();
+        focus(&mut state, FocusKind::ChangesDiff, FocusRole::Content);
         state.change_selection.extend([
             ChangeSelection {
                 group: ChangeGroup::Staged,
