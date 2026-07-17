@@ -1,5 +1,9 @@
 # Pitui 按 Data View 分层的配置设计
 
+> 本文是当前 0.1.0 View 配置资产与需求参考。下一代不沿用 Model/View 分层，而以
+> Dataset Template、Render Proxy、Render Mode 和 Operation Set 配置替代；权威设计见
+> [`../最终设计方案.md`](../最终设计方案.md)。
+
 > 状态：**基础 view 配置已实现，panel 级 Schema 继续演进**。当前 Schema v1 已解析
 > `views.<view_id>` 的栏宽、commit density/字段开关，以及
 > `views.<view_id>.operations.<operation_id>.bindings`；更细的 panel fields、footer/help
@@ -7,7 +11,9 @@
 
 ## 1. 目标
 
-下一阶段配置不再只处理“全局快捷键”，而是把 UI 拆成以下四层：
+当前 Legacy 的这轮配置扩展不再只处理“全局快捷键”，而是把 UI 拆成以下四层；这些需求会
+迁移为下一代的 Dataset Template、Render Proxy、Render Mode 与 Operation Set 配置，但不
+复用这里的 View/Panel 类型：
 
 ```text
 Global

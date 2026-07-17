@@ -5,6 +5,13 @@
 
 Pitui 是一个安全、克制、支持多仓库的 Git TUI，以分支、commit 和 diff 浏览为核心。
 
+> [!NOTE]
+> 当前 binary 是已经验收的 0.1.0 Legacy 行为基线。下一代不在现有
+> `AppState/GitModel/Controller` 核心上继续重构，而是使用独立 `bevy_ecs` crate 按
+> Data Driven Development 重新开发；Dataset ECS、Command/Operation、Render Proxy、
+> 现有资产复用矩阵、阶段计划和验收门禁以
+> [`最终设计方案.md`](最终设计方案.md) 为权威文档。
+
 ```text
 Repositories + Branches -> Commits -> Commit + Changed Files -> Files + Diff
           |
@@ -410,6 +417,9 @@ Stage 使用 path-limited `git add --all -- <paths>`；unstage 使用 path-limit
 > Pitui 只负责确认并提交 Git 命令。若 cherry-pick 产生冲突，请退出 Pitui 后使用标准 Git 命令完成或中止该操作。
 
 ## 架构
+
+> 本节描述当前 0.1.0 Legacy 实现，仅作为可复用资产与行为基线；下一代目标架构见
+> [`最终设计方案.md`](最终设计方案.md)。
 
 ```text
 Git Worker -> GitResponse -> Model reducer -> normalized GitModel

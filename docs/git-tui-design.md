@@ -1,11 +1,11 @@
 # Pitui 多仓库六视图 Git TUI 设计文档
 
-> **架构更新（2026-07-17）**：本文保留了早期产品迭代和交互设计，因此第 3–18 节中的
+> **文档定位更新（2026-07-17）**：本文保留早期产品迭代、现有交互和 0.1.0 实现记录，
+> 是下一代的产品行为参考，不是目标代码架构。第 3–18 节中的
 > `Screen`、`FocusPanel`、`RepositoryState` 及详情 cache 代码片段仅是历史记录，不是当前
-> API。当前实现已迁移到规范化 `GitModel`、`FocusContext/FocusPath`、纯派生
-> `ViewProjection`、`DataRequirement` 和统一 `OperationSpec`；权威边界见
-> [`model-driven-architecture.md`](model-driven-architecture.md)。新增实现不得复制本文的旧
-> 页面状态机。
+> API；当前 Legacy 实现说明见 [`model-driven-architecture.md`](model-driven-architecture.md)。
+> 下一代将使用 `bevy_ecs` 按 Dataset ECS 完整重写，最终目标、资产复用矩阵和实施计划见
+> [`../最终设计方案.md`](../最终设计方案.md)。新实现不得复制本文的旧页面状态机。
 
 > 目标：实现一个安全、克制、以分支 / commit / diff 浏览为核心的 Git TUI。
 >

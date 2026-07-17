@@ -1,12 +1,15 @@
 # Pitui Model-Driven Architecture
 
-> 状态：**已落地，是当前实现的权威架构说明**。历史产品设计中的
-> `Screen`、`FocusPanel`、`RepositoryState` 和详情缓存代码片段不再代表实现。
+> 状态：**当前 0.1.0 Legacy 实现说明**。本文用于解释和审计现有代码资产，不再是下一代
+> 开发目标。下一代将使用独立 `bevy_ecs` crate 按 Dataset ECS 重新开发，权威设计、复用
+> 边界与计划见 [`../最终设计方案.md`](../最终设计方案.md)。历史产品设计中的 `Screen`、
+> `FocusPanel`、`RepositoryState` 和详情缓存代码片段也不代表当前实现。
 
 ## 1. 结论
 
-当前实现与目标架构一致：Git 数据、语义焦点、视图投影和可调用操作是四个独立层，
-主浏览链由以下模型驱动，而不是由页面枚举驱动：
+当前 0.1.0 Legacy 实现在自身边界内把 Git 数据、语义焦点、视图投影和可调用操作分成
+四个独立层，主浏览链由以下模型驱动，而不是由页面枚举驱动。这里描述的是可复用的行为
+与分层经验，不表示其 Model/View 核心等同于下一代 Dataset ECS：
 
 ```text
 Repository -> Branch -> Commit -> File
@@ -53,7 +56,7 @@ GitModel + FocusContext + ResolvedViewConfig
 
 Input 不执行 Git，Renderer 不修改状态，只有 Git Worker 可以启动 `git` 进程。
 
-## 3. 权威 Model
+## 3. 当前实现的 Model
 
 `src/app/model.rs` 持有唯一核心 Git 数据：
 
