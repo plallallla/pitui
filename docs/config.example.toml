@@ -16,6 +16,16 @@ visible = true
 label = "copy…"
 priority = 110
 
+[ui.footer.groups."file.copy"]
+visible = true
+label = "copy file…"
+priority = 110
+
+[ui.footer.commands."app.shortcuts"]
+visible = true
+label = "shortcuts"
+priority = 100
+
 [ui.footer.commands."app.refresh"]
 visible = true
 label = "refresh"
@@ -39,6 +49,9 @@ chord_timeout_ms = 0 # 0 waits until completion, Esc, or an unmatched key
 [keybindings.commands."app.refresh"]
 bindings = ["Ctrl+R"]
 
+[keybindings.commands."app.shortcuts"]
+bindings = ["Ctrl+?", "?"] # plain ? is the portable terminal fallback
+
 [keybindings.commands."view.changes.toggle"]
 bindings = ["Ctrl+G"]
 
@@ -50,6 +63,17 @@ bindings = ["Ctrl+C i"]
 
 [keybindings.commands."commit.copy.message"]
 bindings = ["Ctrl+C m"]
+
+# These share the Ctrl+C prefix but are mounted only while a file-list column
+# has focus. They never appear or execute in Commits or Diff focus tables.
+[keybindings.commands."file.copy.name"]
+bindings = ["Ctrl+C n"]
+
+[keybindings.commands."file.copy.absolute_path"]
+bindings = ["Ctrl+C a"]
+
+[keybindings.commands."file.copy.relative_path"]
+bindings = ["Ctrl+C r"]
 
 [diff]
 default_mode = "unified" # unified | side-by-side

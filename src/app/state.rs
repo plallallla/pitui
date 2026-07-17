@@ -191,6 +191,9 @@ pub enum GlobalMode {
         prefix: Vec<KeyStroke>,
         started_at: Instant,
     },
+    ShortcutHelp {
+        scroll: u16,
+    },
     Error,
 }
 

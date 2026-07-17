@@ -2,11 +2,19 @@ use std::collections::HashSet;
 
 use crate::domain::GitPath;
 
-use super::{Action, AppState, ChangeGroup, ChangesTreeNode, FocusPanel, PendingJobKind, Screen};
+use super::{
+    Action, AppState, ChangeGroup, ChangesTreeNode, ConfirmDialog, FocusPanel, GlobalMode,
+    PendingJobKind, RemoteEditKind, Screen,
+};
 
+/// A stable, normal-mode operation id. The enum is deliberately `repr(usize)`:
+/// each value indexes [`COMMAND_SPECS`], which is the Rust equivalent of a C++
+/// function-pointer jump table.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(usize)]
 pub enum CommandId {
     AppQuit,
+    AppShortcutHelp,
     AppRefresh,
     ViewChangesToggle,
     FocusNext,
@@ -52,6 +60,9 @@ pub enum CommandId {
     CommitCopyHash,
     CommitCopyInfo,
     CommitCopyMessage,
+    FileCopyName,
+    FileCopyAbsolutePath,
+    FileCopyRelativePath,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -75,9 +86,803 @@ impl FooterGroup {
     }
 }
 
+/// The exact normal-mode column to which a command table is mounted.
+///
+/// Screen alone is intentionally insufficient: `CommitList`, `FileList`, and
+/// `DiffView` on adjacent hierarchy levels expose different operations even
+/// when they display data from the same commit.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum ShortcutContext {
+    BranchTree,
+    OverviewCommits,
+    DetailCommits,
+    CommitFiles,
+    DiffFiles,
+    DiffView,
+    Reflog,
+    ChangesTree,
+    ChangesDiff,
+    Remotes,
+}
+
+impl ShortcutContext {
+    pub const ALL: &'static [Self] = &[
+        Self::BranchTree,
+        Self::OverviewCommits,
+        Self::DetailCommits,
+        Self::CommitFiles,
+        Self::DiffFiles,
+        Self::DiffView,
+        Self::Reflog,
+        Self::ChangesTree,
+        Self::ChangesDiff,
+        Self::Remotes,
+    ];
+    pub const ALL_MASK: u16 = (1 << Self::ALL.len()) - 1;
+
+    pub const fn mask(self) -> u16 {
+        1 << self as u8
+    }
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::BranchTree => "branch.tree",
+            Self::OverviewCommits => "overview.commits",
+            Self::DetailCommits => "detail.commits",
+            Self::CommitFiles => "commit.files",
+            Self::DiffFiles => "diff.files",
+            Self::DiffView => "diff.view",
+            Self::Reflog => "reflog.list",
+            Self::ChangesTree => "changes.tree",
+            Self::ChangesDiff => "changes.diff",
+            Self::Remotes => "remotes.list",
+        }
+    }
+
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::BranchTree => "Branches · repository / branch column",
+            Self::OverviewCommits => "Commits · overview right column",
+            Self::DetailCommits => "Commits · detail left column",
+            Self::CommitFiles => "Commit · changed-files column",
+            Self::DiffFiles => "Commit · file column beside diff",
+            Self::DiffView => "Diff · file content column",
+            Self::Reflog => "Reflog · entries column",
+            Self::ChangesTree => "Changes · staged / unstaged tree",
+            Self::ChangesDiff => "Changes · diff column",
+            Self::Remotes => "Remote Management · remote list",
+        }
+    }
+
+    pub fn from_view(screen: Screen, focus: FocusPanel) -> Option<Self> {
+        match (screen, focus) {
+            (Screen::BranchOverview, FocusPanel::BranchList) => Some(Self::BranchTree),
+            (Screen::BranchOverview, FocusPanel::CommitList) => Some(Self::OverviewCommits),
+            (Screen::CommitDetail, FocusPanel::CommitList) => Some(Self::DetailCommits),
+            (Screen::CommitDetail, FocusPanel::CommitFileList) => Some(Self::CommitFiles),
+            (Screen::FileDiffDetail, FocusPanel::FileList) => Some(Self::DiffFiles),
+            (Screen::FileDiffDetail, FocusPanel::DiffView) => Some(Self::DiffView),
+            (Screen::Reflog, FocusPanel::ReflogList) => Some(Self::Reflog),
+            (Screen::Changes, FocusPanel::ChangesTree) => Some(Self::ChangesTree),
+            (Screen::Changes, FocusPanel::ChangesDiff) => Some(Self::ChangesDiff),
+            (Screen::Remotes, FocusPanel::RemoteList) => Some(Self::Remotes),
+            _ => None,
+        }
+    }
+
+    pub fn from_app(app: &AppState) -> Option<Self> {
+        Self::from_view(app.screen, app.focus)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandMount {
+    Global,
+    Focus,
+}
+
+pub type CommandHandler = fn(&AppState) -> Option<Action>;
+
+/// Metadata and callable behavior for one command. Input resolution, footer
+/// hints, configuration validation, and the help popup all consume this same
+/// table; none of them carries a second screen/focus key map.
+#[derive(Clone, Copy)]
+pub struct CommandSpec {
+    pub id: CommandId,
+    pub name: &'static str,
+    pub default_bindings: &'static [&'static str],
+    pub default_label: &'static str,
+    pub default_visible: bool,
+    pub footer_group: FooterGroup,
+    pub chord_group: Option<&'static str>,
+    pub mount: CommandMount,
+    pub contexts: u16,
+    pub invoke: CommandHandler,
+}
+
+macro_rules! command_spec {
+    (
+        $id:ident, $name:literal, $bindings:expr, $label:literal,
+        $visible:expr, $group:ident, $chord:expr, $mount:ident,
+        $contexts:expr, $invoke:expr
+    ) => {
+        CommandSpec {
+            id: CommandId::$id,
+            name: $name,
+            default_bindings: $bindings,
+            default_label: $label,
+            default_visible: $visible,
+            footer_group: FooterGroup::$group,
+            chord_group: $chord,
+            mount: CommandMount::$mount,
+            contexts: $contexts,
+            invoke: $invoke,
+        }
+    };
+}
+
+const BRANCH_TREE: u16 = ShortcutContext::BranchTree.mask();
+const BRANCH_COMMITS: u16 = ShortcutContext::OverviewCommits.mask();
+const DETAIL_COMMITS: u16 = ShortcutContext::DetailCommits.mask();
+const DETAIL_FILES: u16 = ShortcutContext::CommitFiles.mask();
+const FILE_LIST: u16 = ShortcutContext::DiffFiles.mask();
+const FILE_DIFF: u16 = ShortcutContext::DiffView.mask();
+const REFLOG: u16 = ShortcutContext::Reflog.mask();
+const CHANGES_TREE: u16 = ShortcutContext::ChangesTree.mask();
+const CHANGES_DIFF: u16 = ShortcutContext::ChangesDiff.mask();
+const REMOTES: u16 = ShortcutContext::Remotes.mask();
+const ALL_CONTEXTS: u16 = ShortcutContext::ALL_MASK;
+const TWO_PANEL_CONTEXTS: u16 = BRANCH_TREE
+    | BRANCH_COMMITS
+    | DETAIL_COMMITS
+    | DETAIL_FILES
+    | FILE_LIST
+    | FILE_DIFF
+    | CHANGES_TREE
+    | CHANGES_DIFF;
+
+/// The single normal-mode command jump table. Its order must match
+/// [`CommandId`]; a unit test enforces that invariant.
+pub static COMMAND_SPECS: &[CommandSpec] = &[
+    command_spec!(
+        AppQuit,
+        "app.quit",
+        &["q", "Ctrl+C"],
+        "quit",
+        true,
+        Safety,
+        None,
+        Global,
+        ALL_CONTEXTS,
+        |_| Some(Action::Quit)
+    ),
+    command_spec!(
+        AppShortcutHelp,
+        "app.shortcuts",
+        &["Ctrl+?", "?"],
+        "shortcuts",
+        true,
+        Global,
+        None,
+        Global,
+        ALL_CONTEXTS,
+        |_| Some(Action::OpenShortcutHelp)
+    ),
+    command_spec!(
+        AppRefresh,
+        "app.refresh",
+        &["Ctrl+R"],
+        "refresh",
+        true,
+        Global,
+        None,
+        Global,
+        ALL_CONTEXTS,
+        |app| (!app.repositories.is_empty()).then_some(Action::RefreshRepository)
+    ),
+    command_spec!(
+        ViewChangesToggle,
+        "view.changes.toggle",
+        &["Ctrl+G"],
+        "changes",
+        true,
+        Global,
+        None,
+        Global,
+        ALL_CONTEXTS,
+        |app| (app.screen == Screen::Changes || app.active_repository_index.is_some())
+            .then_some(Action::ToggleChanges)
+    ),
+    command_spec!(
+        FocusNext,
+        "focus.next",
+        &["Tab"],
+        "focus",
+        true,
+        Navigation,
+        None,
+        Focus,
+        TWO_PANEL_CONTEXTS,
+        |app| has_multiple_panels(app.screen).then_some(Action::FocusNext)
+    ),
+    command_spec!(
+        FocusPrevious,
+        "focus.previous",
+        &["BackTab"],
+        "focus",
+        false,
+        Navigation,
+        None,
+        Focus,
+        TWO_PANEL_CONTEXTS,
+        |app| has_multiple_panels(app.screen).then_some(Action::FocusPrev)
+    ),
+    command_spec!(
+        NavigationBack,
+        "navigation.back",
+        &["Esc"],
+        "back",
+        true,
+        Safety,
+        None,
+        Focus,
+        ALL_CONTEXTS & !BRANCH_TREE & !BRANCH_COMMITS,
+        |app| (app.screen != Screen::BranchOverview).then_some(Action::Back)
+    ),
+    command_spec!(
+        NavigationUp,
+        "navigation.up",
+        &["Up", "k"],
+        "up",
+        false,
+        Navigation,
+        None,
+        Focus,
+        ALL_CONTEXTS,
+        |app| can_move(app, -1).then_some(Action::MoveUp)
+    ),
+    command_spec!(
+        NavigationDown,
+        "navigation.down",
+        &["Down", "j"],
+        "down",
+        false,
+        Navigation,
+        None,
+        Focus,
+        ALL_CONTEXTS,
+        |app| can_move(app, 1).then_some(Action::MoveDown)
+    ),
+    command_spec!(
+        NavigationLeft,
+        "navigation.left",
+        &["Left", "h"],
+        "left",
+        false,
+        Navigation,
+        None,
+        Focus,
+        TWO_PANEL_CONTEXTS,
+        |app| can_move_horizontal(app, false).then_some(Action::MoveLeft)
+    ),
+    command_spec!(
+        NavigationRight,
+        "navigation.right",
+        &["Right", "l"],
+        "right",
+        false,
+        Navigation,
+        None,
+        Focus,
+        TWO_PANEL_CONTEXTS,
+        |app| can_move_horizontal(app, true).then_some(Action::MoveRight)
+    ),
+    command_spec!(
+        NavigationPageUp,
+        "navigation.page_up",
+        &["PageUp"],
+        "page up",
+        true,
+        Navigation,
+        None,
+        Focus,
+        ALL_CONTEXTS,
+        |app| can_move(app, -1).then_some(Action::PageUp)
+    ),
+    command_spec!(
+        NavigationPageDown,
+        "navigation.page_down",
+        &["PageDown"],
+        "page down",
+        true,
+        Navigation,
+        None,
+        Focus,
+        ALL_CONTEXTS,
+        |app| can_move(app, 1).then_some(Action::PageDown)
+    ),
+    command_spec!(
+        NavigationHome,
+        "navigation.home",
+        &["Home"],
+        "first/top",
+        true,
+        Navigation,
+        None,
+        Focus,
+        ALL_CONTEXTS,
+        |app| can_move(app, -1).then_some(Action::Home)
+    ),
+    command_spec!(
+        NavigationEnd,
+        "navigation.end",
+        &["End"],
+        "last/bottom",
+        true,
+        Navigation,
+        None,
+        Focus,
+        ALL_CONTEXTS,
+        |app| can_move(app, 1).then_some(Action::End)
+    ),
+    command_spec!(
+        RepositoryActivate,
+        "repository.activate",
+        &["Enter"],
+        "open",
+        true,
+        Primary,
+        None,
+        Focus,
+        BRANCH_TREE,
+        |app| (app.selected_tree_node().is_some()).then_some(Action::LoadCommitsForSelectedBranch)
+    ),
+    command_spec!(
+        RepositoryFetch,
+        "repository.fetch",
+        &["f"],
+        "fetch",
+        true,
+        Primary,
+        None,
+        Focus,
+        BRANCH_TREE,
+        |app| (selected_repository_ready(app).is_some()
+            && app.selected_repository_node_index().is_some())
+        .then_some(Action::OpenFetchRepositoryDialog)
+    ),
+    command_spec!(
+        RepositoryPullRebase,
+        "repository.pull_rebase",
+        &["p"],
+        "pull --rebase",
+        true,
+        Primary,
+        None,
+        Focus,
+        BRANCH_TREE,
+        |app| (selected_repository_ready(app).is_some()
+            && app.selected_repository_node_index().is_some())
+        .then_some(Action::OpenPullRebaseDialog)
+    ),
+    command_spec!(
+        RepositoryPush,
+        "repository.push",
+        &["P"],
+        "push",
+        true,
+        Primary,
+        None,
+        Focus,
+        BRANCH_TREE,
+        |app| (selected_repository_ready(app).is_some()
+            && app.selected_repository_node_index().is_some())
+        .then_some(Action::OpenPushDialog)
+    ),
+    command_spec!(
+        RepositoryRemotesOpen,
+        "repository.remotes.open",
+        &["o"],
+        "remotes",
+        true,
+        Primary,
+        None,
+        Focus,
+        BRANCH_TREE,
+        |app| (app.selected_tree_repository_index().is_some()).then_some(Action::OpenRemotes)
+    ),
+    command_spec!(
+        RepositoryReflogOpen,
+        "repository.reflog.open",
+        &["g"],
+        "reflog",
+        true,
+        Primary,
+        None,
+        Focus,
+        BRANCH_TREE,
+        |app| (selected_repository_ready(app).is_some()
+            && app.selected_repository_node_index().is_some())
+        .then_some(Action::OpenReflog)
+    ),
+    command_spec!(
+        BranchSwitch,
+        "branch.switch",
+        &["s"],
+        "switch",
+        true,
+        Primary,
+        None,
+        Focus,
+        BRANCH_TREE,
+        |app| app
+            .selected_branch()
+            .is_some()
+            .then_some(Action::OpenSwitchBranchDialog)
+    ),
+    command_spec!(
+        BranchRebase,
+        "branch.rebase",
+        &["b"],
+        "rebase",
+        true,
+        Primary,
+        None,
+        Focus,
+        BRANCH_TREE,
+        |app| app
+            .selected_branch()
+            .is_some()
+            .then_some(Action::OpenRebaseDialog)
+    ),
+    command_spec!(
+        ListFilter,
+        "list.filter",
+        &["/"],
+        "filter",
+        true,
+        Contextual,
+        None,
+        Focus,
+        BRANCH_TREE | BRANCH_COMMITS | DETAIL_COMMITS,
+        |app| can_filter(app).then_some(Action::StartFilter)
+    ),
+    command_spec!(
+        CommitOpenDetail,
+        "commit.open_detail",
+        &["Enter"],
+        "detail",
+        true,
+        Primary,
+        None,
+        Focus,
+        BRANCH_COMMITS | DETAIL_COMMITS,
+        |app| (app.selected_commit().is_some()).then_some(Action::OpenCommitDetail)
+    ),
+    command_spec!(
+        CommitToggleSelection,
+        "commit.toggle_selection",
+        &["Space"],
+        "select",
+        true,
+        Primary,
+        None,
+        Focus,
+        BRANCH_COMMITS | DETAIL_COMMITS,
+        |app| (app.selected_commit().is_some()).then_some(Action::ToggleCommitCopySelection)
+    ),
+    command_spec!(
+        CommitQueueCherryPick,
+        "commit.cherry_pick.queue",
+        &["y"],
+        "queue",
+        true,
+        Primary,
+        None,
+        Focus,
+        BRANCH_COMMITS | DETAIL_COMMITS,
+        |app| (app.selected_commit().is_some()).then_some(Action::QueueCherryPickSelectedCommit)
+    ),
+    command_spec!(
+        CommitApplyCherryPickQueue,
+        "commit.cherry_pick.apply_queue",
+        &["Y"],
+        "cherry-pick",
+        true,
+        Primary,
+        None,
+        Focus,
+        BRANCH_COMMITS | DETAIL_COMMITS,
+        |app| (!app.cherry_pick_queue.is_empty()).then_some(Action::OpenCherryPickQueueDialog)
+    ),
+    command_spec!(
+        CommitReset,
+        "commit.reset",
+        &["R"],
+        "reset",
+        true,
+        Primary,
+        None,
+        Focus,
+        BRANCH_COMMITS | DETAIL_COMMITS | REFLOG,
+        |app| {
+            match app.screen {
+                Screen::Reflog => app.selected_reflog().is_some(),
+                _ => app.selected_commit().is_some(),
+            }
+            .then_some(Action::OpenResetDialog)
+        }
+    ),
+    command_spec!(
+        CommitFileToggleExpanded,
+        "commit.file.toggle_expanded",
+        &["Space"],
+        "expand",
+        true,
+        Primary,
+        None,
+        Focus,
+        DETAIL_FILES,
+        |app| (app.selected_file().is_some()).then_some(Action::ToggleFileExpanded)
+    ),
+    command_spec!(
+        CommitFileOpenDiff,
+        "commit.file.open_diff",
+        &["Enter", "v"],
+        "file diff",
+        true,
+        Primary,
+        None,
+        Focus,
+        DETAIL_FILES,
+        |app| (app.selected_file().is_some()).then_some(Action::OpenSelectedFileDiff)
+    ),
+    command_spec!(
+        FileOpenDiff,
+        "file.open_diff",
+        &["Enter"],
+        "file diff",
+        true,
+        Primary,
+        None,
+        Focus,
+        FILE_LIST,
+        |app| (app.selected_file().is_some()).then_some(Action::OpenSelectedFileDiff)
+    ),
+    command_spec!(
+        FileNext,
+        "file.next",
+        &["n"],
+        "next",
+        true,
+        Navigation,
+        None,
+        Focus,
+        FILE_LIST | FILE_DIFF,
+        |app| can_move_file(app, 1).then_some(Action::NextFile)
+    ),
+    command_spec!(
+        FilePrevious,
+        "file.previous",
+        &["p"],
+        "previous",
+        true,
+        Navigation,
+        None,
+        Focus,
+        FILE_LIST | FILE_DIFF,
+        |app| can_move_file(app, -1).then_some(Action::PrevFile)
+    ),
+    command_spec!(
+        DiffModeToggle,
+        "diff.mode.toggle",
+        &["v"],
+        "mode",
+        true,
+        Contextual,
+        None,
+        Focus,
+        FILE_LIST | FILE_DIFF | CHANGES_TREE | CHANGES_DIFF,
+        |app| active_diff(app).then_some(Action::ToggleDiffMode)
+    ),
+    command_spec!(
+        DiffWrapToggle,
+        "diff.wrap.toggle",
+        &["w"],
+        "wrap",
+        true,
+        Contextual,
+        None,
+        Focus,
+        FILE_LIST | FILE_DIFF | CHANGES_TREE | CHANGES_DIFF,
+        |app| active_diff(app).then_some(Action::ToggleWrap)
+    ),
+    command_spec!(
+        ChangesActivate,
+        "changes.activate",
+        &["Enter"],
+        "open/toggle",
+        true,
+        Primary,
+        None,
+        Focus,
+        CHANGES_TREE,
+        |app| (app.selected_changes_node().is_some()).then_some(Action::ActivateSelectedChange)
+    ),
+    command_spec!(
+        ChangesToggleSelection,
+        "changes.toggle_selection",
+        &["Space"],
+        "select",
+        true,
+        Primary,
+        None,
+        Focus,
+        CHANGES_TREE | CHANGES_DIFF,
+        |app| change_node_has_targets(app).then_some(Action::ToggleChangeSelection)
+    ),
+    command_spec!(
+        ChangesStage,
+        "changes.stage",
+        &["s"],
+        "stage",
+        true,
+        Primary,
+        None,
+        Focus,
+        CHANGES_TREE | CHANGES_DIFF,
+        |app| (!change_operation_paths(app, ChangeGroup::Unstaged).is_empty())
+            .then_some(Action::StageSelectedChanges)
+    ),
+    command_spec!(
+        ChangesUnstage,
+        "changes.unstage",
+        &["u"],
+        "unstage",
+        true,
+        Primary,
+        None,
+        Focus,
+        CHANGES_TREE | CHANGES_DIFF,
+        |app| (!change_operation_paths(app, ChangeGroup::Staged).is_empty())
+            .then_some(Action::UnstageSelectedChanges)
+    ),
+    command_spec!(
+        ChangesCommit,
+        "changes.commit",
+        &["c"],
+        "commit",
+        true,
+        Primary,
+        None,
+        Focus,
+        CHANGES_TREE | CHANGES_DIFF,
+        |app| (app.change_group_count(ChangeGroup::Staged) > 0).then_some(Action::OpenCommitDialog)
+    ),
+    command_spec!(
+        RemoteAdd,
+        "remote.add",
+        &["a"],
+        "add remote",
+        true,
+        Primary,
+        None,
+        Focus,
+        REMOTES,
+        |app| app
+            .remotes_repository_index
+            .is_some()
+            .then_some(Action::OpenAddRemoteEditor)
+    ),
+    command_spec!(
+        RemoteSetSharedUrl,
+        "remote.set_shared_url",
+        &["e"],
+        "set shared URL",
+        true,
+        Primary,
+        None,
+        Focus,
+        REMOTES,
+        |app| app
+            .selected_remote()
+            .is_some()
+            .then_some(Action::OpenSetRemoteUrlEditor)
+    ),
+    command_spec!(
+        RemoteSetUpstream,
+        "remote.set_upstream",
+        &["u"],
+        "set upstream",
+        true,
+        Primary,
+        None,
+        Focus,
+        REMOTES,
+        |app| app
+            .selected_remote()
+            .is_some()
+            .then_some(Action::OpenSetUpstreamRemoteDialog)
+    ),
+    command_spec!(
+        CommitCopyHash,
+        "commit.copy.hash",
+        &["Ctrl+C h"],
+        "hash",
+        true,
+        Primary,
+        Some("commit.copy"),
+        Focus,
+        BRANCH_COMMITS | DETAIL_COMMITS,
+        |app| (app.selected_commit().is_some()).then_some(Action::CopySelectedCommitHashes)
+    ),
+    command_spec!(
+        CommitCopyInfo,
+        "commit.copy.info",
+        &["Ctrl+C i"],
+        "info",
+        true,
+        Primary,
+        Some("commit.copy"),
+        Focus,
+        BRANCH_COMMITS | DETAIL_COMMITS,
+        |app| (app.selected_commit().is_some()).then_some(Action::CopyCurrentCommitInfo)
+    ),
+    command_spec!(
+        CommitCopyMessage,
+        "commit.copy.message",
+        &["Ctrl+C m"],
+        "message",
+        true,
+        Primary,
+        Some("commit.copy"),
+        Focus,
+        BRANCH_COMMITS | DETAIL_COMMITS,
+        |app| (app.selected_commit().is_some()).then_some(Action::CopyCurrentCommitMessage)
+    ),
+    command_spec!(
+        FileCopyName,
+        "file.copy.name",
+        &["Ctrl+C n"],
+        "file name",
+        true,
+        Primary,
+        Some("file.copy"),
+        Focus,
+        DETAIL_FILES | FILE_LIST,
+        |app| (app.selected_file().is_some()).then_some(Action::CopySelectedFileName)
+    ),
+    command_spec!(
+        FileCopyAbsolutePath,
+        "file.copy.absolute_path",
+        &["Ctrl+C a"],
+        "absolute path",
+        true,
+        Primary,
+        Some("file.copy"),
+        Focus,
+        DETAIL_FILES | FILE_LIST,
+        |app| (app.selected_file().is_some()).then_some(Action::CopySelectedFileAbsolutePath)
+    ),
+    command_spec!(
+        FileCopyRelativePath,
+        "file.copy.relative_path",
+        &["Ctrl+C r"],
+        "relative path",
+        true,
+        Primary,
+        Some("file.copy"),
+        Focus,
+        DETAIL_FILES | FILE_LIST,
+        |app| (app.selected_file().is_some()).then_some(Action::CopySelectedFileRelativePath)
+    ),
+];
+
 impl CommandId {
     pub const ALL: &'static [Self] = &[
         Self::AppQuit,
+        Self::AppShortcutHelp,
         Self::AppRefresh,
         Self::ViewChangesToggle,
         Self::FocusNext,
@@ -123,197 +928,36 @@ impl CommandId {
         Self::CommitCopyHash,
         Self::CommitCopyInfo,
         Self::CommitCopyMessage,
+        Self::FileCopyName,
+        Self::FileCopyAbsolutePath,
+        Self::FileCopyRelativePath,
     ];
 
     pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL
+        COMMAND_SPECS
             .iter()
-            .copied()
-            .find(|command| command.as_str() == value)
+            .find(|spec| spec.name == value)
+            .map(|spec| spec.id)
     }
 
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::AppQuit => "app.quit",
-            Self::AppRefresh => "app.refresh",
-            Self::ViewChangesToggle => "view.changes.toggle",
-            Self::FocusNext => "focus.next",
-            Self::FocusPrevious => "focus.previous",
-            Self::NavigationBack => "navigation.back",
-            Self::NavigationUp => "navigation.up",
-            Self::NavigationDown => "navigation.down",
-            Self::NavigationLeft => "navigation.left",
-            Self::NavigationRight => "navigation.right",
-            Self::NavigationPageUp => "navigation.page_up",
-            Self::NavigationPageDown => "navigation.page_down",
-            Self::NavigationHome => "navigation.home",
-            Self::NavigationEnd => "navigation.end",
-            Self::RepositoryActivate => "repository.activate",
-            Self::RepositoryFetch => "repository.fetch",
-            Self::RepositoryPullRebase => "repository.pull_rebase",
-            Self::RepositoryPush => "repository.push",
-            Self::RepositoryRemotesOpen => "repository.remotes.open",
-            Self::RepositoryReflogOpen => "repository.reflog.open",
-            Self::BranchSwitch => "branch.switch",
-            Self::BranchRebase => "branch.rebase",
-            Self::ListFilter => "list.filter",
-            Self::CommitOpenDetail => "commit.open_detail",
-            Self::CommitToggleSelection => "commit.toggle_selection",
-            Self::CommitQueueCherryPick => "commit.cherry_pick.queue",
-            Self::CommitApplyCherryPickQueue => "commit.cherry_pick.apply_queue",
-            Self::CommitReset => "commit.reset",
-            Self::CommitFileToggleExpanded => "commit.file.toggle_expanded",
-            Self::CommitFileOpenDiff => "commit.file.open_diff",
-            Self::FileOpenDiff => "file.open_diff",
-            Self::FileNext => "file.next",
-            Self::FilePrevious => "file.previous",
-            Self::DiffModeToggle => "diff.mode.toggle",
-            Self::DiffWrapToggle => "diff.wrap.toggle",
-            Self::ChangesActivate => "changes.activate",
-            Self::ChangesToggleSelection => "changes.toggle_selection",
-            Self::ChangesStage => "changes.stage",
-            Self::ChangesUnstage => "changes.unstage",
-            Self::ChangesCommit => "changes.commit",
-            Self::RemoteAdd => "remote.add",
-            Self::RemoteSetSharedUrl => "remote.set_shared_url",
-            Self::RemoteSetUpstream => "remote.set_upstream",
-            Self::CommitCopyHash => "commit.copy.hash",
-            Self::CommitCopyInfo => "commit.copy.info",
-            Self::CommitCopyMessage => "commit.copy.message",
-        }
+        self.spec().name
     }
 
     pub fn default_bindings(self) -> &'static [&'static str] {
-        match self {
-            Self::AppQuit => &["q", "Ctrl+C"],
-            Self::AppRefresh => &["Ctrl+R"],
-            Self::ViewChangesToggle => &["Ctrl+G"],
-            Self::FocusNext => &["Tab"],
-            Self::FocusPrevious => &["BackTab"],
-            Self::NavigationBack => &["Esc"],
-            Self::NavigationUp => &["Up", "k"],
-            Self::NavigationDown => &["Down", "j"],
-            Self::NavigationLeft => &["Left", "h"],
-            Self::NavigationRight => &["Right", "l"],
-            Self::NavigationPageUp => &["PageUp"],
-            Self::NavigationPageDown => &["PageDown"],
-            Self::NavigationHome => &["Home"],
-            Self::NavigationEnd => &["End"],
-            Self::RepositoryActivate | Self::CommitOpenDetail | Self::ChangesActivate => &["Enter"],
-            Self::RepositoryFetch => &["f"],
-            Self::RepositoryPullRebase => &["p"],
-            Self::RepositoryPush => &["P"],
-            Self::RepositoryRemotesOpen => &["o"],
-            Self::RepositoryReflogOpen => &["g"],
-            Self::BranchSwitch => &["s"],
-            Self::BranchRebase => &["b"],
-            Self::ListFilter => &["/"],
-            Self::CommitToggleSelection
-            | Self::CommitFileToggleExpanded
-            | Self::ChangesToggleSelection => &["Space"],
-            Self::CommitQueueCherryPick => &["y"],
-            Self::CommitApplyCherryPickQueue => &["Y"],
-            Self::CommitReset => &["R"],
-            Self::CommitFileOpenDiff => &["Enter", "v"],
-            Self::FileOpenDiff => &["Enter"],
-            Self::FileNext => &["n"],
-            Self::FilePrevious => &["p"],
-            Self::DiffModeToggle => &["v"],
-            Self::DiffWrapToggle => &["w"],
-            Self::ChangesStage => &["s"],
-            Self::ChangesUnstage => &["u"],
-            Self::ChangesCommit => &["c"],
-            Self::RemoteAdd => &["a"],
-            Self::RemoteSetSharedUrl => &["e"],
-            Self::RemoteSetUpstream => &["u"],
-            Self::CommitCopyHash => &["Ctrl+C h"],
-            Self::CommitCopyInfo => &["Ctrl+C i"],
-            Self::CommitCopyMessage => &["Ctrl+C m"],
-        }
+        self.spec().default_bindings
     }
 
     pub fn default_label(self) -> &'static str {
-        match self {
-            Self::AppQuit => "quit",
-            Self::AppRefresh => "refresh",
-            Self::ViewChangesToggle => "changes",
-            Self::FocusNext | Self::FocusPrevious => "focus",
-            Self::NavigationBack => "back",
-            Self::NavigationUp => "up",
-            Self::NavigationDown => "down",
-            Self::NavigationLeft => "left",
-            Self::NavigationRight => "right",
-            Self::NavigationPageUp => "page up",
-            Self::NavigationPageDown => "page down",
-            Self::NavigationHome => "first/top",
-            Self::NavigationEnd => "last/bottom",
-            Self::RepositoryActivate => "open",
-            Self::RepositoryFetch => "fetch",
-            Self::RepositoryPullRebase => "pull --rebase",
-            Self::RepositoryPush => "push",
-            Self::RepositoryRemotesOpen => "remotes",
-            Self::RepositoryReflogOpen => "reflog",
-            Self::BranchSwitch => "switch",
-            Self::BranchRebase => "rebase",
-            Self::ListFilter => "filter",
-            Self::CommitOpenDetail => "detail",
-            Self::CommitToggleSelection => "select",
-            Self::CommitQueueCherryPick => "queue",
-            Self::CommitApplyCherryPickQueue => "cherry-pick",
-            Self::CommitReset => "reset",
-            Self::CommitFileToggleExpanded => "expand",
-            Self::CommitFileOpenDiff => "file diff",
-            Self::FileOpenDiff => "file diff",
-            Self::FileNext => "next",
-            Self::FilePrevious => "previous",
-            Self::DiffModeToggle => "mode",
-            Self::DiffWrapToggle => "wrap",
-            Self::ChangesActivate => "open/toggle",
-            Self::ChangesToggleSelection => "select",
-            Self::ChangesStage => "stage",
-            Self::ChangesUnstage => "unstage",
-            Self::ChangesCommit => "commit",
-            Self::RemoteAdd => "add remote",
-            Self::RemoteSetSharedUrl => "set shared URL",
-            Self::RemoteSetUpstream => "set upstream",
-            Self::CommitCopyHash => "hash",
-            Self::CommitCopyInfo => "info",
-            Self::CommitCopyMessage => "message",
-        }
+        self.spec().default_label
     }
 
     pub fn default_visible(self) -> bool {
-        !matches!(
-            self,
-            Self::FocusPrevious
-                | Self::NavigationUp
-                | Self::NavigationDown
-                | Self::NavigationLeft
-                | Self::NavigationRight
-        )
+        self.spec().default_visible
     }
 
     pub fn footer_group(self) -> FooterGroup {
-        match self {
-            Self::AppRefresh | Self::ViewChangesToggle => FooterGroup::Global,
-            Self::AppQuit | Self::NavigationBack => FooterGroup::Safety,
-            Self::FocusNext
-            | Self::FocusPrevious
-            | Self::NavigationUp
-            | Self::NavigationDown
-            | Self::NavigationLeft
-            | Self::NavigationRight
-            | Self::NavigationPageUp
-            | Self::NavigationPageDown
-            | Self::NavigationHome
-            | Self::NavigationEnd
-            | Self::FileNext
-            | Self::FilePrevious => FooterGroup::Navigation,
-            Self::ListFilter | Self::DiffModeToggle | Self::DiffWrapToggle => {
-                FooterGroup::Contextual
-            }
-            _ => FooterGroup::Primary,
-        }
+        self.spec().footer_group
     }
 
     pub fn default_priority(self) -> u16 {
@@ -327,90 +971,17 @@ impl CommandId {
     }
 
     pub fn chord_group(self) -> Option<&'static str> {
-        matches!(
-            self,
-            Self::CommitCopyHash | Self::CommitCopyInfo | Self::CommitCopyMessage
-        )
-        .then_some("commit.copy")
+        self.spec().chord_group
     }
 
-    /// Conservative static contexts used while validating configured key
-    /// collisions. Runtime actionability applies the finer state predicates.
-    pub fn context_mask(self) -> u16 {
-        const BRANCH_TREE: u16 = 1 << 0;
-        const BRANCH_COMMITS: u16 = 1 << 1;
-        const DETAIL_COMMITS: u16 = 1 << 2;
-        const DETAIL_FILES: u16 = 1 << 3;
-        const FILE_LIST: u16 = 1 << 4;
-        const FILE_DIFF: u16 = 1 << 5;
-        const REFLOG: u16 = 1 << 6;
-        const CHANGES_TREE: u16 = 1 << 7;
-        const CHANGES_DIFF: u16 = 1 << 8;
-        const REMOTES: u16 = 1 << 9;
-        const ALL: u16 = (1 << 10) - 1;
+    pub fn mount(self) -> CommandMount {
+        self.spec().mount
+    }
 
-        match self {
-            Self::AppQuit
-            | Self::AppRefresh
-            | Self::ViewChangesToggle
-            | Self::NavigationUp
-            | Self::NavigationDown
-            | Self::NavigationPageUp
-            | Self::NavigationPageDown
-            | Self::NavigationHome
-            | Self::NavigationEnd => ALL,
-            Self::FocusNext | Self::FocusPrevious => {
-                BRANCH_TREE
-                    | BRANCH_COMMITS
-                    | DETAIL_COMMITS
-                    | DETAIL_FILES
-                    | FILE_LIST
-                    | FILE_DIFF
-                    | CHANGES_TREE
-                    | CHANGES_DIFF
-            }
-            Self::NavigationBack => ALL & !BRANCH_TREE & !BRANCH_COMMITS,
-            Self::NavigationLeft | Self::NavigationRight => {
-                BRANCH_TREE
-                    | BRANCH_COMMITS
-                    | DETAIL_COMMITS
-                    | DETAIL_FILES
-                    | FILE_LIST
-                    | FILE_DIFF
-                    | CHANGES_TREE
-                    | CHANGES_DIFF
-            }
-            Self::RepositoryActivate
-            | Self::RepositoryFetch
-            | Self::RepositoryPullRebase
-            | Self::RepositoryPush
-            | Self::RepositoryRemotesOpen
-            | Self::RepositoryReflogOpen
-            | Self::BranchSwitch
-            | Self::BranchRebase => BRANCH_TREE,
-            Self::ListFilter => BRANCH_TREE | BRANCH_COMMITS | DETAIL_COMMITS,
-            Self::CommitOpenDetail
-            | Self::CommitToggleSelection
-            | Self::CommitApplyCherryPickQueue => BRANCH_COMMITS | DETAIL_COMMITS,
-            Self::CommitQueueCherryPick => BRANCH_COMMITS | DETAIL_COMMITS | DETAIL_FILES,
-            Self::CommitReset => BRANCH_COMMITS | DETAIL_COMMITS | REFLOG,
-            Self::CommitFileToggleExpanded => DETAIL_FILES,
-            Self::CommitFileOpenDiff => DETAIL_FILES,
-            Self::FileOpenDiff => FILE_LIST,
-            Self::FileNext | Self::FilePrevious => FILE_LIST | FILE_DIFF,
-            Self::DiffModeToggle | Self::DiffWrapToggle => {
-                FILE_LIST | FILE_DIFF | CHANGES_TREE | CHANGES_DIFF
-            }
-            Self::ChangesActivate => CHANGES_TREE,
-            Self::ChangesToggleSelection
-            | Self::ChangesStage
-            | Self::ChangesUnstage
-            | Self::ChangesCommit => CHANGES_TREE | CHANGES_DIFF,
-            Self::RemoteAdd | Self::RemoteSetSharedUrl | Self::RemoteSetUpstream => REMOTES,
-            Self::CommitCopyHash | Self::CommitCopyInfo | Self::CommitCopyMessage => {
-                BRANCH_TREE | BRANCH_COMMITS | DETAIL_COMMITS | DETAIL_FILES | FILE_LIST | FILE_DIFF
-            }
-        }
+    /// Exact focus tables used while validating configured key collisions.
+    /// Runtime actionability applies the finer selection/pending predicates.
+    pub fn context_mask(self) -> u16 {
+        self.spec().contexts
     }
 
     pub fn action(self, app: &AppState) -> Option<Action> {
@@ -420,194 +991,205 @@ impl CommandId {
         ) {
             return None;
         }
-        match self {
-            Self::AppQuit => Some(Action::Quit),
-            Self::AppRefresh if !app.repositories.is_empty() => Some(Action::RefreshRepository),
-            Self::ViewChangesToggle
-                if app.screen == Screen::Changes || app.active_repository_index.is_some() =>
-            {
-                Some(Action::ToggleChanges)
+        let spec = self.spec();
+        if spec.mount == CommandMount::Focus {
+            let context = ShortcutContext::from_app(app)?;
+            if spec.contexts & context.mask() == 0 {
+                return None;
             }
-            Self::FocusNext if has_multiple_panels(app.screen) => Some(Action::FocusNext),
-            Self::FocusPrevious if has_multiple_panels(app.screen) => Some(Action::FocusPrev),
-            Self::NavigationBack if app.screen != Screen::BranchOverview => Some(Action::Back),
-            Self::NavigationUp if can_move(app, -1) => Some(Action::MoveUp),
-            Self::NavigationDown if can_move(app, 1) => Some(Action::MoveDown),
-            Self::NavigationLeft if can_move_horizontal(app, false) => Some(Action::MoveLeft),
-            Self::NavigationRight if can_move_horizontal(app, true) => Some(Action::MoveRight),
-            Self::NavigationPageUp if can_move(app, -1) => Some(Action::PageUp),
-            Self::NavigationPageDown if can_move(app, 1) => Some(Action::PageDown),
-            Self::NavigationHome if can_move(app, -1) => Some(Action::Home),
-            Self::NavigationEnd if can_move(app, 1) => Some(Action::End),
-            Self::RepositoryActivate
-                if app.screen == Screen::BranchOverview
-                    && app.focus == FocusPanel::BranchList
-                    && app.selected_tree_node().is_some() =>
-            {
-                Some(Action::LoadCommitsForSelectedBranch)
-            }
-            Self::RepositoryFetch
-                if selected_repository_ready(app).is_some()
-                    && app.selected_repository_node_index().is_some() =>
-            {
-                Some(Action::OpenFetchRepositoryDialog)
-            }
-            Self::RepositoryPullRebase
-                if selected_repository_ready(app).is_some()
-                    && app.selected_repository_node_index().is_some() =>
-            {
-                Some(Action::OpenPullRebaseDialog)
-            }
-            Self::RepositoryPush
-                if selected_repository_ready(app).is_some()
-                    && app.selected_repository_node_index().is_some() =>
-            {
-                Some(Action::OpenPushDialog)
-            }
-            Self::RepositoryRemotesOpen
-                if app.screen == Screen::BranchOverview
-                    && app.focus == FocusPanel::BranchList
-                    && app.selected_tree_repository_index().is_some() =>
-            {
-                Some(Action::OpenRemotes)
-            }
-            Self::RepositoryReflogOpen
-                if selected_repository_ready(app).is_some()
-                    && app.selected_repository_node_index().is_some() =>
-            {
-                Some(Action::OpenReflog)
-            }
-            Self::BranchSwitch
-                if app.screen == Screen::BranchOverview
-                    && app.focus == FocusPanel::BranchList
-                    && app.selected_branch().is_some() =>
-            {
-                Some(Action::OpenSwitchBranchDialog)
-            }
-            Self::BranchRebase
-                if app.screen == Screen::BranchOverview
-                    && app.focus == FocusPanel::BranchList
-                    && app.selected_branch().is_some() =>
-            {
-                Some(Action::OpenRebaseDialog)
-            }
-            Self::ListFilter if can_filter(app) => Some(Action::StartFilter),
-            Self::CommitOpenDetail
-                if commit_list_focused(app) && app.selected_commit().is_some() =>
-            {
-                Some(Action::OpenCommitDetail)
-            }
-            Self::CommitToggleSelection
-                if commit_list_focused(app) && app.selected_commit().is_some() =>
-            {
-                Some(Action::ToggleCommitCopySelection)
-            }
-            Self::CommitQueueCherryPick
-                if commit_context(app) && app.selected_commit().is_some() =>
-            {
-                Some(Action::QueueCherryPickSelectedCommit)
-            }
-            Self::CommitApplyCherryPickQueue
-                if commit_list_focused(app) && !app.cherry_pick_queue.is_empty() =>
-            {
-                Some(Action::OpenCherryPickQueueDialog)
-            }
-            Self::CommitReset
-                if ((commit_list_focused(app) && app.selected_commit().is_some())
-                    || (app.screen == Screen::Reflog
-                        && app.focus == FocusPanel::ReflogList
-                        && app.selected_reflog().is_some())) =>
-            {
-                Some(Action::OpenResetDialog)
-            }
-            Self::CommitFileToggleExpanded
-                if app.screen == Screen::CommitDetail
-                    && app.focus == FocusPanel::CommitFileList
-                    && app.selected_file().is_some() =>
-            {
-                Some(Action::ToggleFileExpanded)
-            }
-            Self::CommitFileOpenDiff
-                if app.screen == Screen::CommitDetail
-                    && app.focus == FocusPanel::CommitFileList
-                    && app.selected_file().is_some() =>
-            {
-                Some(Action::OpenSelectedFileDiff)
-            }
-            Self::FileOpenDiff
-                if app.screen == Screen::FileDiffDetail
-                    && app.focus == FocusPanel::FileList
-                    && app.selected_file().is_some() =>
-            {
-                Some(Action::OpenSelectedFileDiff)
-            }
-            Self::FileNext if app.screen == Screen::FileDiffDetail && can_move_file(app, 1) => {
-                Some(Action::NextFile)
-            }
-            Self::FilePrevious
-                if app.screen == Screen::FileDiffDetail && can_move_file(app, -1) =>
-            {
-                Some(Action::PrevFile)
-            }
-            Self::DiffModeToggle if active_diff(app) => Some(Action::ToggleDiffMode),
-            Self::DiffWrapToggle if active_diff(app) => Some(Action::ToggleWrap),
-            Self::ChangesActivate
-                if app.screen == Screen::Changes
-                    && app.focus == FocusPanel::ChangesTree
-                    && app.selected_changes_node().is_some() =>
-            {
-                Some(Action::ActivateSelectedChange)
-            }
-            Self::ChangesToggleSelection
-                if app.screen == Screen::Changes && change_node_has_targets(app) =>
-            {
-                Some(Action::ToggleChangeSelection)
-            }
-            Self::ChangesStage if change_operation_paths(app, ChangeGroup::Unstaged).is_empty() => {
-                None
-            }
-            Self::ChangesStage if app.screen == Screen::Changes => {
-                Some(Action::StageSelectedChanges)
-            }
-            Self::ChangesUnstage if change_operation_paths(app, ChangeGroup::Staged).is_empty() => {
-                None
-            }
-            Self::ChangesUnstage if app.screen == Screen::Changes => {
-                Some(Action::UnstageSelectedChanges)
-            }
-            Self::ChangesCommit
-                if app.screen == Screen::Changes
-                    && app.change_group_count(ChangeGroup::Staged) > 0 =>
-            {
-                Some(Action::OpenCommitDialog)
-            }
-            Self::RemoteAdd
-                if app.screen == Screen::Remotes
-                    && app.focus == FocusPanel::RemoteList
-                    && app.remotes_repository_index.is_some() =>
-            {
-                Some(Action::OpenAddRemoteEditor)
-            }
-            Self::RemoteSetSharedUrl
-                if app.screen == Screen::Remotes
-                    && app.focus == FocusPanel::RemoteList
-                    && app.selected_remote().is_some() =>
-            {
-                Some(Action::OpenSetRemoteUrlEditor)
-            }
-            Self::RemoteSetUpstream
-                if app.screen == Screen::Remotes
-                    && app.focus == FocusPanel::RemoteList
-                    && app.selected_remote().is_some() =>
-            {
-                Some(Action::OpenSetUpstreamRemoteDialog)
-            }
-            Self::CommitCopyHash if copy_context(app) => Some(Action::CopySelectedCommitHashes),
-            Self::CommitCopyInfo if copy_context(app) => Some(Action::CopyCurrentCommitInfo),
-            Self::CommitCopyMessage if copy_context(app) => Some(Action::CopyCurrentCommitMessage),
-            _ => None,
         }
+        (spec.invoke)(app)
     }
+
+    pub fn spec(self) -> &'static CommandSpec {
+        &COMMAND_SPECS[self as usize]
+    }
+}
+
+/// A non-configurable operation table used while a modal editor or safety
+/// dialog owns keyboard input. These tables are also rendered in the global
+/// shortcut reference, so commit submission and remote editing cannot drift
+/// away from their documented operation sets.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(usize)]
+pub enum ModalShortcutSetId {
+    Filter,
+    Confirmation,
+    ResetMode,
+    TypedConfirmation,
+    CommitMessage,
+    RemoteAdd,
+    RemoteUrl,
+    Error,
+    ShortcutHelp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModalShortcutHint {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub operation: &'static str,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ModalShortcutSet {
+    pub id: ModalShortcutSetId,
+    pub title: &'static str,
+    pub footer: &'static str,
+    pub hints: &'static [ModalShortcutHint],
+}
+
+impl ModalShortcutSetId {
+    pub const ALL: &'static [Self] = &[
+        Self::Filter,
+        Self::Confirmation,
+        Self::ResetMode,
+        Self::TypedConfirmation,
+        Self::CommitMessage,
+        Self::RemoteAdd,
+        Self::RemoteUrl,
+        Self::Error,
+        Self::ShortcutHelp,
+    ];
+
+    pub fn spec(self) -> &'static ModalShortcutSet {
+        &MODAL_SHORTCUT_SETS[self as usize]
+    }
+}
+
+macro_rules! modal_hint {
+    ($key:literal, $label:literal, $operation:literal) => {
+        ModalShortcutHint {
+            key: $key,
+            label: $label,
+            operation: $operation,
+        }
+    };
+}
+
+pub static MODAL_SHORTCUT_SETS: &[ModalShortcutSet] = &[
+    ModalShortcutSet {
+        id: ModalShortcutSetId::Filter,
+        title: "Mode · filter editor",
+        footer: "Text input | Backspace delete | Enter apply | Esc cancel",
+        hints: &[
+            modal_hint!("text", "append query", "UpdateFilter"),
+            modal_hint!("Backspace", "delete character", "UpdateFilter"),
+            modal_hint!("Enter", "apply filter", "SubmitFilter"),
+            modal_hint!("Esc", "cancel filter", "CancelFilter"),
+        ],
+    },
+    ModalShortcutSet {
+        id: ModalShortcutSetId::Confirmation,
+        title: "Mode · safety confirmation",
+        footer: "Enter confirm | Esc / q cancel",
+        hints: &[
+            modal_hint!("Enter", "confirm operation", "Confirm"),
+            modal_hint!("Esc / q", "cancel operation", "Cancel"),
+        ],
+    },
+    ModalShortcutSet {
+        id: ModalShortcutSetId::ResetMode,
+        title: "Mode · reset mode selection",
+        footer: "s soft | m mixed | h hard | Esc / q cancel",
+        hints: &[
+            modal_hint!("s", "choose soft reset", "ChooseResetSoft"),
+            modal_hint!("m", "choose mixed reset", "ChooseResetMixed"),
+            modal_hint!("h", "choose hard reset", "ChooseResetHard"),
+            modal_hint!("Esc / q", "cancel reset", "Cancel"),
+        ],
+    },
+    ModalShortcutSet {
+        id: ModalShortcutSetId::TypedConfirmation,
+        title: "Mode · hard-reset hash confirmation",
+        footer: "Text input | Backspace delete | Enter final confirm | Esc cancel",
+        hints: &[
+            modal_hint!("text", "append short hash", "UpdateTypedConfirmation"),
+            modal_hint!("Backspace", "delete character", "UpdateTypedConfirmation"),
+            modal_hint!("Enter", "confirm exact hash", "ConfirmReset"),
+            modal_hint!("Esc", "cancel reset", "Cancel"),
+        ],
+    },
+    ModalShortcutSet {
+        id: ModalShortcutSetId::CommitMessage,
+        title: "Mode · commit submission",
+        footer: "Text input | Backspace delete | Enter create commit | Esc cancel",
+        hints: &[
+            modal_hint!("text", "append commit message", "UpdateCommitMessage"),
+            modal_hint!("Backspace", "delete character", "UpdateCommitMessage"),
+            modal_hint!("Enter", "create commit", "SubmitCommit"),
+            modal_hint!("Esc", "cancel commit", "Cancel"),
+        ],
+    },
+    ModalShortcutSet {
+        id: ModalShortcutSetId::RemoteAdd,
+        title: "Mode · add remote editor",
+        footer: "Text input | Backspace delete | Tab switch field | Enter continue | Esc cancel",
+        hints: &[
+            modal_hint!("text", "edit active field", "UpdateRemoteName/Url"),
+            modal_hint!("Backspace", "delete character", "UpdateRemoteName/Url"),
+            modal_hint!("Tab / BackTab", "switch field", "FocusNextRemoteField"),
+            modal_hint!("Enter", "validate / continue", "SubmitRemoteEditor"),
+            modal_hint!("Esc", "cancel remote edit", "Cancel"),
+        ],
+    },
+    ModalShortcutSet {
+        id: ModalShortcutSetId::RemoteUrl,
+        title: "Mode · shared remote URL editor",
+        footer: "Text input | Backspace delete | Enter continue | Esc cancel",
+        hints: &[
+            modal_hint!("text", "edit shared URL", "UpdateRemoteUrl"),
+            modal_hint!("Backspace", "delete character", "UpdateRemoteUrl"),
+            modal_hint!("Enter", "validate / continue", "SubmitRemoteEditor"),
+            modal_hint!("Esc", "cancel remote edit", "Cancel"),
+        ],
+    },
+    ModalShortcutSet {
+        id: ModalShortcutSetId::Error,
+        title: "Mode · command error",
+        footer: "Enter / Esc / q dismiss",
+        hints: &[modal_hint!(
+            "Enter / Esc / q",
+            "dismiss error",
+            "DismissError"
+        )],
+    },
+    ModalShortcutSet {
+        id: ModalShortcutSetId::ShortcutHelp,
+        title: "Mode · shortcut reference",
+        footer: "↑/↓ scroll | PageUp/PageDown page | Home/End jump | Esc close",
+        hints: &[
+            modal_hint!("Up / k", "scroll up", "MoveUp"),
+            modal_hint!("Down / j", "scroll down", "MoveDown"),
+            modal_hint!("PageUp / PageDown", "scroll page", "PageUp/PageDown"),
+            modal_hint!("Home / End", "jump start/end", "Home/End"),
+            modal_hint!("Ctrl+? / ? / Enter / Esc / q", "close reference", "Cancel"),
+        ],
+    },
+];
+
+pub fn modal_shortcut_set_id(mode: &GlobalMode) -> Option<ModalShortcutSetId> {
+    match mode {
+        GlobalMode::Filtering { .. } => Some(ModalShortcutSetId::Filter),
+        GlobalMode::Confirming {
+            dialog: ConfirmDialog::ResetModeChoice { .. },
+        } => Some(ModalShortcutSetId::ResetMode),
+        GlobalMode::Confirming { .. } => Some(ModalShortcutSetId::Confirmation),
+        GlobalMode::TypingConfirmation { .. } => Some(ModalShortcutSetId::TypedConfirmation),
+        GlobalMode::EditingCommitMessage { .. } => Some(ModalShortcutSetId::CommitMessage),
+        GlobalMode::EditingRemote {
+            kind: RemoteEditKind::Add,
+            ..
+        } => Some(ModalShortcutSetId::RemoteAdd),
+        GlobalMode::EditingRemote { .. } => Some(ModalShortcutSetId::RemoteUrl),
+        GlobalMode::Error => Some(ModalShortcutSetId::Error),
+        GlobalMode::ShortcutHelp { .. } => Some(ModalShortcutSetId::ShortcutHelp),
+        GlobalMode::Normal | GlobalMode::Chord { .. } => None,
+    }
+}
+
+pub fn modal_shortcut_set(mode: &GlobalMode) -> Option<&'static ModalShortcutSet> {
+    modal_shortcut_set_id(mode).map(ModalShortcutSetId::spec)
 }
 
 fn has_multiple_panels(screen: Screen) -> bool {
@@ -625,27 +1207,6 @@ fn can_filter(app: &AppState) -> bool {
             FocusPanel::BranchList | FocusPanel::CommitList
         ) | (Screen::CommitDetail, FocusPanel::CommitList)
     )
-}
-
-fn commit_list_focused(app: &AppState) -> bool {
-    matches!(
-        (app.screen, app.focus),
-        (
-            Screen::BranchOverview | Screen::CommitDetail,
-            FocusPanel::CommitList
-        )
-    )
-}
-
-fn commit_context(app: &AppState) -> bool {
-    matches!(
-        app.screen,
-        Screen::BranchOverview | Screen::CommitDetail | Screen::FileDiffDetail
-    )
-}
-
-fn copy_context(app: &AppState) -> bool {
-    commit_context(app) && app.selected_commit().is_some()
 }
 
 fn active_diff(app: &AppState) -> bool {
@@ -738,20 +1299,43 @@ fn can_scroll(offset: u16, line_count: usize, delta: isize) -> bool {
     }
 }
 
-fn can_move_horizontal(app: &AppState, expand: bool) -> bool {
+fn can_move_horizontal(app: &AppState, right: bool) -> bool {
     if app.screen == Screen::Changes && app.focus == FocusPanel::ChangesTree {
         return match app.selected_changes_node() {
-            Some(ChangesTreeNode::Root) => app.expansion.changes_root_expanded != expand,
+            Some(ChangesTreeNode::Root) => app.expansion.changes_root_expanded != right,
             Some(ChangesTreeNode::Group(ChangeGroup::Staged)) => {
-                app.expansion.staged_changes_expanded != expand
+                app.expansion.staged_changes_expanded != right
             }
             Some(ChangesTreeNode::Group(ChangeGroup::Unstaged)) => {
-                app.expansion.unstaged_changes_expanded != expand
+                app.expansion.unstaged_changes_expanded != right
             }
             Some(ChangesTreeNode::File { .. }) | None => false,
         };
     }
-    has_multiple_panels(app.screen)
+
+    match (app.screen, app.focus, right) {
+        // Branches | Commits
+        (Screen::BranchOverview, FocusPanel::BranchList, true) => true,
+        (Screen::BranchOverview, FocusPanel::CommitList, false) => true,
+        (Screen::BranchOverview, FocusPanel::CommitList, true) => app.selected_commit().is_some(),
+
+        // Commits | Commit (metadata + files). Crossing either outer edge
+        // slides the two-column hierarchy instead of wrapping focus.
+        (Screen::CommitDetail, FocusPanel::CommitList, false) => true,
+        (Screen::CommitDetail, FocusPanel::CommitList, true) => true,
+        (Screen::CommitDetail, FocusPanel::CommitFileList, false) => true,
+        (Screen::CommitDetail, FocusPanel::CommitFileList, true) => app.selected_file().is_some(),
+
+        // Commit (metadata + files) | Diff
+        (Screen::FileDiffDetail, FocusPanel::FileList, false) => true,
+        (Screen::FileDiffDetail, FocusPanel::FileList, true) => true,
+        (Screen::FileDiffDetail, FocusPanel::DiffView, false) => true,
+
+        // Changes keeps its existing tree expand/collapse semantics; only a
+        // focused diff can move back to the tree with Left.
+        (Screen::Changes, FocusPanel::ChangesDiff, false) => true,
+        _ => false,
+    }
 }
 
 fn change_node_has_targets(app: &AppState) -> bool {
@@ -799,16 +1383,27 @@ fn change_operation_paths(app: &AppState, group: ChangeGroup) -> Vec<GitPath> {
 mod tests {
     use std::collections::HashSet;
 
-    use super::CommandId;
+    use super::{COMMAND_SPECS, CommandId, MODAL_SHORTCUT_SETS, ModalShortcutSetId};
 
     #[test]
     fn registry_lists_every_command_once_and_ids_round_trip() {
-        assert_eq!(CommandId::ALL.len(), 46);
+        assert_eq!(CommandId::ALL.len(), 50);
+        assert_eq!(COMMAND_SPECS.len(), CommandId::ALL.len());
         let mut ids = HashSet::new();
-        for command in CommandId::ALL.iter().copied() {
+        for (index, command) in CommandId::ALL.iter().copied().enumerate() {
+            assert_eq!(COMMAND_SPECS[index].id, command, "jump-table order drift");
             assert!(ids.insert(command.as_str()), "duplicate command id");
             assert_eq!(CommandId::parse(command.as_str()), Some(command));
             assert!(!command.default_bindings().is_empty());
+        }
+    }
+
+    #[test]
+    fn modal_operation_sets_are_index_aligned() {
+        assert_eq!(MODAL_SHORTCUT_SETS.len(), ModalShortcutSetId::ALL.len());
+        for (index, id) in ModalShortcutSetId::ALL.iter().copied().enumerate() {
+            assert_eq!(MODAL_SHORTCUT_SETS[index].id, id);
+            assert!(!id.spec().hints.is_empty());
         }
     }
 }

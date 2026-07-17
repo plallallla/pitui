@@ -354,13 +354,31 @@ impl App {
                         .selected_commit()
                         .is_none_or(|selected| &selected.hash != commit)
             }
-            PendingJobKind::FileDiff { .. } => {
+            PendingJobKind::FileDiff {
+                commit,
+                path,
+                focus_diff,
+                ..
+            } => {
                 self.state.latest_file_diff_job != Some(id)
                     || self.state.branch_commits_repository_index != Some(repository_index)
-                    || !matches!(
-                        self.state.screen,
-                        Screen::CommitDetail | Screen::FileDiffDetail
-                    )
+                    || self
+                        .state
+                        .current_commit_detail
+                        .as_ref()
+                        .is_none_or(|detail| &detail.commit.hash != commit)
+                    || self
+                        .state
+                        .selected_file()
+                        .is_none_or(|file| &file.path != path)
+                    || if *focus_diff {
+                        !matches!(
+                            self.state.screen,
+                            Screen::CommitDetail | Screen::FileDiffDetail
+                        )
+                    } else {
+                        self.state.screen != Screen::FileDiffDetail
+                    }
             }
             PendingJobKind::Reflog { .. } => {
                 self.state.latest_reflog_job != Some(id)
@@ -875,6 +893,7 @@ impl App {
             GlobalMode::EditingCommitMessage { .. } => self.dispatch_commit_message(action),
             GlobalMode::EditingRemote { .. } => self.dispatch_remote_editor(action),
             GlobalMode::Chord { .. } => self.dispatch_chord(action),
+            GlobalMode::ShortcutHelp { .. } => self.dispatch_shortcut_help(action),
             GlobalMode::Error => match action {
                 Action::DismissError | Action::Cancel | Action::Back | Action::Confirm => {
                     self.state.dismiss_error();
@@ -887,6 +906,34 @@ impl App {
 
     fn on_tick(&mut self) {
         self.state.tick_count = self.state.tick_count.wrapping_add(1);
+    }
+
+    fn dispatch_shortcut_help(&mut self, action: Action) {
+        if matches!(
+            action,
+            Action::Cancel | Action::Back | Action::Confirm | Action::OpenShortcutHelp
+        ) {
+            self.state.close_popup();
+            return;
+        }
+        let GlobalMode::ShortcutHelp { scroll } = &mut self.state.mode else {
+            return;
+        };
+        let maximum = self
+            .state
+            .config
+            .shortcut_help_line_count()
+            .saturating_sub(1)
+            .min(usize::from(u16::MAX)) as u16;
+        *scroll = match action {
+            Action::MoveUp => scroll.saturating_sub(1),
+            Action::MoveDown => scroll.saturating_add(1).min(maximum),
+            Action::PageUp => scroll.saturating_sub(PAGE_SIZE as u16),
+            Action::PageDown => scroll.saturating_add(PAGE_SIZE as u16).min(maximum),
+            Action::Home => 0,
+            Action::End => maximum,
+            _ => *scroll,
+        };
     }
 
     fn dispatch_filtering(&mut self, action: Action) {
@@ -1390,8 +1437,10 @@ impl App {
             Action::MoveRight if self.state.focus == FocusPanel::ChangesTree => {
                 self.expand_selected_change_node()
             }
-            Action::MoveLeft | Action::FocusPrev => self.focus_previous(),
-            Action::MoveRight | Action::FocusNext => self.focus_next(),
+            Action::MoveLeft => self.navigate_left(),
+            Action::MoveRight => self.navigate_right(),
+            Action::FocusPrev => self.focus_previous(),
+            Action::FocusNext => self.focus_next(),
             Action::Back => self.back(),
             Action::RefreshRepository => {
                 self.refresh_all_repositories();
@@ -1463,9 +1512,16 @@ impl App {
                     started_at: Instant::now(),
                 };
             }
+            Action::OpenShortcutHelp => {
+                self.state.open_popup();
+                self.state.mode = GlobalMode::ShortcutHelp { scroll: 0 };
+            }
             Action::CopySelectedCommitHashes => self.copy_selected_commit_hashes(),
             Action::CopyCurrentCommitInfo => self.copy_current_commit_info(),
             Action::CopyCurrentCommitMessage => self.copy_current_commit_message(),
+            Action::CopySelectedFileName => self.copy_selected_file_name(),
+            Action::CopySelectedFileAbsolutePath => self.copy_selected_file_absolute_path(),
+            Action::CopySelectedFileRelativePath => self.copy_selected_file_relative_path(),
             Action::QueueCherryPickSelectedCommit => self.queue_selected_commit(),
             Action::OpenCherryPickQueueDialog => self.open_cherry_pick_dialog(),
             Action::OpenResetDialog => self.open_reset_dialog(),
@@ -1800,6 +1856,60 @@ impl App {
 
     fn focus_previous(&mut self) {
         self.focus_next();
+    }
+
+    /// Navigate one column to the right. When the focused column is already
+    /// the right-hand column, slide the two-column window one level deeper:
+    /// the old right column becomes the new left column and keeps focus.
+    fn navigate_right(&mut self) {
+        match (self.state.screen, self.state.focus) {
+            (Screen::BranchOverview, FocusPanel::BranchList) => {
+                self.state.focus = FocusPanel::CommitList;
+            }
+            (Screen::BranchOverview, FocusPanel::CommitList) => {
+                self.shift_to_commit_detail();
+            }
+            (Screen::CommitDetail, FocusPanel::CommitList) => {
+                self.state.focus = FocusPanel::CommitFileList;
+            }
+            (Screen::CommitDetail, FocusPanel::CommitFileList) => {
+                self.shift_to_file_diff();
+            }
+            (Screen::FileDiffDetail, FocusPanel::FileList) => {
+                self.state.focus = FocusPanel::DiffView;
+            }
+            (Screen::Changes, FocusPanel::ChangesDiff) => {}
+            _ => {}
+        }
+    }
+
+    /// Navigate one column to the left. Crossing a screen boundary is the
+    /// exact inverse of `navigate_right`: the current left column becomes the
+    /// previous screen's right column and retains focus.
+    fn navigate_left(&mut self) {
+        match (self.state.screen, self.state.focus) {
+            (Screen::BranchOverview, FocusPanel::CommitList) => {
+                self.state.focus = FocusPanel::BranchList;
+            }
+            (Screen::CommitDetail, FocusPanel::CommitFileList) => {
+                self.state.focus = FocusPanel::CommitList;
+            }
+            (Screen::CommitDetail, FocusPanel::CommitList) => {
+                self.state.screen = Screen::BranchOverview;
+                self.state.focus = FocusPanel::CommitList;
+            }
+            (Screen::FileDiffDetail, FocusPanel::DiffView) => {
+                self.state.focus = FocusPanel::FileList;
+            }
+            (Screen::FileDiffDetail, FocusPanel::FileList) => {
+                self.state.screen = Screen::CommitDetail;
+                self.state.focus = FocusPanel::CommitFileList;
+            }
+            (Screen::Changes, FocusPanel::ChangesDiff) => {
+                self.state.focus = FocusPanel::ChangesTree;
+            }
+            _ => {}
+        }
     }
 
     fn back(&mut self) {
@@ -2544,6 +2654,38 @@ impl App {
         self.submit_commit_detail(repository_index, commit, true);
     }
 
+    /// Slide `Branches | Commits` to `Commits | Commit` without advancing
+    /// focus into the new detail column. The selected Commits column is reused
+    /// as the new left column, so keyboard position remains visually stable.
+    fn shift_to_commit_detail(&mut self) {
+        let Some((repository_index, commit)) = self.state.branch_commits_repository_index.zip(
+            self.state
+                .selected_commit()
+                .map(|commit| commit.hash.clone()),
+        ) else {
+            return;
+        };
+
+        self.state.screen = Screen::CommitDetail;
+        self.state.focus = FocusPanel::CommitList;
+
+        // If Enter already queued the same detail request, turn it into a
+        // column-shift request so its response cannot steal focus to Files.
+        if let Some(id) = self.state.latest_commit_detail_job
+            && let Some(PendingJobKind::CommitDetail {
+                repository_index: pending_repository,
+                commit: pending_commit,
+                focus_files,
+            }) = self.state.pending_jobs.get_mut(&id)
+            && *pending_repository == repository_index
+            && pending_commit == &commit
+        {
+            *focus_files = false;
+        }
+
+        self.preview_selected_commit_detail();
+    }
+
     fn latest_commit_detail_request_matches(
         &self,
         repository_index: usize,
@@ -2601,6 +2743,60 @@ impl App {
         self.state.selection.selected_file_index = None;
         self.state.expansion.expanded_files.clear();
         self.submit_commit_detail(repository_index, commit, false);
+    }
+
+    /// Slide `Commits | Commit` to `Commit | Diff`. The complete Commit
+    /// column (metadata plus changed files) remains selected and becomes the
+    /// new left column; the diff is loaded on the right without stealing focus.
+    fn shift_to_file_diff(&mut self) {
+        let Some(repository_index) = self.state.branch_commits_repository_index else {
+            return;
+        };
+        let Some(detail) = self.state.current_commit_detail.as_ref() else {
+            return;
+        };
+        let Some(file) = self.state.selected_file() else {
+            return;
+        };
+        let commit = detail.commit.hash.clone();
+        let path = file.path.clone();
+
+        self.state.screen = Screen::FileDiffDetail;
+        self.state.focus = FocusPanel::FileList;
+
+        if self
+            .state
+            .current_file_diff
+            .as_ref()
+            .is_some_and(|diff| diff.commit == commit && diff.path == path)
+        {
+            // A different older request must not replace the reusable cached
+            // diff after this column shift.
+            self.state.latest_file_diff_job = None;
+            return;
+        }
+
+        self.state.current_file_diff = None;
+        self.state.selection.diff_scroll = 0;
+
+        // Preserve column focus if an explicit open for the same file was
+        // already queued before the second Right key arrived.
+        if let Some(id) = self.state.latest_file_diff_job
+            && let Some(PendingJobKind::FileDiff {
+                repository_index: pending_repository,
+                commit: pending_commit,
+                path: pending_path,
+                focus_diff,
+            }) = self.state.pending_jobs.get_mut(&id)
+            && *pending_repository == repository_index
+            && pending_commit == &commit
+            && pending_path == &path
+        {
+            *focus_diff = false;
+            return;
+        }
+
+        self.submit_selected_file_diff(false);
     }
 
     fn toggle_file_expanded(&mut self) {
@@ -2706,6 +2902,53 @@ impl App {
         };
         self.submit_commit_message_for_copy(repository_index, commit);
         self.state.last_message = Some("Loading full commit message…".into());
+    }
+
+    fn selected_file_path_for_copy(&self) -> Option<(usize, GitPath)> {
+        Some((
+            self.state.branch_commits_repository_index?,
+            self.state.selected_file()?.path.clone(),
+        ))
+    }
+
+    fn copy_selected_file_name(&mut self) {
+        let Some((_, path)) = self.selected_file_path_for_copy() else {
+            return;
+        };
+        let path = PathBuf::from(path.to_os_string());
+        let Some(name) = path.file_name() else {
+            return;
+        };
+        self.state.pending_clipboard = Some(name.to_string_lossy().into_owned());
+        self.state.last_message = Some("Copied selected file name".into());
+    }
+
+    fn copy_selected_file_absolute_path(&mut self) {
+        let Some((repository_index, path)) = self.selected_file_path_for_copy() else {
+            return;
+        };
+        let Some(repository) = self.state.repositories.get(repository_index) else {
+            return;
+        };
+        let root = if repository.git_cwd().is_absolute() {
+            repository.git_cwd().to_path_buf()
+        } else {
+            let Ok(current_directory) = std::env::current_dir() else {
+                return;
+            };
+            current_directory.join(repository.git_cwd())
+        };
+        let absolute = root.join(PathBuf::from(path.to_os_string()));
+        self.state.pending_clipboard = Some(absolute.to_string_lossy().into_owned());
+        self.state.last_message = Some("Copied selected file absolute path".into());
+    }
+
+    fn copy_selected_file_relative_path(&mut self) {
+        let Some((_, path)) = self.selected_file_path_for_copy() else {
+            return;
+        };
+        self.state.pending_clipboard = Some(path.as_str().to_string());
+        self.state.last_message = Some("Copied selected file repository-relative path".into());
     }
 
     fn queue_selected_commit(&mut self) {

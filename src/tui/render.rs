@@ -11,6 +11,7 @@ use crate::{
     app::{
         AppState, BranchTreeNode, ChangeGroup, ChangesTreeNode, ConfirmDialog, DiffViewMode,
         FilterTarget, FocusPanel, GlobalMode, RemoteEditKind, RemoteInputField, Screen,
+        ShortcutContext, modal_shortcut_set,
     },
     config::{FooterMode, FooterOverflow},
     domain::{DiffCellKind, DiffLineKind, FileDiff, side_by_side_rows},
@@ -146,6 +147,7 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         GlobalMode::EditingCommitMessage { .. } => "COMMIT",
         GlobalMode::EditingRemote { .. } => "REMOTE",
         GlobalMode::Chord { .. } => "SHORTCUT",
+        GlobalMode::ShortcutHelp { .. } => "HELP",
         GlobalMode::Error => "ERROR",
     };
     let spinner = if app.is_loading() {
@@ -231,7 +233,7 @@ fn list_state(selected: Option<usize>) -> ListState {
 fn render_branch_overview(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let [left, right] = columns(area);
     render_branches(frame, app, left);
-    render_commits(frame, app, right);
+    render_commits(frame, app, right, CommitListDensity::Detailed);
 }
 
 fn render_reflog(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -804,7 +806,27 @@ fn render_branches(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     frame.render_stateful_widget(list, area, &mut list_state(selected));
 }
 
-fn commit_items(app: &AppState) -> (Vec<ListItem<'static>>, bool) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommitListDensity {
+    Compact,
+    Detailed,
+}
+
+fn commit_tags(decorations: &str) -> String {
+    decorations
+        .split(',')
+        .filter_map(|decoration| decoration.trim().strip_prefix("tag: "))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn commit_date(authored_at: &str) -> &str {
+    authored_at
+        .split_once('T')
+        .map_or(authored_at, |(date, _)| date)
+}
+
+fn commit_items(app: &AppState, density: CommitListDensity) -> (Vec<ListItem<'static>>, bool) {
     let commits = app.visible_commits();
     if commits.is_empty() {
         return (
@@ -824,7 +846,7 @@ fn commit_items(app: &AppState) -> (Vec<ListItem<'static>>, bool) {
         .map(|commit| {
             let queued = app.cherry_pick_queue.contains(&commit.hash);
             let copy_selected = app.commit_copy_selection.contains(&commit.hash);
-            ListItem::new(Line::from(vec![
+            let mut summary = vec![
                 Span::styled(
                     if queued { "● " } else { "  " },
                     Style::default().fg(Color::Magenta),
@@ -839,22 +861,57 @@ fn commit_items(app: &AppState) -> (Vec<ListItem<'static>>, bool) {
                 ),
                 Span::raw(" "),
                 Span::raw(terminal_safe(&commit.subject)),
-                Span::styled(
-                    if commit.decorations.is_empty() {
-                        String::new()
-                    } else {
-                        terminal_safe(&format!("  {}", commit.decorations))
-                    },
-                    Style::default().fg(Color::Cyan),
-                ),
-            ]))
+            ];
+            match density {
+                CommitListDensity::Compact => {
+                    summary.push(Span::styled(
+                        if commit.decorations.is_empty() {
+                            String::new()
+                        } else {
+                            terminal_safe(&format!("  {}", commit.decorations))
+                        },
+                        Style::default().fg(Color::Cyan),
+                    ));
+                    ListItem::new(Line::from(summary))
+                }
+                CommitListDensity::Detailed => {
+                    let tags = commit_tags(&commit.decorations);
+                    ListItem::new(vec![
+                        Line::from(summary),
+                        Line::from(vec![
+                            Span::raw("      "),
+                            Span::styled("Date: ", Style::default().fg(Color::Cyan)),
+                            Span::styled(
+                                terminal_safe(commit_date(&commit.authored_at)),
+                                Style::default().fg(Color::Gray),
+                            ),
+                            Span::raw("  "),
+                            Span::styled("Author: ", Style::default().fg(Color::Cyan)),
+                            Span::styled(
+                                terminal_safe(&commit.author),
+                                Style::default().fg(Color::Green),
+                            ),
+                            Span::raw("  "),
+                            Span::styled("Tags: ", Style::default().fg(Color::Cyan)),
+                            Span::styled(
+                                terminal_safe(if tags.is_empty() { "—" } else { &tags }),
+                                Style::default().fg(if tags.is_empty() {
+                                    Color::DarkGray
+                                } else {
+                                    Color::Magenta
+                                }),
+                            ),
+                        ]),
+                    ])
+                }
+            }
         })
         .collect();
     (items, false)
 }
 
-fn render_commits(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let (items, empty) = commit_items(app);
+fn render_commits(frame: &mut Frame<'_>, app: &AppState, area: Rect, density: CommitListDensity) {
+    let (items, empty) = commit_items(app, density);
     let selection_count = app.commit_copy_selection.len();
     let title = if app.effective_commit_filter().is_empty() {
         format!("Commits · {selection_count} selected")
@@ -881,13 +938,24 @@ fn render_commits(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 
 fn render_commit_detail(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let [left, right] = columns(area);
-    render_commits(frame, app, left);
+    render_commits(frame, app, left, CommitListDensity::Compact);
+    render_commit_column(frame, app, right, FocusPanel::CommitFileList);
+}
+
+/// Shared Commit column used on both sides of the hierarchical transition:
+/// `Commits | Commit` -> `Commit | Diff`.
+fn render_commit_column(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    area: Rect,
+    files_focus: FocusPanel,
+) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(8), Constraint::Min(3)])
-        .split(right);
+        .split(area);
     render_commit_metadata(frame, app, sections[0]);
-    render_changed_files(frame, app, sections[1]);
+    render_changed_files(frame, app, sections[1], app.focus == files_focus);
 }
 
 fn render_commit_metadata(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -938,7 +1006,7 @@ fn render_commit_metadata(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     );
 }
 
-fn render_changed_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
+fn render_changed_files(frame: &mut Frame<'_>, app: &AppState, area: Rect, focused: bool) {
     let files = app
         .current_commit_detail
         .as_ref()
@@ -1002,10 +1070,7 @@ fn render_changed_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             .collect()
     };
     let list = List::new(items)
-        .block(panel_block(
-            "Files changed in commit",
-            app.focus == FocusPanel::CommitFileList,
-        ))
+        .block(panel_block("Files changed in commit", focused))
         .highlight_symbol("▶ ")
         .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
     let selected = (!files.is_empty())
@@ -1026,7 +1091,12 @@ fn file_kind_style(marker: &str) -> Style {
 
 fn render_file_diff(frame: &mut Frame<'_>, app: &AppState, area: Rect, terminal_width: u16) {
     let [left, right] = columns(area);
-    render_file_list(frame, app, left);
+    render_commit_column(frame, app, left, FocusPanel::FileList);
+    let empty_message = if app.latest_file_diff_job.is_some() {
+        "Loading selected file diff…"
+    } else {
+        "No diff loaded"
+    };
     render_diff_panel(
         frame,
         app.current_file_diff.as_ref(),
@@ -1037,36 +1107,7 @@ fn render_file_diff(frame: &mut Frame<'_>, app: &AppState, area: Rect, terminal_
         right,
         terminal_width,
         "Changes",
-        "No diff loaded",
-    );
-}
-
-fn render_file_list(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let files = app
-        .current_commit_detail
-        .as_ref()
-        .map(|detail| detail.files.as_slice())
-        .unwrap_or_default();
-    let items = files
-        .iter()
-        .map(|file| {
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{} ", file.kind.marker()),
-                    file_kind_style(file.kind.marker()),
-                ),
-                Span::raw(terminal_safe(file.path.as_str())),
-            ]))
-        })
-        .collect::<Vec<_>>();
-    let list = List::new(items)
-        .block(panel_block("Files", app.focus == FocusPanel::FileList))
-        .highlight_symbol("▶ ")
-        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
-    frame.render_stateful_widget(
-        list,
-        area,
-        &mut list_state(app.selection.selected_file_index),
+        empty_message,
     );
 }
 
@@ -1275,42 +1316,37 @@ fn side_by_side_text(diff: Option<&FileDiff>, width: u16, empty_message: &str) -
 }
 
 fn render_hotkeys(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
+    let modal_footer =
+        || modal_shortcut_set(&app.mode).map_or(String::new(), |set| set.footer.to_string());
     let mut static_text = match &app.mode {
         GlobalMode::Filtering { target, query } => format!(
-            " /{}: {}_ | Enter apply | Esc cancel ",
+            " /{}: {}_ | {} ",
             match target {
                 FilterTarget::Branches => "branches",
                 FilterTarget::Commits => "commits",
             },
-            query
+            query,
+            modal_footer()
         ),
-        GlobalMode::Confirming {
-            dialog: ConfirmDialog::ResetModeChoice { .. },
-        } => " s soft | m mixed | h hard | Esc cancel ".into(),
-        GlobalMode::Confirming {
-            dialog: ConfirmDialog::HardResetWarning { .. },
-        } => " Enter continue to hash confirmation | Esc cancel ".into(),
-        GlobalMode::Confirming { .. } => " Enter confirm | Esc cancel ".into(),
-        GlobalMode::TypingConfirmation { .. } => {
-            " Type short hash | Enter final confirm | Esc cancel ".into()
-        }
-        GlobalMode::EditingCommitMessage { .. } => {
-            " Type commit message | Enter create commit | Esc cancel ".into()
-        }
+        GlobalMode::Confirming { .. }
+        | GlobalMode::TypingConfirmation { .. }
+        | GlobalMode::EditingCommitMessage { .. }
+        | GlobalMode::ShortcutHelp { .. }
+        | GlobalMode::Error => format!(" {} ", modal_footer()),
         GlobalMode::EditingRemote { kind, field, .. } => match kind {
             RemoteEditKind::Add => format!(
-                " Add remote: editing {} | Tab switch field | Enter continue | Esc cancel ",
+                " Add remote: editing {} | {} ",
                 match field {
                     RemoteInputField::Name => "name",
                     RemoteInputField::Url => "shared URL",
-                }
+                },
+                modal_footer()
             ),
             RemoteEditKind::SetUrl { .. } => {
-                " Set shared fetch/push URL | Enter continue | Esc cancel ".into()
+                format!(" Set shared fetch/push URL | {} ", modal_footer())
             }
         },
         GlobalMode::Chord { .. } | GlobalMode::Normal => String::new(),
-        GlobalMode::Error => " Enter / Esc dismiss ".into(),
     };
 
     let text = if matches!(app.mode, GlobalMode::Normal | GlobalMode::Chord { .. }) {
@@ -1450,6 +1486,11 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let (title, lines, height) = match &app.mode {
+        GlobalMode::ShortcutHelp { .. } => (
+            "Global shortcut reference — effective bindings and operation sets",
+            shortcut_help_lines(app),
+            90,
+        ),
         GlobalMode::Confirming { dialog } => match dialog {
             ConfirmDialog::FetchRepository { repository_index } => {
                 let repository = app.repositories.get(*repository_index);
@@ -1932,7 +1973,20 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         _ => return,
     };
 
-    let popup = centered_rect(72, height, area);
+    let help_popup = matches!(app.mode, GlobalMode::ShortcutHelp { .. });
+    let popup = centered_rect(if help_popup { 94 } else { 72 }, height, area);
+    let popup_scroll = match app.mode {
+        GlobalMode::ShortcutHelp { scroll } => {
+            let viewport = usize::from(popup.height.saturating_sub(2)).max(1);
+            scroll.min(
+                lines
+                    .len()
+                    .saturating_sub(viewport)
+                    .min(usize::from(u16::MAX)) as u16,
+            )
+        }
+        _ => 0,
+    };
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -1942,9 +1996,59 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Yellow)),
             )
+            .scroll((popup_scroll, 0))
             .wrap(Wrap { trim: false }),
         popup,
     );
+}
+
+fn shortcut_help_lines(app: &AppState) -> Vec<Line<'static>> {
+    let origin_focus = app
+        .previous_focus
+        .unwrap_or_else(|| app.default_focus_for_screen());
+    let current_context = ShortcutContext::from_view(app.screen, origin_focus);
+    let mut lines = vec![
+        Line::styled(
+            "Effective configured bindings. The focused normal-mode table is marked with ▶.",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::styled(
+            "Normal commands are configurable; modal safety/editor tables are reserved.",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::raw(""),
+    ];
+    for section in app.config.shortcut_help_sections() {
+        let current = section.context.is_some() && section.context == current_context;
+        lines.push(Line::styled(
+            terminal_safe(&format!(
+                "{} {}",
+                if current { "▶" } else { " " },
+                section.title
+            )),
+            Style::default()
+                .fg(if current { Color::Yellow } else { Color::Cyan })
+                .add_modifier(Modifier::BOLD),
+        ));
+        for item in section.items {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:<25}", terminal_safe(&item.key)),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(
+                    format!("{:<23}", terminal_safe(&item.label)),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    terminal_safe(&item.operation),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        lines.push(Line::raw(""));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -1986,6 +2090,37 @@ mod tests {
     }
 
     #[test]
+    fn renders_detailed_commits_on_the_right_and_compact_commits_on_the_left() {
+        let mut state = AppState::default();
+        state.branch_commits.items.push(Commit {
+            hash: CommitHash("0123456789abcdef".into()),
+            short_hash: "0123456".into(),
+            author: "Ada Lovelace".into(),
+            authored_at: "2026-07-16T10:20:30+08:00".into(),
+            decorations: "HEAD -> main, tag: v1.2.3, origin/main".into(),
+            subject: "show rich commit metadata".into(),
+        });
+        state.ensure_valid_commit_selection();
+
+        let backend = TestBackend::new(160, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("Date: 2026-07-16"));
+        assert!(rendered.contains("Author: Ada Lovelace"));
+        assert!(rendered.contains("Tags: v1.2.3"));
+
+        state.screen = Screen::CommitDetail;
+        state.focus = FocusPanel::CommitList;
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(!rendered.contains("Date: 2026-07-16"));
+        assert!(!rendered.contains("Author: Ada Lovelace"));
+        assert!(!rendered.contains("Tags: v1.2.3"));
+        assert!(rendered.contains("show rich commit metadata"));
+    }
+
+    #[test]
     fn renders_only_the_current_chord_level_in_the_footer() {
         let mut state = AppState {
             focus: FocusPanel::CommitList,
@@ -2021,6 +2156,39 @@ mod tests {
         assert!(rendered.contains("m message"));
         assert!(rendered.contains("Esc cancel"));
         assert!(!rendered.contains("Ctrl+C copy…"));
+    }
+
+    #[test]
+    fn renders_global_shortcut_reference_from_effective_operation_tables() {
+        let state = AppState {
+            focus: FocusPanel::Popup,
+            previous_focus: Some(FocusPanel::CommitList),
+            mode: GlobalMode::ShortcutHelp { scroll: 0 },
+            ..AppState::default()
+        };
+        let backend = TestBackend::new(180, 80);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("Global shortcut reference"));
+        assert!(rendered.contains("Ctrl+?"));
+        assert!(rendered.contains("app.shortcuts"));
+        assert!(rendered.contains("overview.commits"));
+        assert!(rendered.contains("commit.copy.message"));
+        assert!(rendered.contains("▶ Commits"));
+
+        let state = AppState {
+            focus: FocusPanel::Popup,
+            previous_focus: Some(FocusPanel::CommitList),
+            mode: GlobalMode::ShortcutHelp { scroll: u16::MAX },
+            ..AppState::default()
+        };
+        let backend = TestBackend::new(180, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("shortcut reference"));
+        assert!(rendered.contains("close reference"));
     }
 
     #[test]
@@ -2272,11 +2440,18 @@ mod tests {
             let mut terminal = Terminal::new(backend).unwrap();
             let state = AppState::default();
             terminal.draw(|frame| render(frame, &state)).unwrap();
+            let help = AppState {
+                focus: FocusPanel::Popup,
+                previous_focus: Some(FocusPanel::BranchList),
+                mode: GlobalMode::ShortcutHelp { scroll: u16::MAX },
+                ..AppState::default()
+            };
+            terminal.draw(|frame| render(frame, &help)).unwrap();
         }
     }
 
     #[test]
-    fn renders_wide_side_by_side_diff() {
+    fn renders_file_diff_with_reused_commit_column_and_side_by_side_diff() {
         let commit = Commit {
             hash: CommitHash("0123456789abcdef".into()),
             short_hash: "0123456".into(),
@@ -2344,6 +2519,10 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("Commit"));
+        assert!(rendered.contains("0123456789abcdef"));
+        assert!(rendered.contains("Files changed in commit"));
+        assert!(rendered.contains("file.rs"));
         assert!(rendered.contains("side-by-side"));
         assert!(rendered.contains("old"));
         assert!(rendered.contains("new"));

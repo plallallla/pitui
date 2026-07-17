@@ -1,57 +1,165 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::{
-    app::{Action, AppState, GlobalMode, RemoteEditKind, RemoteInputField},
+    app::{
+        Action, AppState, GlobalMode, ModalShortcutSetId, RemoteEditKind, RemoteInputField,
+        modal_shortcut_set_id,
+    },
     config::{KeyResolution, KeyStroke},
 };
+
+type ModeKeyHandler = fn(&AppState, KeyEvent) -> Option<Action>;
+
+/// Modal modes own text and safety keys, so they use a separate callable jump
+/// table instead of falling through to the focused normal-mode command table.
+/// `ModalShortcutSetId` also selects the shared footer/help operation set.
+#[derive(Clone, Copy)]
+struct ModeKeyTable {
+    id: ModalShortcutSetId,
+    handle: ModeKeyHandler,
+}
+
+static MODE_KEY_TABLES: &[ModeKeyTable] = &[
+    ModeKeyTable {
+        id: ModalShortcutSetId::Filter,
+        handle: map_filter_table,
+    },
+    ModeKeyTable {
+        id: ModalShortcutSetId::Confirmation,
+        handle: map_confirmation_table,
+    },
+    ModeKeyTable {
+        id: ModalShortcutSetId::ResetMode,
+        handle: map_reset_mode_table,
+    },
+    ModeKeyTable {
+        id: ModalShortcutSetId::TypedConfirmation,
+        handle: map_typed_confirmation_table,
+    },
+    ModeKeyTable {
+        id: ModalShortcutSetId::CommitMessage,
+        handle: map_commit_message_table,
+    },
+    ModeKeyTable {
+        id: ModalShortcutSetId::RemoteAdd,
+        handle: map_remote_table,
+    },
+    ModeKeyTable {
+        id: ModalShortcutSetId::RemoteUrl,
+        handle: map_remote_table,
+    },
+    ModeKeyTable {
+        id: ModalShortcutSetId::Error,
+        handle: map_error_table,
+    },
+    ModeKeyTable {
+        id: ModalShortcutSetId::ShortcutHelp,
+        handle: map_shortcut_help_table,
+    },
+];
 
 pub fn map_key(app: &AppState, event: KeyEvent) -> Option<Action> {
     if !matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
-    if event.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(event.code, KeyCode::Char('c') | KeyCode::Char('C'))
-        && !matches!(app.mode, GlobalMode::Normal | GlobalMode::Chord { .. })
-    {
-        return Some(Action::Quit);
-    }
-
     match &app.mode {
-        GlobalMode::Filtering { query, .. } => map_filtering(event, query),
-        GlobalMode::Confirming {
-            dialog: crate::app::ConfirmDialog::ResetModeChoice { .. },
-        } => match event.code {
-            KeyCode::Char('s') | KeyCode::Char('S') => Some(Action::ChooseResetSoft),
-            KeyCode::Char('m') | KeyCode::Char('M') => Some(Action::ChooseResetMixed),
-            KeyCode::Char('h') | KeyCode::Char('H') => Some(Action::ChooseResetHard),
-            KeyCode::Esc | KeyCode::Char('q') => Some(Action::Cancel),
-            _ => None,
-        },
-        GlobalMode::Confirming { .. } => match event.code {
-            KeyCode::Enter => Some(Action::Confirm),
-            KeyCode::Esc | KeyCode::Char('q') => Some(Action::Cancel),
-            _ => None,
-        },
-        GlobalMode::TypingConfirmation { input, .. } => map_typed_confirmation(event, input),
-        GlobalMode::EditingCommitMessage { input, .. } => map_commit_message(event, input),
-        GlobalMode::EditingRemote {
-            kind,
-            field,
-            name,
-            url,
-            ..
-        } => map_remote_editor(event, kind, *field, name, url),
         GlobalMode::Chord { prefix, .. } => {
             if matches!(event.code, KeyCode::Esc) {
                 return Some(Action::Cancel);
             }
             map_resolved_key(app, prefix, event).or(Some(Action::Cancel))
         }
-        GlobalMode::Error => match event.code {
-            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => Some(Action::DismissError),
-            _ => None,
-        },
         GlobalMode::Normal => map_resolved_key(app, &[], event),
+        _ => {
+            if event.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(event.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            {
+                return Some(Action::Quit);
+            }
+            let id = modal_shortcut_set_id(&app.mode)?;
+            let table = MODE_KEY_TABLES.iter().find(|table| table.id == id)?;
+            (table.handle)(app, event)
+        }
+    }
+}
+
+fn map_filter_table(app: &AppState, event: KeyEvent) -> Option<Action> {
+    let GlobalMode::Filtering { query, .. } = &app.mode else {
+        return None;
+    };
+    map_filtering(event, query)
+}
+
+fn map_confirmation_table(_app: &AppState, event: KeyEvent) -> Option<Action> {
+    match event.code {
+        KeyCode::Enter => Some(Action::Confirm),
+        KeyCode::Esc | KeyCode::Char('q') => Some(Action::Cancel),
+        _ => None,
+    }
+}
+
+fn map_reset_mode_table(_app: &AppState, event: KeyEvent) -> Option<Action> {
+    match event.code {
+        KeyCode::Char('s') | KeyCode::Char('S') => Some(Action::ChooseResetSoft),
+        KeyCode::Char('m') | KeyCode::Char('M') => Some(Action::ChooseResetMixed),
+        KeyCode::Char('h') | KeyCode::Char('H') => Some(Action::ChooseResetHard),
+        KeyCode::Esc | KeyCode::Char('q') => Some(Action::Cancel),
+        _ => None,
+    }
+}
+
+fn map_typed_confirmation_table(app: &AppState, event: KeyEvent) -> Option<Action> {
+    let GlobalMode::TypingConfirmation { input, .. } = &app.mode else {
+        return None;
+    };
+    map_typed_confirmation(event, input)
+}
+
+fn map_commit_message_table(app: &AppState, event: KeyEvent) -> Option<Action> {
+    let GlobalMode::EditingCommitMessage { input, .. } = &app.mode else {
+        return None;
+    };
+    map_commit_message(event, input)
+}
+
+fn map_remote_table(app: &AppState, event: KeyEvent) -> Option<Action> {
+    let GlobalMode::EditingRemote {
+        kind,
+        field,
+        name,
+        url,
+        ..
+    } = &app.mode
+    else {
+        return None;
+    };
+    map_remote_editor(event, kind, *field, name, url)
+}
+
+fn map_error_table(_app: &AppState, event: KeyEvent) -> Option<Action> {
+    match event.code {
+        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => Some(Action::DismissError),
+        _ => None,
+    }
+}
+
+fn map_shortcut_help_table(_app: &AppState, event: KeyEvent) -> Option<Action> {
+    if event.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(event.code, KeyCode::Char('?') | KeyCode::Char('/'))
+    {
+        return Some(Action::Cancel);
+    }
+    match event.code {
+        KeyCode::Up | KeyCode::Char('k') => Some(Action::MoveUp),
+        KeyCode::Down | KeyCode::Char('j') => Some(Action::MoveDown),
+        KeyCode::PageUp => Some(Action::PageUp),
+        KeyCode::PageDown => Some(Action::PageDown),
+        KeyCode::Home => Some(Action::Home),
+        KeyCode::End => Some(Action::End),
+        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+            Some(Action::Cancel)
+        }
+        _ => None,
     }
 }
 
@@ -189,10 +297,21 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::{ChangeGroup, ChangeSelection, FocusPanel, Screen},
+        app::{ChangeGroup, ChangeSelection, FocusPanel, ModalShortcutSetId, Screen},
         config::KeyStroke,
-        domain::{GitPath, WorkingTreeChange},
+        domain::{
+            ChangedFile, Commit, CommitDetail, CommitHash, FileChangeKind, GitPath,
+            WorkingTreeChange,
+        },
     };
+
+    #[test]
+    fn modal_input_jump_table_covers_every_documented_operation_set() {
+        assert_eq!(MODE_KEY_TABLES.len(), ModalShortcutSetId::ALL.len());
+        for (index, id) in ModalShortcutSetId::ALL.iter().copied().enumerate() {
+            assert_eq!(MODE_KEY_TABLES[index].id, id);
+        }
+    }
 
     #[test]
     fn maps_global_exit() {
@@ -263,6 +382,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn horizontal_keys_follow_the_column_hierarchy_without_wrapping() {
+        let commit = Commit {
+            hash: CommitHash("0123456789abcdef".into()),
+            short_hash: "0123456".into(),
+            author: "Ada".into(),
+            authored_at: "2026-07-16".into(),
+            decorations: String::new(),
+            subject: "navigation".into(),
+        };
+        let mut state = AppState::default();
+        state.branch_commits.items.push(commit.clone());
+        state.ensure_valid_commit_selection();
+
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(map_key(&state, left), None);
+        assert_eq!(map_key(&state, right), Some(Action::MoveRight));
+
+        state.focus = FocusPanel::CommitList;
+        assert_eq!(map_key(&state, left), Some(Action::MoveLeft));
+        assert_eq!(map_key(&state, right), Some(Action::MoveRight));
+
+        state.screen = Screen::CommitDetail;
+        state.current_commit_detail = Some(CommitDetail {
+            commit,
+            author_email: "ada@example.invalid".into(),
+            committer: "Ada".into(),
+            committer_email: "ada@example.invalid".into(),
+            committed_at: "2026-07-16".into(),
+            message: "navigation".into(),
+            files: vec![ChangedFile {
+                kind: FileChangeKind::Modified,
+                path: GitPath::from("src/main.rs"),
+                old_path: None,
+                additions: Some(1),
+                deletions: Some(1),
+                hunks: Vec::new(),
+                is_binary: false,
+            }],
+        });
+        state.ensure_valid_file_selection();
+        state.focus = FocusPanel::CommitFileList;
+        assert_eq!(map_key(&state, left), Some(Action::MoveLeft));
+        assert_eq!(map_key(&state, right), Some(Action::MoveRight));
+
+        state.screen = Screen::FileDiffDetail;
+        state.focus = FocusPanel::FileList;
+        assert_eq!(map_key(&state, left), Some(Action::MoveLeft));
+        assert_eq!(map_key(&state, right), Some(Action::MoveRight));
+
+        state.focus = FocusPanel::DiffView;
+        assert_eq!(map_key(&state, left), Some(Action::MoveLeft));
+        assert_eq!(map_key(&state, right), None);
     }
 
     #[test]
@@ -499,6 +674,107 @@ mod tests {
                 &state,
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
             ),
+            Some(Action::Cancel)
+        );
+    }
+
+    #[test]
+    fn copy_chord_mounts_commit_operations_only_on_commits_and_file_paths_only_on_files() {
+        let commit = Commit {
+            hash: CommitHash("0123456789abcdef".into()),
+            short_hash: "01234567".into(),
+            author: "Ada".into(),
+            authored_at: "2026-07-16".into(),
+            decorations: String::new(),
+            subject: "context tables".into(),
+        };
+        let mut state = AppState {
+            screen: Screen::CommitDetail,
+            focus: FocusPanel::CommitFileList,
+            ..AppState::default()
+        };
+        state.branch_commits.items.push(commit.clone());
+        state.ensure_valid_commit_selection();
+        state.current_commit_detail = Some(CommitDetail {
+            commit,
+            author_email: "ada@example.invalid".into(),
+            committer: "Ada".into(),
+            committer_email: "ada@example.invalid".into(),
+            committed_at: "2026-07-16".into(),
+            message: "context tables".into(),
+            files: vec![ChangedFile {
+                kind: FileChangeKind::Modified,
+                path: GitPath::from("src/nested/main.rs"),
+                old_path: None,
+                additions: Some(1),
+                deletions: Some(1),
+                hunks: Vec::new(),
+                is_binary: false,
+            }],
+        });
+        state.ensure_valid_file_selection();
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(
+            map_key(&state, ctrl_c),
+            Some(Action::BeginChord(vec![
+                KeyStroke::parse("Ctrl+C").unwrap()
+            ]))
+        );
+        let prefix = vec![KeyStroke::parse("Ctrl+C").unwrap()];
+        for (key, action) in [
+            ('n', Action::CopySelectedFileName),
+            ('a', Action::CopySelectedFileAbsolutePath),
+            ('r', Action::CopySelectedFileRelativePath),
+        ] {
+            state.mode = GlobalMode::Chord {
+                prefix: prefix.clone(),
+                started_at: Instant::now(),
+            };
+            assert_eq!(
+                map_key(
+                    &state,
+                    KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
+                ),
+                Some(action)
+            );
+        }
+
+        state.mode = GlobalMode::Normal;
+        state.screen = Screen::FileDiffDetail;
+        state.focus = FocusPanel::DiffView;
+        assert_eq!(map_key(&state, ctrl_c), Some(Action::Quit));
+    }
+
+    #[test]
+    fn global_shortcut_reference_opens_and_uses_its_own_modal_table() {
+        let state = AppState::default();
+        let ctrl_question = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL);
+        assert_eq!(
+            map_key(&state, ctrl_question),
+            Some(Action::OpenShortcutHelp)
+        );
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)
+            ),
+            Some(Action::OpenShortcutHelp)
+        );
+
+        let help = AppState {
+            mode: GlobalMode::ShortcutHelp { scroll: 0 },
+            focus: FocusPanel::Popup,
+            previous_focus: Some(FocusPanel::BranchList),
+            ..AppState::default()
+        };
+        assert_eq!(
+            map_key(&help, KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            Some(Action::PageDown)
+        );
+        assert_eq!(map_key(&help, ctrl_question), Some(Action::Cancel));
+        assert_eq!(
+            map_key(&help, KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
             Some(Action::Cancel)
         );
     }

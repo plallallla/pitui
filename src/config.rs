@@ -13,7 +13,10 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
-use crate::app::{Action, AppState, CommandId, DiffViewMode, FooterGroup};
+use crate::app::{
+    Action, AppState, CommandId, CommandMount, DiffViewMode, FooterGroup, ModalShortcutSetId,
+    ShortcutContext,
+};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_LOG_BYTES: u64 = 5 * 1024 * 1024;
@@ -200,6 +203,21 @@ pub struct FooterItem {
     pub label: String,
     pub group: FooterGroup,
     pub priority: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShortcutHelpItem {
+    pub key: String,
+    pub label: String,
+    /// Stable operation id used by the design document and configuration.
+    pub operation: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShortcutHelpSection {
+    pub title: String,
+    pub context: Option<ShortcutContext>,
+    pub items: Vec<ShortcutHelpItem>,
 }
 
 #[derive(Clone, Debug)]
@@ -481,6 +499,7 @@ impl ResolvedFooterConfig {
                 .and_then(|presentation| presentation.label.clone())
                 .unwrap_or_else(|| match group {
                     "commit.copy" => "copy…".into(),
+                    "file.copy" => "copy file…".into(),
                     _ => "more…".into(),
                 }),
             priority: custom
@@ -603,6 +622,79 @@ impl ResolvedConfig {
         Arc::new(Self::default())
     }
 
+    /// Builds the global shortcut reference from the same command and modal
+    /// operation tables used by input resolution and the footer. Empty
+    /// bindings remain visible as `(unbound)` so the popup is also an
+    /// effective-configuration inspector.
+    pub fn shortcut_help_sections(&self) -> Vec<ShortcutHelpSection> {
+        let command_item = |command: CommandId| ShortcutHelpItem {
+            key: {
+                let bindings = self.keymap.bindings_for(command);
+                if bindings.is_empty() {
+                    "(unbound)".into()
+                } else {
+                    bindings
+                        .iter()
+                        .map(|binding| display_sequence(binding))
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                }
+            },
+            label: self.footer.command_presentation(command).label,
+            operation: command.as_str().into(),
+        };
+
+        let mut sections = Vec::new();
+        sections.push(ShortcutHelpSection {
+            title: "Global · mounted in every normal focus".into(),
+            context: None,
+            items: CommandId::ALL
+                .iter()
+                .copied()
+                .filter(|command| command.mount() == CommandMount::Global)
+                .map(command_item)
+                .collect(),
+        });
+        for context in ShortcutContext::ALL.iter().copied() {
+            sections.push(ShortcutHelpSection {
+                title: format!("{}  [{}]", context.title(), context.id()),
+                context: Some(context),
+                items: CommandId::ALL
+                    .iter()
+                    .copied()
+                    .filter(|command| command.mount() == CommandMount::Focus)
+                    .filter(|command| command.context_mask() & context.mask() != 0)
+                    .map(command_item)
+                    .collect(),
+            });
+        }
+        for id in ModalShortcutSetId::ALL.iter().copied() {
+            let set = id.spec();
+            sections.push(ShortcutHelpSection {
+                title: format!("{}  [safety-reserved]", set.title),
+                context: None,
+                items: set
+                    .hints
+                    .iter()
+                    .map(|hint| ShortcutHelpItem {
+                        key: hint.key.into(),
+                        label: hint.label.into(),
+                        operation: hint.operation.into(),
+                    })
+                    .collect(),
+            });
+        }
+        sections
+    }
+
+    pub fn shortcut_help_line_count(&self) -> usize {
+        3 + self
+            .shortcut_help_sections()
+            .iter()
+            .map(|section| section.items.len() + 2)
+            .sum::<usize>()
+    }
+
     pub fn effective_toml(&self) -> String {
         let mut output = format!(
             "schema_version = {CONFIG_SCHEMA_VERSION}\n\n[ui.footer]\nmode = {}\nmax_rows = {}\nshow_global = {}\nshow_alternative_bindings = {}\ndefault_visibility = {}\nseparator = {}\noverflow = {}\n",
@@ -625,7 +717,7 @@ impl ResolvedConfig {
                 FooterOverflow::Ellipsis => "ellipsis",
             })
         );
-        for group_id in ["commit.copy", "more"] {
+        for group_id in ["commit.copy", "file.copy", "more"] {
             let group = self.footer.group_presentation(group_id);
             output.push_str(&format!(
                 "\n[ui.footer.groups.{}]\nvisible = {}\nlabel = {}\npriority = {}\n",
@@ -856,9 +948,9 @@ fn apply_footer(resolved: &mut ResolvedFooterConfig, raw: RawFooter) -> Result<(
         );
     }
     for (id, presentation) in raw.groups {
-        if !matches!(id.as_str(), "commit.copy" | "more") {
+        if !matches!(id.as_str(), "commit.copy" | "file.copy" | "more") {
             return Err(ConfigError::new(format!(
-                "unknown chord group `{id}`; known groups: commit.copy, more"
+                "unknown chord group `{id}`; known groups: commit.copy, file.copy, more"
             )));
         }
         resolved.groups.insert(
@@ -1442,8 +1534,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::{FocusPanel, GlobalMode},
-        domain::{Commit, CommitHash},
+        app::{FocusPanel, GlobalMode, Screen, ShortcutContext},
+        domain::{ChangedFile, Commit, CommitDetail, CommitHash, FileChangeKind, GitPath},
     };
 
     #[test]
@@ -1570,6 +1662,28 @@ keep_files = 4
     }
 
     #[test]
+    fn disjoint_commit_and_file_focus_tables_may_reuse_the_same_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("disjoint.toml");
+        fs::write(
+            &path,
+            r#"
+schema_version = 1
+[keybindings.commands."commit.copy.hash"]
+bindings = ["Ctrl+K x"]
+[keybindings.commands."file.copy.name"]
+bindings = ["Ctrl+K x"]
+"#,
+        )
+        .unwrap();
+        load(&ConfigLoadOptions {
+            path: Some(path),
+            ..ConfigLoadOptions::default()
+        })
+        .expect("disjoint focus tables must not conflict");
+    }
+
+    #[test]
     fn configurable_binding_and_footer_share_the_same_actionability() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -1685,6 +1799,110 @@ bindings = ["Alt+R"]
                 .resolve(&state, &prefix, KeyStroke::parse("h").unwrap()),
             Some(KeyResolution::Action(Action::CopySelectedCommitHashes))
         );
+    }
+
+    #[test]
+    fn focused_file_table_replaces_commit_copy_palette() {
+        let commit = Commit {
+            hash: CommitHash("0123456789abcdef".into()),
+            short_hash: "01234567".into(),
+            author: "Ada".into(),
+            authored_at: "2026-07-16".into(),
+            decorations: String::new(),
+            subject: "file palette".into(),
+        };
+        let mut state = AppState {
+            screen: Screen::CommitDetail,
+            focus: FocusPanel::CommitFileList,
+            current_commit_detail: Some(CommitDetail {
+                commit,
+                author_email: "ada@example.invalid".into(),
+                committer: "Ada".into(),
+                committer_email: "ada@example.invalid".into(),
+                committed_at: "2026-07-16".into(),
+                message: "file palette".into(),
+                files: vec![ChangedFile {
+                    kind: FileChangeKind::Modified,
+                    path: GitPath::from("src/main.rs"),
+                    old_path: None,
+                    additions: Some(1),
+                    deletions: Some(1),
+                    hunks: Vec::new(),
+                    is_binary: false,
+                }],
+            }),
+            ..AppState::default()
+        };
+        state.ensure_valid_file_selection();
+        let root = state
+            .config
+            .keymap
+            .footer_items(&state, &state.config.footer);
+        assert!(
+            root.iter()
+                .any(|item| item.key == "Ctrl+C" && item.label == "copy file…")
+        );
+
+        let prefix = vec![KeyStroke::parse("Ctrl+C").unwrap()];
+        state.mode = GlobalMode::Chord {
+            prefix,
+            started_at: Instant::now(),
+        };
+        assert_eq!(
+            state
+                .config
+                .keymap
+                .footer_items(&state, &state.config.footer)
+                .iter()
+                .map(|item| item.key.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["a", "n", "r"])
+        );
+    }
+
+    #[test]
+    fn shortcut_reference_is_generated_from_focus_and_modal_operation_sets() {
+        let config = ResolvedConfig::default();
+        let sections = config.shortcut_help_sections();
+        let commit = sections
+            .iter()
+            .find(|section| section.context == Some(ShortcutContext::DetailCommits))
+            .unwrap();
+        assert!(
+            commit
+                .items
+                .iter()
+                .any(|item| item.operation == "commit.copy.message")
+        );
+        assert!(
+            commit
+                .items
+                .iter()
+                .all(|item| !item.operation.starts_with("file.copy."))
+        );
+        let files = sections
+            .iter()
+            .find(|section| section.context == Some(ShortcutContext::CommitFiles))
+            .unwrap();
+        assert!(
+            files
+                .items
+                .iter()
+                .any(|item| item.operation == "file.copy.absolute_path")
+        );
+        assert!(
+            files
+                .items
+                .iter()
+                .all(|item| !item.operation.starts_with("commit.copy."))
+        );
+        assert!(sections.iter().any(|section| {
+            section.title.contains("commit submission")
+                && section
+                    .items
+                    .iter()
+                    .any(|item| item.operation == "SubmitCommit")
+        }));
     }
 
     #[test]

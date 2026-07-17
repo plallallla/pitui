@@ -871,6 +871,22 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
     assert_eq!(app.state.branch_commits.items.len(), 2);
     assert_eq!(app.state.focus, FocusPanel::BranchList);
 
+    app.dispatch(Action::OpenShortcutHelp);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::ShortcutHelp { scroll: 0 }
+    ));
+    assert_eq!(app.state.focus, FocusPanel::Popup);
+    assert_eq!(app.state.previous_focus, Some(FocusPanel::BranchList));
+    app.dispatch(Action::PageDown);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::ShortcutHelp { scroll: 10 }
+    ));
+    app.dispatch(Action::Cancel);
+    assert_eq!(app.state.mode, GlobalMode::Normal);
+    assert_eq!(app.state.focus, FocusPanel::BranchList);
+
     app.dispatch(Action::FocusNext);
     assert_eq!(app.state.focus, FocusPanel::CommitList);
     app.dispatch(Action::OpenCommitDetail);
@@ -978,6 +994,90 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
     assert_eq!(app.state.visible_commits().len(), 1);
     app.dispatch(Action::SubmitFilter);
     assert_eq!(app.state.commit_filter, "second");
+}
+
+#[test]
+fn horizontal_navigation_slides_columns_through_branch_commit_file_and_diff_levels() {
+    let repo = repository();
+    fs::write(repo.path().join("app.txt"), "first\nsecond\n").unwrap();
+    commit_all(repo.path(), "hierarchical navigation");
+
+    let mut app = app_for(&[repo.path()]);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.screen, Screen::BranchOverview);
+    assert_eq!(app.state.focus, FocusPanel::BranchList);
+
+    // Branches | Commits: move into the right column, then slide it to the
+    // left of Commits | Commit without wrapping back to Branches.
+    app.dispatch(Action::MoveRight);
+    assert_eq!(app.state.screen, Screen::BranchOverview);
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    app.dispatch(Action::MoveRight);
+    assert_eq!(app.state.screen, Screen::CommitDetail);
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+
+    // Returning before the worker answers must keep the older screen; a stale
+    // response may not reopen the deeper level.
+    app.dispatch(Action::MoveLeft);
+    assert_eq!(app.state.screen, Screen::BranchOverview);
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.screen, Screen::BranchOverview);
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+
+    app.dispatch(Action::MoveRight);
+    assert_eq!(app.state.screen, Screen::CommitDetail);
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    assert!(app.state.current_commit_detail.is_some());
+
+    // Commits | Commit: enter the reused Commit column, then slide the whole
+    // metadata + files column to the left of Commit | Diff.
+    app.dispatch(Action::MoveRight);
+    assert_eq!(app.state.screen, Screen::CommitDetail);
+    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+    app.dispatch(Action::MoveRight);
+    assert_eq!(app.state.screen, Screen::FileDiffDetail);
+    assert_eq!(app.state.focus, FocusPanel::FileList);
+
+    app.dispatch(Action::MoveLeft);
+    assert_eq!(app.state.screen, Screen::CommitDetail);
+    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.screen, Screen::CommitDetail);
+    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+
+    app.dispatch(Action::MoveRight);
+    assert_eq!(app.state.screen, Screen::FileDiffDetail);
+    assert_eq!(app.state.focus, FocusPanel::FileList);
+    wait_until_idle(&mut app);
+    assert_eq!(app.state.focus, FocusPanel::FileList);
+    assert!(app.state.current_file_diff.is_some());
+
+    app.dispatch(Action::MoveRight);
+    assert_eq!(app.state.focus, FocusPanel::DiffView);
+    app.dispatch(Action::MoveRight);
+    assert_eq!(app.state.screen, Screen::FileDiffDetail);
+    assert_eq!(app.state.focus, FocusPanel::DiffView);
+
+    // Left is the exact inverse: move within a pair, then slide the current
+    // left column back into the previous screen's right column.
+    app.dispatch(Action::MoveLeft);
+    assert_eq!(app.state.focus, FocusPanel::FileList);
+    app.dispatch(Action::MoveLeft);
+    assert_eq!(app.state.screen, Screen::CommitDetail);
+    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
+    app.dispatch(Action::MoveLeft);
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    app.dispatch(Action::MoveLeft);
+    assert_eq!(app.state.screen, Screen::BranchOverview);
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    app.dispatch(Action::MoveLeft);
+    assert_eq!(app.state.focus, FocusPanel::BranchList);
+    app.dispatch(Action::MoveLeft);
+    assert_eq!(app.state.screen, Screen::BranchOverview);
+    assert_eq!(app.state.focus, FocusPanel::BranchList);
 }
 
 #[test]
@@ -1175,6 +1275,38 @@ fn file_diff_navigation_keeps_file_list_focus_and_copies_full_commit_message() {
     assert_eq!(
         app.state.current_file_diff.as_ref().unwrap().path,
         app.state.selected_file().unwrap().path
+    );
+
+    let selected_path = app.state.selected_file().unwrap().path.clone();
+    open_commit_copy_chord(&mut app);
+    app.dispatch(Action::CopySelectedFileName);
+    assert_eq!(
+        app.take_clipboard_request().as_deref(),
+        Some(
+            Path::new(selected_path.as_str())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    open_commit_copy_chord(&mut app);
+    app.dispatch(Action::CopySelectedFileRelativePath);
+    assert_eq!(
+        app.take_clipboard_request().as_deref(),
+        Some(selected_path.as_str())
+    );
+    open_commit_copy_chord(&mut app);
+    app.dispatch(Action::CopySelectedFileAbsolutePath);
+    assert_eq!(
+        app.take_clipboard_request().as_deref(),
+        Some(
+            fs::canonicalize(repo.path())
+                .unwrap()
+                .join(selected_path.as_str())
+                .to_string_lossy()
+                .as_ref()
+        )
     );
 
     app.dispatch(Action::MoveUp);
