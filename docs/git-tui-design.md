@@ -181,6 +181,10 @@ pub enum GlobalMode {
     ShortcutHelp {
         scroll: u16,
     },
+    CommandPrompt {
+        input: String,
+        validation_error: Option<String>,
+    },
     Error,
 }
 ```
@@ -223,10 +227,8 @@ pub struct AppState {
     pub diff_mode: DiffViewMode,
     pub wrap_diff: bool,
 
-    pub cherry_pick_queue: Vec<CommitHash>,
-    pub cherry_pick_queue_repository_index: Option<usize>,
-    pub commit_copy_selection: HashSet<CommitHash>,
-    pub commit_copy_selection_repository_index: Option<usize>,
+    pub commit_selection: HashSet<CommitHash>,
+    pub commit_selection_repository_index: Option<usize>,
     pub pending_clipboard: Option<String>,
     pub pending_jobs: HashMap<GitJobId, PendingJobKind>,
     pub latest_commits_job: Option<GitJobId>,
@@ -248,7 +250,7 @@ pub struct RepositoryState {
 }
 ```
 
-`PendingJobKind` 对每类请求都保存 `repository_index`。列表、commit detail 和 file diff 仅应用对应仓库、对应上下文的最新 job response，防止跨仓库或快速切换时旧响应覆盖当前状态。cherry-pick queue 也绑定单一仓库，不允许将不同仓库的 commit 混入同一次写操作。
+`PendingJobKind` 对每类请求都保存 `repository_index`。列表、commit detail 和 file diff 仅应用对应仓库、对应上下文的最新 job response，防止跨仓库或快速切换时旧响应覆盖当前状态。commit 多选集合也绑定单一仓库与当前 viewing branch；切换上下文时清空，不允许将不同仓库的 commits 混入同一次写操作。
 
 ### 3.6 SelectionState
 
@@ -358,9 +360,12 @@ pub enum Action {
     PrevFile,
     ToggleWrap,
 
-    ToggleCommitCopySelection,
+    ToggleCommitSelection,
     BeginChord(Vec<KeyStroke>),
     OpenShortcutHelp,
+    OpenCommandPrompt,
+    UpdateCommandPrompt(String),
+    SubmitCommandPrompt,
     CopySelectedCommitHashes,
     CopyCurrentCommitInfo,
     CopyCurrentCommitMessage,
@@ -368,8 +373,7 @@ pub enum Action {
     CopySelectedFileAbsolutePath,
     CopySelectedFileRelativePath,
 
-    QueueCherryPickSelectedCommit,
-    OpenCherryPickQueueDialog,
+    OpenCherryPickSelectedDialog,
     OpenResetDialog,
     UpdateTypedConfirmation(String),
     ConfirmReset,
@@ -428,9 +432,14 @@ Changes
     -> Reflog、Changes 或 Remotes 时同时刷新当前视图数据
 
 任意主视图 + 任意 Normal focus
-  Ctrl+? / ?
+  h
     -> ShortcutHelp(scroll=0) + focus=Popup
     -> 保存 previous_focus；关闭后恢复原 screen/focus
+
+任意主视图 + 任意 Normal focus
+  Ctrl+Backtick
+    -> CommandPrompt(input="", validation_error=None) + focus=Popup
+    -> 输入 help 并按 Enter 后打开 ShortcutHelp
 ```
 
 ### 5.2 Focus 状态机
@@ -490,13 +499,26 @@ TypingConfirmation
   other text input
     -> TypingConfirmation(input updated)
 
-Normal + Ctrl+? / ?
+Normal + h
   -> ShortcutHelp(scroll=0)
 
 ShortcutHelp
   navigation keys
     -> ShortcutHelp(scroll updated)
-  Ctrl+? / ? / Enter / Esc / q
+  h / Enter / Esc / q
+    -> Normal + restore previous_focus
+
+Normal + Ctrl+Backtick
+  -> CommandPrompt(input="", validation_error=None)
+
+CommandPrompt
+  Char / Backspace
+    -> CommandPrompt(input updated, validation_error cleared)
+  Enter + input == help
+    -> ShortcutHelp(scroll=0)
+  Enter + empty/unknown input
+    -> CommandPrompt(validation_error set)
+  Esc
     -> Normal + restore previous_focus
 ```
 
@@ -535,21 +557,22 @@ View 1 用于：
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ repo=pitui | branch=main | viewing=feature/x | op=NORMAL | S=0 M=1 U=0    │
+│ repo=pitui | branch=main | op=NORMAL | S=0 M=1 U=0 C=0 | ↑0 ↓0          │
 ├──────────────────────────────┬─────────────────────────────────────────────┤
 │ Repositories / Branches      │ Commits                                     │
 │ ▼ ● pitui /repo/pitui        │ > 3cc6d76 Fix Debug Layer error             │
-│   ├─ * main                  │     Date: 2026-07-16 Author: Ada Tags: v1.2 │
+│   ├─ * main                  │     Date: 2026-07-16 13:20 Author: Ada Tags: v1.2 │
 │   └─   feature/x             │   0acaf2e Fix color grading format          │
-│ ▶ ○ backend /repo/backend    │     Date: 2026-07-15 Author: Lin Tags: —    │
+│ ▶ ○ backend /repo/backend    │     Date: 2026-07-15 09:05 Author: Lin      │
 ├──────────────────────────────┴─────────────────────────────────────────────┤
-│ Ctrl+R refresh | Tab focus | Enter view | s switch | / filter | q quit  │
+│ Ctrl+R refresh | Tab focus | Enter view | S switch | / filter | q quit  │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-View 1 的 Commits 位于宽右栏，使用两行 detailed item：summary 行保留选择/cherry-pick
-标记、short hash 与 subject；metadata 行显示 ISO 日期的 calendar 部分、author，以及从
-`%D` decorations 中提取的一个或多个 `tag:`。无 tag 时显示 `—`。当同一 Commits 组件在
+View 1 的 Commits 位于宽右栏，使用两行 detailed item：summary 行显示统一多选标记、
+short hash 与 subject；metadata 行显示 ISO 日期到分钟（`YYYY-MM-DD HH:MM`）、author，
+并在存在 Git tag 时追加从 `%D` decorations 中提取的一个或多个 `tag:`。无 tag 时整个
+`Tags:` 字段都不渲染。当同一 Commits 组件在
 View 2 成为窄左栏时切换为原有单行 compact item，保持纵向密度与既有 decorations 展示。
 
 ### 6.3 FocusPanel
@@ -572,13 +595,13 @@ focus = BranchList
 
 | Key | Action | 前置条件 | 结果 |
 |---|---|---|---|
-| ↑ / k | MoveUp | tree 非空 | 扁平化 tree selection 上移；选中分支时自动加载右侧 commits，焦点保持在 BranchList；跨仓库时更新 active repository |
-| ↓ / j | MoveDown | tree 非空 | 扁平化 tree selection 下移；选中分支时自动加载右侧 commits，焦点保持在 BranchList；跨仓库时更新 active repository |
+| w / ↑ / k | MoveUp | tree 非空 | 扁平化 tree selection 上移；选中分支时自动加载右侧 commits，焦点保持在 BranchList；跨仓库时更新 active repository |
+| s / ↓ / j | MoveDown | tree 非空 | 扁平化 tree selection 下移；选中分支时自动加载右侧 commits，焦点保持在 BranchList；跨仓库时更新 active repository |
 | PageUp | PageUp | tree 非空 | 树向上翻页，只为最终选中的分支加载右侧 commits |
 | PageDown | PageDown | tree 非空 | 树向下翻页，只为最终选中的分支加载右侧 commits |
 | Home | Home | tree 非空 | 选择第一行；若为分支则同步右侧 commits |
 | End | End | tree 非空 | 选择最后一行；若为分支则同步右侧 commits |
-| → / l | MoveRight | 总是 | focus -> CommitList；不改变 screen |
+| d / → / l | MoveRight | 总是 | focus -> CommitList；不改变 screen |
 | Enter | LoadCommitsForSelectedBranch | 已选择仓库 | 展开/折叠仓库节点 |
 | Enter | LoadCommitsForSelectedBranch | 已选择分支 | 加载该分支 commits，不切换真实分支 |
 | f | OpenFetchRepositoryDialog | 已选择仓库 | 确认执行 `git fetch --all --prune` |
@@ -586,7 +609,7 @@ focus = BranchList
 | P | OpenPushDialog | 已选择仓库 | 确认执行 `git push` |
 | g | OpenReflog | 已选择仓库 | 加载该仓库最近 300 条 reflog |
 | o | OpenRemotes | 已选择仓库或分支 | 打开所属仓库的 Remote Management |
-| s | OpenSwitchBranchDialog | 已选择分支 | 进入切分支确认弹窗 |
+| S | OpenSwitchBranchDialog | 已选择分支 | 进入切分支确认弹窗 |
 | b | OpenRebaseDialog | 已选择分支 | 将当前分支安全 rebase 到所选分支 |
 | / | StartFilter | 总是 | 按仓库名、路径、分支或 subject 过滤树 |
 | Ctrl+R | RefreshRepository | 任意主界面的 Normal mode | 手动刷新全部 repo status / branch list / 当前 viewing commits |
@@ -597,22 +620,21 @@ focus = BranchList
 
 | Key | Action | 前置条件 | 结果 |
 |---|---|---|---|
-| ↑ / k | MoveUp | commits 非空 | selected_commit_index 上移 |
-| ↓ / j | MoveDown | commits 非空 | selected_commit_index 下移 |
+| w / ↑ / k | MoveUp | commits 非空 | selected_commit_index 上移 |
+| s / ↓ / j | MoveDown | commits 非空 | selected_commit_index 下移 |
 | PageUp | PageUp | commits 非空 | commit 列表向上翻页 |
 | PageDown | PageDown | commits 非空 | commit 列表向下翻页 |
 | Home | Home | commits 非空 | 选择第一个 commit |
 | End | End | commits 非空 | 选择最后一个 commit |
-| ← / h | MoveLeft | 总是 | focus -> BranchList；不改变 screen |
-| → / l | MoveRight | 已选择 commit | 平移为 `Commits | Commit`；Commits 成为左栏并保持 focus，异步加载右栏 detail |
+| a / ← | MoveLeft | 总是 | focus -> BranchList；不改变 screen；`h` 保留给帮助 |
+| d / → / l | MoveRight | 已选择 commit | 平移为 `Commits | Commit`；Commits 成为左栏并保持 focus，异步加载右栏 detail |
 | Enter | OpenCommitDetail | 已选择 commit | 加载 commit detail，然后进入 View 2 |
-| Space | ToggleCommitCopySelection | 已选择 commit | 加入/移出独立的复制多选集合 |
+| Space | ToggleCommitSelection | 已选择 commit | 加入/移出统一 commit 多选集合 |
 | Ctrl+C | BeginChord([Ctrl+C]) | 已选择 commit | 进入当前有效 keymap 的复制 chord，不改变 focus |
 | Ctrl+C → h | CopySelectedCommitHashes | commits 非空 | 按列表顺序复制多选完整 hashes；集合为空则复制当前 hash |
 | Ctrl+C → i | CopyCurrentCommitInfo | 已选择 commit | 复制 hash、author、date、refs 与 message |
 | Ctrl+C → m | CopyCurrentCommitMessage | 已选择 commit | 复制完整 message；缺少 detail 时后台加载，不切换 screen/focus |
-| y | QueueCherryPickSelectedCommit | 已选择 commit | 加入 cherry-pick queue |
-| Y | OpenCherryPickQueueDialog | queue 非空 | 打开 cherry-pick queue 确认弹窗 |
+| y | OpenCherryPickSelectedDialog | 多选集合非空 | 按历史顺序打开所选 commits 的 cherry-pick 确认弹窗 |
 | R | OpenResetDialog | 已选择 commit | 打开 reset typed confirmation 弹窗 |
 | / | StartFilter | commits 非空 | 进入 commit search/filter 模式 |
 | Ctrl+R | RefreshRepository | 任意主界面的 Normal mode | 手动刷新 repo status / branch list / commits |
@@ -620,7 +642,7 @@ focus = BranchList
 | Esc | Back | 总是 | 若无上层视图，则保持当前视图 |
 | q | Quit | 总是 | 退出应用 |
 
-`commit_copy_selection` 与 cherry-pick queue 完全独立；切换仓库或 viewing branch 时清空，过滤列表不会改变集合。剪贴板由 TUI 层通过 OSC 52 写入，不引入平台特定 clipboard 命令。message copy 必须返回完整 subject/body；若 `CommitDetail` 尚未缓存，则发送独立 `LoadCommitMessage`，响应只写 clipboard，不得导航到 Commit Detail 或改变当前 focus。
+`commit_selection` 是复制 hashes 与 cherry-pick 共用的显式多选集合；切换仓库或 viewing branch 时清空，过滤列表不会改变集合。复制 hashes 在集合为空时仍可复制当前 commit，但 cherry-pick 严格要求集合非空，并按日志中的 oldest-to-newest 顺序提交。剪贴板由 TUI 层通过 OSC 52 写入，不引入平台特定 clipboard 命令。message copy 必须返回完整 subject/body；若 `CommitDetail` 尚未缓存，则发送独立 `LoadCommitMessage`，响应只写 clipboard，不得导航到 Commit Detail 或改变当前 focus。
 
 `Ctrl+C` 是可配置的二级快捷键 prefix。进入 `GlobalMode::Chord` 后，底部只显示当前 prefix
 直接可接受的 `h hash | i info | m message | Esc cancel`；`q` 或再次按 `Ctrl+C` 也取消。
@@ -724,7 +746,7 @@ View 2 用于：
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ repo=pitui | branch=main | viewing=feature/x | commit=3cc6d76 | NORMAL     │
+│ repo=pitui | branch=main | commit=3cc6d76 | op=NORMAL | S=0 M=0 U=0 C=0 │
 ├──────────────────────────────┬─────────────────────────────────────────────┤
 │ Commits                      │ Commit                                      │
 │ > 3cc6d76 Fix Debug Layer    │ Commit: 3cc6d76                             │
@@ -768,19 +790,18 @@ focus = CommitList
 
 | Key | Action | 前置条件 | 结果 |
 |---|---|---|---|
-| ↑ / k | MoveUp | commits 非空 | 选择上一个 commit，自动刷新右侧 detail，focus 保持 CommitList |
-| ↓ / j | MoveDown | commits 非空 | 选择下一个 commit，自动刷新右侧 detail，focus 保持 CommitList |
+| w / ↑ / k | MoveUp | commits 非空 | 选择上一个 commit，自动刷新右侧 detail，focus 保持 CommitList |
+| s / ↓ / j | MoveDown | commits 非空 | 选择下一个 commit，自动刷新右侧 detail，focus 保持 CommitList |
 | PageUp | PageUp | commits 非空 | commit 列表向上翻页，只加载最终选中 commit detail |
 | PageDown | PageDown | commits 非空 | commit 列表向下翻页，只加载最终选中 commit detail |
-| ← / h | MoveLeft | 总是 | 平移回 `Branches | Commits`；Commits 成为右栏并保持 focus |
-| → / l | MoveRight | 总是 | focus -> CommitFileList；不改变 screen |
+| a / ← | MoveLeft | 总是 | 平移回 `Branches | Commits`；Commits 成为右栏并保持 focus |
+| d / → / l | MoveRight | 总是 | focus -> CommitFileList；不改变 screen |
 | Enter | OpenCommitDetail | 已选择 commit | 重新加载所选 commit detail |
-| Space | ToggleCommitCopySelection | 已选择 commit | 加入/移出独立 commit 复制集合 |
+| Space | ToggleCommitSelection | 已选择 commit | 加入/移出统一 commit 多选集合 |
 | Ctrl+C → h | CopySelectedCommitHashes | commits 非空 | 复制多选完整 hashes；无多选时复制当前 hash |
 | Ctrl+C → i | CopyCurrentCommitInfo | 已选择 commit | 复制当前 commit info |
 | Ctrl+C → m | CopyCurrentCommitMessage | 已选择 commit | 复制完整 message，必要时后台加载且不改变 focus |
-| y | QueueCherryPickSelectedCommit | 已选择 commit | 加入 cherry-pick queue |
-| Y | OpenCherryPickQueueDialog | queue 非空 | 打开 cherry-pick queue 确认弹窗 |
+| y | OpenCherryPickSelectedDialog | 多选集合非空 | 按历史顺序打开所选 commits 的 cherry-pick 确认弹窗 |
 | R | OpenResetDialog | 已选择 commit | 打开 reset typed confirmation 弹窗 |
 | Tab | FocusNext | 总是 | focus -> CommitFileList |
 | Esc | Back | 总是 | screen -> BranchOverview |
@@ -790,14 +811,14 @@ focus = CommitList
 
 | Key | Action | 前置条件 | 结果 |
 |---|---|---|---|
-| ↑ / k | MoveUp | files 非空 | selected_file_index 上移 |
-| ↓ / j | MoveDown | files 非空 | selected_file_index 下移 |
+| w / ↑ / k | MoveUp | files 非空 | selected_file_index 上移 |
+| s / ↓ / j | MoveDown | files 非空 | selected_file_index 下移 |
 | PageUp | PageUp | files 非空 | 文件树向上翻页 |
 | PageDown | PageDown | files 非空 | 文件树向下翻页 |
 | Home | Home | files 非空 | 选择第一个文件 |
 | End | End | files 非空 | 选择最后一个文件 |
-| ← / h | MoveLeft | 总是 | focus -> CommitList；不改变 screen |
-| → / l | MoveRight | 已选择文件 | 平移为 `Commit | Diff`；完整 Commit 栏成为左栏并保持 focus，异步加载右栏 diff |
+| a / ← | MoveLeft | 总是 | focus -> CommitList；不改变 screen |
+| d / → / l | MoveRight | 已选择文件 | 平移为 `Commit | Diff`；完整 Commit 栏成为左栏并保持 focus，异步加载右栏 diff |
 | Space | ToggleFileExpanded | 已选择文件 | 展开 / 折叠 hunk summary |
 | Enter | OpenSelectedFileDiff | 已选择文件 | 加载文件 diff，然后进入 View 3 |
 | v | OpenSelectedFileDiff | 已选择文件 | 等价于打开文件 diff |
@@ -902,7 +923,7 @@ View 3 用于：
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ repo=pitui | branch=main | viewing=feature/x | commit=3cc6d76 | file=a.rs │
+│ repo=pitui | branch=main | commit=3cc6d76 | file=a.rs | op=NORMAL       │
 ├──────────────────────────────┬─────────────────────────────────────────────┤
 │ Commit                       │ Changes                                     │
 │ Commit: 3cc6d76              │ @@ -70,10 +70,18 @@                         │
@@ -914,7 +935,7 @@ View 3 用于：
 │   ▶ A parser.rs              │                                             │
 │   ▶ D old_status.rs          │                                             │
 ├──────────────────────────────┴─────────────────────────────────────────────┤
-│ v mode | n next file | p prev file | w wrap | Tab focus | Esc back        │
+│ v mode | n next file | p prev file | W wrap | Tab focus | Esc back        │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -945,19 +966,19 @@ focus = FileList
 
 | Key | Action | 前置条件 | 结果 |
 |---|---|---|---|
-| ↑ / k | MoveUp | files 非空 | 选择上一个文件并加载 diff，focus 保持 FileList |
-| ↓ / j | MoveDown | files 非空 | 选择下一个文件并加载 diff，focus 保持 FileList |
+| w / ↑ / k | MoveUp | files 非空 | 选择上一个文件并加载 diff，focus 保持 FileList |
+| s / ↓ / j | MoveDown | files 非空 | 选择下一个文件并加载 diff，focus 保持 FileList |
 | PageUp | PageUp | files 非空 | 上翻 10 个文件，只为最终文件提交一次 diff 请求 |
 | PageDown | PageDown | files 非空 | 下翻 10 个文件，只为最终文件提交一次 diff 请求 |
 | Home | Home | files 非空 | 选择第一个文件并加载 diff，focus 保持 FileList |
 | End | End | files 非空 | 选择最后一个文件并加载 diff，focus 保持 FileList |
-| ← / h | MoveLeft | 总是 | 平移回 `Commits | Commit`；完整 Commit 栏成为右栏并保持 focus |
-| → / l | MoveRight | 总是 | focus -> DiffView；不改变 screen |
+| a / ← | MoveLeft | 总是 | 平移回 `Commits | Commit`；完整 Commit 栏成为右栏并保持 focus |
+| d / → / l | MoveRight | 总是 | focus -> DiffView；不改变 screen |
 | n | NextFile | files 非空 | 选择下一个文件，并加载该文件 diff |
 | p | PrevFile | files 非空 | 选择上一个文件，并加载该文件 diff |
 | Enter | OpenSelectedFileDiff | 已选择文件 | 加载该文件 diff |
 | v | ToggleDiffMode | 总是 | unified / side-by-side 切换 |
-| w | ToggleWrap | 总是 | 开启 / 关闭换行 |
+| W | ToggleWrap | 总是 | 开启 / 关闭换行 |
 | Ctrl+C → n | CopySelectedFileName | 已选择文件 | 复制文件 basename |
 | Ctrl+C → a | CopySelectedFileAbsolutePath | 已选择文件 | 复制绝对路径 |
 | Ctrl+C → r | CopySelectedFileRelativePath | 已选择文件 | 复制仓库相对路径 |
@@ -969,18 +990,18 @@ focus = FileList
 
 | Key | Action | 前置条件 | 结果 |
 |---|---|---|---|
-| ↑ / k | MoveUp | diff 已加载 | diff_scroll 上移 |
-| ↓ / j | MoveDown | diff 已加载 | diff_scroll 下移 |
+| w / ↑ / k | MoveUp | diff 已加载 | diff_scroll 上移 |
+| s / ↓ / j | MoveDown | diff 已加载 | diff_scroll 下移 |
 | PageUp | PageUp | diff 已加载 | diff 向上翻页 |
 | PageDown | PageDown | diff 已加载 | diff 向下翻页 |
 | Home | Home | diff 已加载 | 滚动到 diff 顶部 |
 | End | End | diff 已加载 | 滚动到 diff 底部 |
-| ← / h | MoveLeft | 总是 | focus -> FileList；不改变 screen |
-| → / l | MoveRight | 最深层 | 无动作，不 wrap 回 FileList |
+| a / ← | MoveLeft | 总是 | focus -> FileList；不改变 screen |
+| d / → / l | MoveRight | 最深层 | 无动作，不 wrap 回 FileList |
 | n | NextFile | files 非空 | 选择下一个文件，并加载 diff |
 | p | PrevFile | files 非空 | 选择上一个文件，并加载 diff |
 | v | ToggleDiffMode | 总是 | unified / side-by-side 切换 |
-| w | ToggleWrap | 总是 | 开启 / 关闭换行 |
+| W | ToggleWrap | 总是 | 开启 / 关闭换行 |
 | Tab | FocusNext | 总是 | focus -> FileList |
 | Esc | Back | 总是 | screen -> CommitDetail |
 | Ctrl+C / q | Quit | 总是 | 此 focus 不挂载 commit/file copy table，执行全局退出 |
@@ -1088,29 +1109,24 @@ CommandFailed
   -> mode = Error
 ```
 
-### 9.2 Cherry-pick Queue
+### 9.2 Cherry-pick Selected Commits
 
 #### 触发
 
 ```text
-y: add selected commit to queue
-Y: open queue confirmation
+Space: toggle current commit in the shared selection
+y: open cherry-pick confirmation for the selection
 ```
 
-#### y 状态转移
+#### 状态转移
 
 ```text
-Normal + y
-  -> if selected commit not in queue:
-       cherry_pick_queue.push(commit)
-  -> screen unchanged
-```
+Normal + y + commit_selection non-empty
+  -> collect selected commits oldest-to-newest
+  -> Confirming(CherryPickSelected)
 
-#### Y 状态转移
-
-```text
-Normal + Y + queue non-empty
-  -> Confirming(CherryPickQueue)
+Normal + y + commit_selection empty
+  -> no action; command is absent from the current footer/help action set
 ```
 
 #### 弹窗内容
@@ -1119,7 +1135,7 @@ Normal + Y + queue non-empty
 About to run:
 git cherry-pick <commit1> <commit2> ...
 
-Queue:
+Selected commits (oldest to newest):
 1. 3cc6d76 Fix Debug Layer error
 2. 0acaf2e Fix color grading format
 
@@ -1129,13 +1145,13 @@ Enter confirm | Esc cancel
 #### 确认状态转移
 
 ```text
-Confirming(CherryPickQueue) + Enter
+Confirming(CherryPickSelected) + Enter
   -> GitRequest::CherryPick { commits }
   -> mode = Normal
   -> pending_jobs += job_id
 
 GitResponse::CommandSucceeded
-  -> cherry_pick_queue.clear()
+  -> commit_selection.clear()
   -> RefreshRepository
 ```
 
@@ -1230,8 +1246,13 @@ CommitFiles / DiffFiles         -> file.copy.name/absolute_path/relative_path
 DiffView                        -> no copy table; Ctrl+C falls back to app.quit
 ```
 
-`app.shortcuts` 是 Global command，默认 `Ctrl+?`；普通终端无法区分 Ctrl+? 与 Backspace
-时可用备用 `?`，两者都打开全局 operation-set 参考框。
+`app.shortcuts` 是 Global command，默认 `h`，打开当前-focus operation-set 参考框。
+`navigation.up/left/down/right` 默认首选 `w/a/s/d`，并保留箭头与 `k/j/l` 替代绑定；
+chord 中的 `Ctrl+C → h` 仍由第二级表解析。
+
+`app.command_prompt` 是另一个 Global command，只绑定 Ctrl+Backtick；`Ctrl+Space` 不绑定
+任何操作。WASD 占用后，branch switch、Changes stage、diff wrap、remote add 分别使用
+大写 `S/S/W/A`。
 
 ### 10.2 Filtering 模式
 
@@ -1282,21 +1303,38 @@ EditingRemote(SetUrl):
   Esc              -> Cancel
 ```
 
-### 10.6 ShortcutHelp 模式
+### 10.6 CommandPrompt 模式
 
 ```text
-Ctrl+? from any Normal focus
+Ctrl+Backtick from any Normal focus
+  -> open_popup(); previous_focus = current focus
+  -> GlobalMode::CommandPrompt { input: "", validation_error: None }
+
+Char / Backspace -> UpdateCommandPrompt
+Enter            -> SubmitCommandPrompt
+Esc              -> close_popup(); restore previous_focus
+```
+
+可接受命令由 `PROMPT_COMMAND_SPECS` 可调用表维护，表项包含 name、description、operation id
+和 `fn() -> Action`。当前 `help` 返回 `OpenShortcutHelp`；Controller 先恢复来源 focus，再按普通
+命令路径打开帮助弹窗。空输入与未知输入留在命令框并显示 validation error。
+
+### 10.7 ShortcutHelp 模式
+
+```text
+h from any Normal focus
   -> open_popup(); previous_focus = current focus
   -> GlobalMode::ShortcutHelp { scroll: 0 }
 
-Up/Down or k/j     -> scroll one line
+w/s or Up/Down or k/j -> scroll one line
 PageUp/PageDown    -> scroll one page
 Home/End           -> jump start/end
-Ctrl+?/?/Enter/Esc/q -> close_popup(); restore previous_focus
+h/Enter/Esc/q       -> close_popup(); restore previous_focus
 ```
 
-帮助内容由有效 keymap 的 Global 表、十张 focus 表与全部 modal 操作表生成；每行显示有效
-binding、label、operation id，当前来源 focus 用 `▶` 标记，`bindings=[]` 显示 `(unbound)`。
+帮助内容只由有效 keymap 的 Global 表与来源 focus 对应的唯一 `ShortcutContext` 表生成；
+其他 View、其他 focus、modal 与 prompt command 表不进入弹窗。每行显示有效 binding、label、
+operation id，来源 focus 用 `▶` 标记，`bindings=[]` 显示 `(unbound)`。
 
 ---
 
@@ -1610,7 +1648,6 @@ Renderer 保存业务状态
 ```text
 repo
 current_branch
-viewing_branch
 selected_commit
 selected_file
 operation
@@ -1619,14 +1656,12 @@ unstaged_count
 untracked_count
 conflicted_count
 ahead / behind
-current_view
-focused_panel
 ```
 
 示例：
 
 ```text
-repo=pitui | branch=main | viewing=feature/x | commit=3cc6d76 | file=a.rs | op=NORMAL | S=1 M=3 U=0 C=0 | ↑2 ↓0
+repo=pitui | branch=main | commit=3cc6d76 | file=a.rs | op=NORMAL | S=1 M=3 U=0 C=0 | ↑2 ↓0
 ```
 
 ### 14.3 底部 Hotkey Bar
@@ -1638,10 +1673,10 @@ Hotkey bar 根据 `screen + focus + mode + selection` 动态生成。
 ```text
 BranchOverview + BranchList:
 repo: Enter expand/collapse | f fetch | p pull --rebase | P push | g reflog | o remotes
-branch: Enter view commits | s switch | b rebase | o remotes
+branch: Enter view commits | S switch | b rebase | o remotes
 
 BranchOverview + CommitList:
-Space select | Ctrl+C copy… | Enter detail | y queue | Y cherry-pick | R reset
+Space select | Ctrl+C copy… | Enter detail | y cherry-pick selected | R reset
 
 Shortcut + CommitCopy:
 h hash | i info | m message | Esc cancel
@@ -1653,24 +1688,24 @@ Shortcut + FileCopy:
 n file name | a absolute path | r relative path | Esc cancel
 
 FileDiffDetail + DiffView:
-v mode | n next file | p prev file | Home/End | PgUp/PgDn | w wrap | Tab focus | Esc back
+v mode | n next file | p prev file | Home/End | PgUp/PgDn | W wrap | Tab focus | Esc back
 (no copy chord in DiffView)
 
 Reflog + ReflogList:
 R reset | Esc back | q quit
 
 Remotes + RemoteList:
-a add remote | e set shared URL | u set upstream | Ctrl+R refresh | Esc back
+A add remote | e set shared URL | u set upstream | Ctrl+R refresh | Esc back
 
 Changes + ChangesTree / ChangesDiff:
-Enter/←/→ expand/collapse | ↑/↓ select/scroll | Home/End | PgUp/PgDn | Ctrl+R refresh | Esc back
+Enter/a/d/←/→ expand/collapse | w/s/↑/↓ select/scroll | Home/End | PgUp/PgDn | Ctrl+R refresh | Esc back
 
 Global normal mode:
-Ctrl+? shortcuts | Ctrl+G changes | Ctrl+R refresh（所有主 screen 都放在 hotkey bar 最前面）
+h help | Ctrl+Backtick command | Ctrl+G changes | Ctrl+R refresh（所有主 screen 都放在 hotkey bar 最前面）
 ```
 
-Normal/Chord footer 来自 `ResolvedKeymap::footer_items`；filter、confirm、commit submission、
-remote editor、error 与 shortcut help footer 来自相应 `ModalShortcutSet.footer`，不再由
+Normal/Chord footer 来自 `ResolvedKeymap::footer_items`；quick command、filter、confirm、
+commit submission、remote editor、error 与 shortcut help footer 来自相应 `ModalShortcutSet.footer`，不再由
 Renderer 复制操作字符串。
 
 ---
@@ -1702,7 +1737,7 @@ AppState {
     previous_focus: None,
     mode: GlobalMode::Normal,
     diff_mode: DiffViewMode::Unified,
-    cherry_pick_queue: vec![],
+    commit_selection: HashSet::new(),
     pending_jobs: vec![],
     last_error: None,
 }
@@ -1905,13 +1940,13 @@ u -> Confirming(SetUpstreamRemote for current branch)
 1. 第一级始终是 `Changes` root；第二级固定为 `Staged Changes` 与 `Unstaged Changes`；第三级才是文件。
 2. `MM` 文件同时出现在两个分组。Staged 节点只加载 `git diff --cached`，Unstaged 节点只加载 `git diff`，绝不在右侧混合两个边界。
 3. untracked 与 conflicted 文件归入 Unstaged；untracked 使用 `git diff --no-index` 预览，冲突保留 Git 的 unmerged patch。
-4. root 和 group 支持 `Enter`、`←/h`、`→/l` 折叠/展开；文件节点 `Enter` 聚焦右侧。`Tab` 始终在 tree/diff 间切换。
-5. 右侧复用 File Diff Detail 的 `render_diff_panel`、`unified_text`、`side_by_side_text`；`v` 切换模式，`w` 切换 wrap，终端宽度小于 140 时 side-by-side 自动降级。
+4. root 和 group 支持 `Enter`、`a/←`、`d/→/l` 折叠/展开；文件节点 `Enter` 聚焦右侧。`Tab` 始终在 tree/diff 间切换。
+5. 右侧复用 File Diff Detail 的 `render_diff_panel`、`unified_text`、`side_by_side_text`；`v` 切换模式，`W` 切换 wrap，终端宽度小于 140 时 side-by-side 自动降级。
 6. rename/copy 显示 `old → new`；Git argv 始终使用原始 `GitPath` 字节。
 7. 空文件或 binary 无 textual diff 时显示明确占位；快速选择文件产生的旧 response 由 latest job id 丢弃。
 8. `PendingJobKind::Changes*` 携带 `repository_index` 和 diff group；离开 screen、切换仓库或快速切换文件后，过期 response 不得覆盖当前内容。
 9. `Space` 在 file/group/root 上选择或反选对应节点；diff focus 下仍操作左侧当前文件。父节点用 `[ ]`、`[x]`、`[-]` 表示空选、全选和部分选择。
-10. `s` 只 stage 已选的 Unstaged 节点，`u` 只 unstage 已选的 Staged 节点；没有显式选择时回退到当前同组文件。混合选择不会越过 group 边界。
+10. `S` 只 stage 已选的 Unstaged 节点，`u` 只 unstage 已选的 Staged 节点；没有显式选择时回退到当前同组文件。混合选择不会越过 group 边界。
 11. `c` 只在至少一个 staged 文件存在时打开 commit message 弹窗；`Enter` 提交、`Esc` 取消，空消息留在弹窗并显示 validation error。
 12. `Home/End/PageUp/PageDown` 在 ChangesTree 中跳转/翻页选择并只加载最终文件；在 ChangesDiff 中跳到内容首尾或按 10 行翻页，不改变 focus。
 
@@ -1983,7 +2018,7 @@ Error + Enter/Esc
 ```text
 - branch switch confirmation
 - repository pull --rebase / push confirmation
-- cherry-pick queue confirmation
+- explicitly selected commits cherry-pick confirmation
 - reset typed confirmation
 - multi-repository tree + per-repository fetch/reflog/remote management
 - shared fetch/push URL policy + explicit per-branch upstream remote
@@ -1993,7 +2028,7 @@ Error + Enter/Esc
 - file/group multi-select + file-level stage/unstage + commit message dialog
 - multi-select commit hash + current info/full-message copy through OSC 52
 - focus-mounted Ctrl+C palettes: Commits h/i/m; file columns n/a/r; none in DiffView
-- callable CommandSpec / modal input jump tables and Ctrl+? global shortcut reference
+- callable CommandSpec / modal input jump tables, `h` current-focus shortcut reference, and Ctrl+Backtick command prompt
 - File Diff file selection refresh without asynchronous focus stealing
 - soft/mixed reset + two-stage hard reset
 - safe rebase + conflict auto-abort
@@ -2057,9 +2092,13 @@ Pitui 的定位是：
 7. 第一阶段不提供 TUI 配置编辑器，不配置 shell/Git 命令模板，也不改变当前 Git 安全策略。
 8. Normal 命令按十个 `ShortcutContext` 精确挂载：Commits 使用 commit copy，文件列使用
    file copy，DiffView 不挂载 copy；modal 输入另由 `MODE_KEY_TABLES` 独占。
-9. `Ctrl+?` 打开全局快捷键参考框，展示有效 binding、operation id、全部 focus 操作集和
-   commit/remote/confirmation 等 modal 操作集，并在关闭时恢复来源 focus。
+9. `h` 打开当前-focus 快捷键参考框，只展示 Global 与来源 `ShortcutContext` 的有效
+   binding/operation id，并在关闭时恢复来源 focus；Ctrl+Backtick 打开快捷命令框，
+   `Ctrl+Space` 不绑定，`help` 返回同一指南。
 
 第一阶段不包含运行时 reload、文件 watcher、TUI 配置编辑器或独立异步日志事件队列。
 完整 schema、快捷键冲突规则、footer 生成算法、日志轮转/刷新策略、模块边界、测试矩阵与
 后续计划见 [`global-configuration-design.md`](global-configuration-design.md)。
+按 Branch Overview、Commit Detail、File Diff、Changes、Reflog、Remotes 拆分 Fields 与
+Operations 的 Schema v2 设计见
+[`view-configuration-design.md`](view-configuration-design.md)；该 schema 尚未实现。

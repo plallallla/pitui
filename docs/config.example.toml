@@ -23,7 +23,12 @@ priority = 110
 
 [ui.footer.commands."app.shortcuts"]
 visible = true
-label = "shortcuts"
+label = "help"
+priority = 100
+
+[ui.footer.commands."app.command_prompt"]
+visible = true
+label = "command"
 priority = 100
 
 [ui.footer.commands."app.refresh"]
@@ -50,7 +55,35 @@ chord_timeout_ms = 0 # 0 waits until completion, Esc, or an unmatched key
 bindings = ["Ctrl+R"]
 
 [keybindings.commands."app.shortcuts"]
-bindings = ["Ctrl+?", "?"] # plain ? is the portable terminal fallback
+bindings = ["h"]
+
+[keybindings.commands."app.command_prompt"]
+bindings = ["Ctrl+`"]
+
+[keybindings.commands."navigation.up"]
+bindings = ["w", "Up", "k"]
+
+[keybindings.commands."navigation.left"]
+bindings = ["a", "Left"]
+
+[keybindings.commands."navigation.down"]
+bindings = ["s", "Down", "j"]
+
+[keybindings.commands."navigation.right"]
+bindings = ["d", "Right", "l"]
+
+# WASD owns normal-mode navigation. Conflicting operations use uppercase keys.
+[keybindings.commands."branch.switch"]
+bindings = ["S"]
+
+[keybindings.commands."changes.stage"]
+bindings = ["S"]
+
+[keybindings.commands."diff.wrap.toggle"]
+bindings = ["W"]
+
+[keybindings.commands."remote.add"]
+bindings = ["A"]
 
 [keybindings.commands."view.changes.toggle"]
 bindings = ["Ctrl+G"]

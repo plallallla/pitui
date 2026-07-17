@@ -871,7 +871,33 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
     assert_eq!(app.state.branch_commits.items.len(), 2);
     assert_eq!(app.state.focus, FocusPanel::BranchList);
 
-    app.dispatch(Action::OpenShortcutHelp);
+    app.dispatch(Action::OpenCommandPrompt);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::CommandPrompt {
+            ref input,
+            validation_error: None
+        } if input.is_empty()
+    ));
+    assert_eq!(app.state.focus, FocusPanel::Popup);
+    assert_eq!(app.state.previous_focus, Some(FocusPanel::BranchList));
+    app.dispatch(Action::SubmitCommandPrompt);
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::CommandPrompt {
+            validation_error: Some(_),
+            ..
+        }
+    ));
+    app.dispatch(Action::UpdateCommandPrompt("help".into()));
+    assert!(matches!(
+        app.state.mode,
+        GlobalMode::CommandPrompt {
+            validation_error: None,
+            ..
+        }
+    ));
+    app.dispatch(Action::SubmitCommandPrompt);
     assert!(matches!(
         app.state.mode,
         GlobalMode::ShortcutHelp { scroll: 0 }
@@ -928,22 +954,33 @@ fn application_controller_drives_the_three_view_workflow_and_modals() {
     app.dispatch(Action::Back);
     assert_eq!(app.state.screen, Screen::CommitDetail);
     assert_eq!(app.state.focus, FocusPanel::CommitFileList);
-    app.dispatch(Action::QueueCherryPickSelectedCommit);
-    app.dispatch(Action::QueueCherryPickSelectedCommit);
-    assert_eq!(app.state.cherry_pick_queue.len(), 1);
-    app.dispatch(Action::OpenCherryPickQueueDialog);
-    assert!(matches!(app.state.mode, GlobalMode::Confirming { .. }));
+    app.dispatch(Action::FocusNext);
+    assert_eq!(app.state.focus, FocusPanel::CommitList);
+    app.dispatch(Action::ToggleCommitSelection);
+    app.dispatch(Action::MoveDown);
+    app.dispatch(Action::ToggleCommitSelection);
+    assert_eq!(app.state.commit_selection.len(), 2);
+    let expected_cherry_pick = app
+        .state
+        .branch_commits
+        .items
+        .iter()
+        .rev()
+        .filter(|commit| app.state.commit_selection.contains(&commit.hash))
+        .map(|commit| commit.hash.clone())
+        .collect::<Vec<_>>();
+    app.dispatch(Action::OpenCherryPickSelectedDialog);
+    assert!(matches!(
+        &app.state.mode,
+        GlobalMode::Confirming {
+            dialog: pitui::app::ConfirmDialog::CherryPickSelected { commits, .. }
+        } if commits == &expected_cherry_pick
+    ));
     assert_eq!(app.state.focus, FocusPanel::Popup);
     app.dispatch(Action::Cancel);
     assert_eq!(app.state.mode, GlobalMode::Normal);
-    assert_eq!(app.state.focus, FocusPanel::CommitFileList);
-
-    app.dispatch(Action::FocusNext);
     assert_eq!(app.state.focus, FocusPanel::CommitList);
-    app.dispatch(Action::ToggleCommitCopySelection);
-    app.dispatch(Action::MoveDown);
-    app.dispatch(Action::ToggleCommitCopySelection);
-    assert_eq!(app.state.commit_copy_selection.len(), 2);
+
     open_commit_copy_chord(&mut app);
     assert!(matches!(app.state.mode, GlobalMode::Chord { .. }));
     app.dispatch(Action::CopySelectedCommitHashes);
@@ -1506,11 +1543,13 @@ fn application_confirms_switch_cherry_pick_and_typed_reset_end_to_end() {
     wait_until_idle(&mut app);
     assert_eq!(app.state.selected_commit().unwrap().hash.0, feature_commit);
 
-    app.dispatch(Action::QueueCherryPickSelectedCommit);
-    app.dispatch(Action::OpenCherryPickQueueDialog);
+    app.dispatch(Action::OpenCherryPickSelectedDialog);
+    assert_eq!(app.state.mode, GlobalMode::Normal);
+    app.dispatch(Action::ToggleCommitSelection);
+    app.dispatch(Action::OpenCherryPickSelectedDialog);
     app.dispatch(Action::Confirm);
     wait_until_idle(&mut app);
-    assert!(app.state.cherry_pick_queue.is_empty());
+    assert!(app.state.commit_selection.is_empty());
     assert!(repo.path().join("feature.txt").exists());
     assert_eq!(
         git(repo.path(), &["log", "-1", "--format=%s"]),

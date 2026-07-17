@@ -17,7 +17,7 @@ use crate::{
 use super::{
     Action, AppError, AppState, BranchTreeNode, ChangeGroup, ChangeSelection, ChangesTreeNode,
     CommandKind, ConfirmDialog, DiffViewMode, FilterTarget, FocusPanel, GlobalMode, PendingJobKind,
-    RemoteEditKind, RemoteInputField, Screen,
+    RemoteEditKind, RemoteInputField, Screen, ShortcutContext, prompt_command,
 };
 
 const PAGE_SIZE: usize = 10;
@@ -631,11 +631,11 @@ impl App {
                     self.state.selection.selected_commit_index = None;
                     self.state.current_commit_detail = None;
                     self.state.current_file_diff = None;
-                    self.state.commit_copy_selection.clear();
-                    self.state.commit_copy_selection_repository_index = Some(repository_index);
+                    self.state.commit_selection.clear();
+                    self.state.commit_selection_repository_index = Some(repository_index);
                 } else {
                     self.state
-                        .commit_copy_selection
+                        .commit_selection
                         .retain(|hash| available_hashes.contains(hash));
                 }
                 self.state.ensure_valid_commit_selection();
@@ -786,15 +786,7 @@ impl App {
                     _ => None,
                 };
                 if command_kind == Some(CommandKind::CherryPick) {
-                    self.state.cherry_pick_queue.clear();
-                    self.state.cherry_pick_queue_repository_index = None;
-                }
-                if matches!(
-                    command_kind,
-                    Some(CommandKind::Reset | CommandKind::Rebase | CommandKind::PullRebase)
-                ) {
-                    self.state.cherry_pick_queue.clear();
-                    self.state.cherry_pick_queue_repository_index = None;
+                    self.state.commit_selection.clear();
                 }
                 if command_kind == Some(CommandKind::Reset) {
                     self.state.current_commit_detail = None;
@@ -893,6 +885,7 @@ impl App {
             GlobalMode::EditingCommitMessage { .. } => self.dispatch_commit_message(action),
             GlobalMode::EditingRemote { .. } => self.dispatch_remote_editor(action),
             GlobalMode::Chord { .. } => self.dispatch_chord(action),
+            GlobalMode::CommandPrompt { .. } => self.dispatch_command_prompt(action),
             GlobalMode::ShortcutHelp { .. } => self.dispatch_shortcut_help(action),
             GlobalMode::Error => match action {
                 Action::DismissError | Action::Cancel | Action::Back | Action::Confirm => {
@@ -916,15 +909,20 @@ impl App {
             self.state.close_popup();
             return;
         }
-        let GlobalMode::ShortcutHelp { scroll } = &mut self.state.mode else {
-            return;
-        };
+        let origin_focus = self
+            .state
+            .previous_focus
+            .unwrap_or_else(|| self.state.default_focus_for_screen());
+        let context = ShortcutContext::from_view(self.state.screen, origin_focus);
         let maximum = self
             .state
             .config
-            .shortcut_help_line_count()
+            .shortcut_help_line_count(context)
             .saturating_sub(1)
             .min(usize::from(u16::MAX)) as u16;
+        let GlobalMode::ShortcutHelp { scroll } = &mut self.state.mode else {
+            return;
+        };
         *scroll = match action {
             Action::MoveUp => scroll.saturating_sub(1),
             Action::MoveDown => scroll.saturating_add(1).min(maximum),
@@ -934,6 +932,54 @@ impl App {
             Action::End => maximum,
             _ => *scroll,
         };
+    }
+
+    fn dispatch_command_prompt(&mut self, action: Action) {
+        match action {
+            Action::UpdateCommandPrompt(input) => {
+                if let GlobalMode::CommandPrompt {
+                    input: current_input,
+                    validation_error,
+                } = &mut self.state.mode
+                {
+                    *current_input = input;
+                    *validation_error = None;
+                }
+            }
+            Action::SubmitCommandPrompt => {
+                let GlobalMode::CommandPrompt { input, .. } = self.state.mode.clone() else {
+                    return;
+                };
+                let input = input.trim();
+                if input.is_empty() {
+                    if let GlobalMode::CommandPrompt {
+                        validation_error, ..
+                    } = &mut self.state.mode
+                    {
+                        *validation_error = Some(
+                            "Command cannot be empty. Type `help` for the shortcut guide.".into(),
+                        );
+                    }
+                    return;
+                }
+                let Some(command) = prompt_command(input) else {
+                    if let GlobalMode::CommandPrompt {
+                        validation_error, ..
+                    } = &mut self.state.mode
+                    {
+                        *validation_error = Some(format!(
+                            "Unknown command `{input}`. Type `help` for the shortcut guide."
+                        ));
+                    }
+                    return;
+                };
+                let next_action = (command.invoke)();
+                self.state.close_popup();
+                self.dispatch_normal(next_action);
+            }
+            Action::Cancel | Action::Back => self.state.close_popup(),
+            _ => {}
+        }
     }
 
     fn dispatch_filtering(&mut self, action: Action) {
@@ -1339,7 +1385,7 @@ impl App {
                             },
                         );
                     }
-                    ConfirmDialog::CherryPickQueue {
+                    ConfirmDialog::CherryPickSelected {
                         repository_index,
                         commits,
                     } => {
@@ -1505,7 +1551,7 @@ impl App {
             Action::NextFile => self.move_file(1),
             Action::PrevFile => self.move_file(-1),
             Action::ToggleWrap => self.state.wrap_diff = !self.state.wrap_diff,
-            Action::ToggleCommitCopySelection => self.toggle_commit_copy_selection(),
+            Action::ToggleCommitSelection => self.toggle_commit_selection(),
             Action::BeginChord(prefix) => {
                 self.state.mode = GlobalMode::Chord {
                     prefix,
@@ -1516,14 +1562,20 @@ impl App {
                 self.state.open_popup();
                 self.state.mode = GlobalMode::ShortcutHelp { scroll: 0 };
             }
+            Action::OpenCommandPrompt => {
+                self.state.open_popup();
+                self.state.mode = GlobalMode::CommandPrompt {
+                    input: String::new(),
+                    validation_error: None,
+                };
+            }
             Action::CopySelectedCommitHashes => self.copy_selected_commit_hashes(),
             Action::CopyCurrentCommitInfo => self.copy_current_commit_info(),
             Action::CopyCurrentCommitMessage => self.copy_current_commit_message(),
             Action::CopySelectedFileName => self.copy_selected_file_name(),
             Action::CopySelectedFileAbsolutePath => self.copy_selected_file_absolute_path(),
             Action::CopySelectedFileRelativePath => self.copy_selected_file_relative_path(),
-            Action::QueueCherryPickSelectedCommit => self.queue_selected_commit(),
-            Action::OpenCherryPickQueueDialog => self.open_cherry_pick_dialog(),
+            Action::OpenCherryPickSelectedDialog => self.open_cherry_pick_selected_dialog(),
             Action::OpenResetDialog => self.open_reset_dialog(),
             Action::DismissError => self.state.dismiss_error(),
             Action::Confirm
@@ -1538,6 +1590,8 @@ impl App {
             | Action::ConfirmReset
             | Action::UpdateCommitMessage(_)
             | Action::SubmitCommit
+            | Action::UpdateCommandPrompt(_)
+            | Action::SubmitCommandPrompt
             | Action::UpdateRemoteName(_)
             | Action::UpdateRemoteUrl(_)
             | Action::FocusNextRemoteField
@@ -1991,13 +2045,9 @@ impl App {
         if self.state.focus != FocusPanel::BranchList {
             self.state.focus = FocusPanel::CommitList;
         }
-        if self.state.cherry_pick_queue_repository_index != Some(repository_index) {
-            self.state.cherry_pick_queue.clear();
-            self.state.cherry_pick_queue_repository_index = None;
-        }
-        if self.state.commit_copy_selection_repository_index != Some(repository_index) {
-            self.state.commit_copy_selection.clear();
-            self.state.commit_copy_selection_repository_index = None;
+        if self.state.commit_selection_repository_index != Some(repository_index) {
+            self.state.commit_selection.clear();
+            self.state.commit_selection_repository_index = None;
         }
         self.load_active_repository_commits(repository_index);
     }
@@ -2062,8 +2112,8 @@ impl App {
             self.state.selection.selected_commit_index = None;
             self.state.current_commit_detail = None;
             self.state.current_file_diff = None;
-            self.state.commit_copy_selection.clear();
-            self.state.commit_copy_selection_repository_index = Some(repository_index);
+            self.state.commit_selection.clear();
+            self.state.commit_selection_repository_index = Some(repository_index);
             self.state.ensure_valid_commit_selection();
             return;
         }
@@ -2087,8 +2137,8 @@ impl App {
         self.state.selection.selected_commit_index = None;
         self.state.current_commit_detail = None;
         self.state.current_file_diff = None;
-        self.state.commit_copy_selection.clear();
-        self.state.commit_copy_selection_repository_index = Some(repository_index);
+        self.state.commit_selection.clear();
+        self.state.commit_selection_repository_index = Some(repository_index);
         self.submit_commits(repository_index, branch);
     }
 
@@ -2836,7 +2886,7 @@ impl App {
         }
     }
 
-    fn toggle_commit_copy_selection(&mut self) {
+    fn toggle_commit_selection(&mut self) {
         let Some(repository_index) = self.state.branch_commits_repository_index else {
             return;
         };
@@ -2847,12 +2897,12 @@ impl App {
         else {
             return;
         };
-        if self.state.commit_copy_selection_repository_index != Some(repository_index) {
-            self.state.commit_copy_selection.clear();
-            self.state.commit_copy_selection_repository_index = Some(repository_index);
+        if self.state.commit_selection_repository_index != Some(repository_index) {
+            self.state.commit_selection.clear();
+            self.state.commit_selection_repository_index = Some(repository_index);
         }
-        if !self.state.commit_copy_selection.remove(&hash) {
-            self.state.commit_copy_selection.insert(hash);
+        if !self.state.commit_selection.remove(&hash) {
+            self.state.commit_selection.insert(hash);
         }
     }
 
@@ -2951,40 +3001,22 @@ impl App {
         self.state.last_message = Some("Copied selected file repository-relative path".into());
     }
 
-    fn queue_selected_commit(&mut self) {
-        let Some(repository_index) = self.state.branch_commits_repository_index else {
+    fn open_cherry_pick_selected_dialog(&mut self) {
+        let Some(repository_index) = self.state.commit_selection_repository_index else {
             return;
         };
-        let Some(commit) = self
-            .state
-            .selected_commit()
-            .map(|commit| commit.hash.clone())
-        else {
+        if self.state.branch_commits_repository_index != Some(repository_index) {
             return;
-        };
-        if self.state.cherry_pick_queue_repository_index != Some(repository_index) {
-            self.state.cherry_pick_queue.clear();
-            self.state.cherry_pick_queue_repository_index = Some(repository_index);
         }
-        if !self.state.cherry_pick_queue.contains(&commit) {
-            self.state.cherry_pick_queue.push(commit);
-        }
-    }
-
-    fn open_cherry_pick_dialog(&mut self) {
-        let Some(repository_index) = self.state.cherry_pick_queue_repository_index else {
-            return;
-        };
-        if self.state.cherry_pick_queue.is_empty()
-            || self.state.branch_commits_repository_index != Some(repository_index)
-        {
+        let commits = self.state.selected_commit_hashes_for_cherry_pick();
+        if commits.is_empty() {
             return;
         }
         self.state.open_popup();
         self.state.mode = GlobalMode::Confirming {
-            dialog: ConfirmDialog::CherryPickQueue {
+            dialog: ConfirmDialog::CherryPickSelected {
                 repository_index,
-                commits: self.state.cherry_pick_queue.clone(),
+                commits,
             },
         };
     }

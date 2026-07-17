@@ -133,7 +133,7 @@ pub enum ConfirmDialog {
         repository_index: usize,
         branch: BranchName,
     },
-    CherryPickQueue {
+    CherryPickSelected {
         repository_index: usize,
         commits: Vec<CommitHash>,
     },
@@ -193,6 +193,10 @@ pub enum GlobalMode {
     },
     ShortcutHelp {
         scroll: u16,
+    },
+    CommandPrompt {
+        input: String,
+        validation_error: Option<String>,
     },
     Error,
 }
@@ -513,12 +517,10 @@ pub struct AppState {
     pub expansion: ExpansionState,
     pub diff_mode: DiffViewMode,
     pub wrap_diff: bool,
-    pub cherry_pick_queue: Vec<CommitHash>,
-    pub cherry_pick_queue_repository_index: Option<usize>,
-    /// Independent selection used only for copying commit hashes. Cherry-pick
-    /// queue membership must never implicitly change clipboard selection.
-    pub commit_copy_selection: HashSet<CommitHash>,
-    pub commit_copy_selection_repository_index: Option<usize>,
+    /// Commit selection shared by multi-commit operations such as copying
+    /// hashes and cherry-picking. It is scoped to one repository/branch list.
+    pub commit_selection: HashSet<CommitHash>,
+    pub commit_selection_repository_index: Option<usize>,
     /// Consumed by the terminal layer and written through OSC 52.
     pub pending_clipboard: Option<String>,
     pub pending_jobs: HashMap<GitJobId, PendingJobKind>,
@@ -585,10 +587,8 @@ impl AppState {
             },
             expansion: ExpansionState::default(),
             wrap_diff: false,
-            cherry_pick_queue: Vec::new(),
-            cherry_pick_queue_repository_index: None,
-            commit_copy_selection: HashSet::new(),
-            commit_copy_selection_repository_index: None,
+            commit_selection: HashSet::new(),
+            commit_selection_repository_index: None,
             pending_clipboard: None,
             pending_jobs: HashMap::new(),
             latest_commits_job: None,
@@ -903,7 +903,7 @@ impl AppState {
             .branch_commits
             .items
             .iter()
-            .filter(|commit| self.commit_copy_selection.contains(&commit.hash))
+            .filter(|commit| self.commit_selection.contains(&commit.hash))
             .map(|commit| commit.hash.clone())
             .collect::<Vec<_>>();
         if selected.is_empty() {
@@ -913,6 +913,19 @@ impl AppState {
         } else {
             selected
         }
+    }
+
+    /// Returns only explicitly selected commits in replay order. `git log`
+    /// lists newest commits first, while cherry-pick should normally replay a
+    /// dependent series from oldest to newest.
+    pub fn selected_commit_hashes_for_cherry_pick(&self) -> Vec<CommitHash> {
+        self.branch_commits
+            .items
+            .iter()
+            .rev()
+            .filter(|commit| self.commit_selection.contains(&commit.hash))
+            .map(|commit| commit.hash.clone())
+            .collect()
     }
 
     pub fn selected_commit_info_for_copy(&self) -> Option<String> {
@@ -1249,16 +1262,16 @@ mod tests {
             },
         ];
         state.ensure_valid_commit_selection();
-        state
-            .commit_copy_selection
-            .insert(CommitHash("bbbbbbbb".into()));
-        state
-            .commit_copy_selection
-            .insert(CommitHash("aaaaaaaa".into()));
+        state.commit_selection.insert(CommitHash("bbbbbbbb".into()));
+        state.commit_selection.insert(CommitHash("aaaaaaaa".into()));
 
         assert_eq!(
             state.selected_commit_hashes_for_copy(),
             vec![CommitHash("aaaaaaaa".into()), CommitHash("bbbbbbbb".into())]
+        );
+        assert_eq!(
+            state.selected_commit_hashes_for_cherry_pick(),
+            vec![CommitHash("bbbbbbbb".into()), CommitHash("aaaaaaaa".into())]
         );
         let info = state.selected_commit_info_for_copy().unwrap();
         assert!(info.contains("commit aaaaaaaa"));

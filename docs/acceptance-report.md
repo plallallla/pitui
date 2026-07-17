@@ -4,7 +4,7 @@
 
 ## 结论
 
-`docs/git-tui-design.md` 中 Milestone 1–5 及多仓库安全操作扩展已实现。Pitui 可同时打开多个 Git 仓库，以真正分层的仓库/分支树浏览 commit、独立 Changes 三级树、changed files、两种 file diff、reflog 和 Remote Management，并通过仓库隔离的确认流程执行 fetch、pull --rebase、push、switch、cherry-pick、soft/mixed/hard reset 和 safe rebase。Remote Management 可新增 remote、归一 fetch/push URL 并为当前分支设置双向 upstream；worker 在联系网络前强制校验 URL 和分支路由一致。Changes 支持文件/分组多选、stage、unstage 和 commit。快捷键现由 `CommandId as usize -> CommandSpec` 可调用跳表按十个 focus context 精确挂载：Commits 的 `Ctrl+C → h/i/m` 只复制 hashes/info/message，CommitFiles/FileList 的 `Ctrl+C → n/a/r` 只复制文件名/绝对路径/仓库相对路径，DiffView 不再误挂载 copy。Filter、确认、commit submission、Remote editor 等 modal 使用独占可调用输入表；`Ctrl+?` 全局帮助框从同一 registry、有效 keymap 与 modal 操作集生成并显示 operation id。Commits 位于 Overview 宽右栏时使用两行 detailed item，补充日期、作者与 tags；平移到 Commit Detail 窄左栏后恢复原有单行 compact item。定时 Git 状态轮询已移除，任意主界面通过 `Ctrl+R` 手动刷新；Commit Files、File Diff 和 Changes Diff 统一支持 Home/End/PageUp/PageDown。Branch 列切换分支会自动刷新右侧 commits；Commit Detail 左侧切换 commit 会自动刷新右侧 metadata/files；两者都保持左侧 focus，快速连续移动只接受最新响应。浏览主链使用不回绕的 `Branches | Commits` → `Commits | Commit` → `Commit | Diff` 双栏层级：Right 越过右栏时将其复用为下一界面左栏，Left 完全对称还原。File Diff 左侧因此保留完整 commit metadata + files，而非孤立 Files 列；切换文件仍刷新右侧且不抢走 focus。版本化全局 TOML 配置已接管 command bindings、逐级 chord、action-only footer、共享 diff 默认模式和后台日志策略，并在进入 terminal 前严格校验。所有 Git worker job 另有可配置的持久化 JSONL 生命周期日志。
+`docs/git-tui-design.md` 中 Milestone 1–5 及多仓库安全操作扩展已实现。Pitui 可同时打开多个 Git 仓库，以真正分层的仓库/分支树浏览 commit、独立 Changes 三级树、changed files、两种 file diff、reflog 和 Remote Management，并通过仓库隔离的确认流程执行 fetch、pull --rebase、push、switch、cherry-pick、soft/mixed/hard reset 和 safe rebase。Remote Management 可新增 remote、归一 fetch/push URL 并为当前分支设置双向 upstream；worker 在联系网络前强制校验 URL 和分支路由一致。Changes 支持文件/分组多选、stage、unstage 和 commit。快捷键现由 `CommandId as usize -> CommandSpec` 可调用跳表按十个 focus context 精确挂载：WASD 分别负责 up/left/down/right，原有冲突操作迁移到 `W/S/A`；Commits 的 `Ctrl+C → h/i/m` 只复制 hashes/info/message，CommitFiles/FileList 的 `Ctrl+C → n/a/r` 只复制文件名/绝对路径/仓库相对路径，DiffView 不再误挂载 copy。Filter、确认、quick command、commit submission、Remote editor 等 modal 使用独占可调用输入表；`h` 帮助框只从同一 registry 生成 Global 与来源 focus 的有效 operation。Ctrl+Backtick 打开快捷命令框，`Ctrl+Space` 不绑定，输入 `help` 返回当前-focus 快捷键指南。Commits 位于 Overview 宽右栏时使用两行 detailed item，补充精确到分钟的日期时间和作者，仅在存在 Git tag 时展示 tags；平移到 Commit Detail 窄左栏后恢复原有单行 compact item。顶部状态栏不再显示 view、viewing、focus。定时 Git 状态轮询已移除，任意主界面通过 `Ctrl+R` 手动刷新；Commit Files、File Diff 和 Changes Diff 统一支持 Home/End/PageUp/PageDown。Branch 列切换分支会自动刷新右侧 commits；Commit Detail 左侧切换 commit 会自动刷新右侧 metadata/files；两者都保持左侧 focus，快速连续移动只接受最新响应。浏览主链使用不回绕的 `Branches | Commits` → `Commits | Commit` → `Commit | Diff` 双栏层级：Right 越过右栏时将其复用为下一界面左栏，Left 完全对称还原。File Diff 左侧因此保留完整 commit metadata + files，而非孤立 Files 列；切换文件仍刷新右侧且不抢走 focus。版本化全局 TOML 配置已接管 command bindings、逐级 chord、action-only footer、共享 diff 默认模式和后台日志策略，并在进入 terminal 前严格校验。所有 Git worker job 另有可配置的持久化 JSONL 生命周期日志。按 Data View 分层的 Schema v2 字段、density 与 scoped operation 配置已形成独立设计稿，尚未开放解析。
 
 ## 里程碑证据
 
@@ -28,7 +28,7 @@
 | Reset 安全分级 | soft/mixed/hard mode chooser；hard warning + hash 两阶段确认 | 三种真实 reset 语义、reflog target reset、hard controller end-to-end tests |
 | Safe Rebase | controller + worker 双重前置检查、确认、冲突检测、仅自动 abort 本次操作 | clean success、dirty rejection、真实冲突恢复、既存 rebase 不被 abort integration tests |
 | 全局配置 / Diff 默认模式 | `src/config.rs` 严格 TOML、CLI/env/path 优先级和诊断命令；`[diff].default_mode` 初始化共享 session mode | 合法/非法模式、effective config、CLI exit code、两个 diff 入口初始化 tests |
-| Focus Shortcut Tables / Help | `src/app/command.rs` 的 `COMMAND_SPECS` 函数指针跳表、十个 `ShortcutContext`、commit/file 互斥 chord；`MODE_KEY_TABLES` modal handler；`Ctrl+?` 全局帮助框 | jump-table 顺序/完整性、commit/file/Diff focus 隔离、modal id 对齐、binding/footer/help 一致、逐级 chord、scroll/restore、render 与真实 clipboard path tests |
+| Focus Shortcut Tables / Help | `COMMAND_SPECS` 函数指针跳表、WASD navigation、十个 `ShortcutContext`、commit/file 互斥 chord；`MODE_KEY_TABLES` modal handler；`h` 当前-focus 帮助框；Ctrl+Backtick prompt，Ctrl+Space unbound | jump-table 顺序/完整性、WASD 与大写冲突迁移、current-focus help 隔离、modal id 对齐、binding/footer/help 一致、prompt validation/help 跳转、scroll/restore tests |
 | 后台日志 | 平台默认路径与 `PITUI_LOG`；配置开关/level/target/flush/writer buffer/rotation/retention；queued/started/completed JSONL；敏感 payload 收敛 | JSON escaping、commit message redaction、level、定时 flush、rotate-on-start、多备份和 strict-open tests；success/failure lifecycle integration test |
 | GitHub / License | MIT License、跨平台 CI、Dependabot、Issue Forms、PR template、贡献与安全策略 | Cargo license metadata、GitHub YAML 静态检查、完整质量门禁 |
 
@@ -39,7 +39,7 @@
 - Input Mapper 只生成 `Action`。
 - Normal/Chord 输入、底部提示和全局帮助读取同一个 `COMMAND_SPECS` 可调用 registry 与同一份 `Arc<ResolvedConfig>`；focus context 先过滤挂载表，再调用动态 actionability 函数。
 - modal 输入通过 `MODE_KEY_TABLES` 独占；其 footer/help 文字来自对应 `MODAL_SHORTCUT_SETS`，普通 focus 命令不会穿透。
-- Clipboard payload 由 Application 生成，TUI 只负责 OSC 52 编码与终端写入；复制集合与 cherry-pick queue 隔离。
+- Clipboard payload 由 Application 生成，TUI 只负责 OSC 52 编码与终端写入；Commits 的统一多选集合同时服务 hash 复制与 cherry-pick，后者在集合为空时不可执行。
 - Git Worker 通过 request/response channel 通信，不依赖 TUI；每个 job 显式携带 cwd，不存在全局单仓库路径。
 - GitCommandBus 在发送和执行边界记录每个 job 的 queued/started/completed；响应发布前 flush completion，channel 断开也有错误记录。
 - pending job 保存请求上下文，latest job id 防止过期响应覆盖当前视图。

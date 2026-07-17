@@ -10,8 +10,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     app::{
         AppState, BranchTreeNode, ChangeGroup, ChangesTreeNode, ConfirmDialog, DiffViewMode,
-        FilterTarget, FocusPanel, GlobalMode, RemoteEditKind, RemoteInputField, Screen,
-        ShortcutContext, modal_shortcut_set,
+        FilterTarget, FocusPanel, GlobalMode, PROMPT_COMMAND_SPECS, RemoteEditKind,
+        RemoteInputField, Screen, ShortcutContext, modal_shortcut_set,
     },
     config::{FooterMode, FooterOverflow},
     domain::{DiffCellKind, DiffLineKind, FileDiff, side_by_side_rows},
@@ -118,11 +118,6 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             )
         },
     );
-    let viewing = app
-        .branch_commits
-        .viewing_branch
-        .as_ref()
-        .map_or("—", |branch| branch.0.as_str());
     let selected_commit = match app.screen {
         Screen::Reflog => app
             .selected_reflog()
@@ -147,6 +142,7 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         GlobalMode::EditingCommitMessage { .. } => "COMMIT",
         GlobalMode::EditingRemote { .. } => "REMOTE",
         GlobalMode::Chord { .. } => "SHORTCUT",
+        GlobalMode::CommandPrompt { .. } => "COMMAND",
         GlobalMode::ShortcutHelp { .. } => "HELP",
         GlobalMode::Error => "ERROR",
     };
@@ -158,33 +154,11 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let tracking = active_repository.map_or(String::new(), |repo| {
         format!("↑{} ↓{}", repo.status.ahead, repo.status.behind)
     });
-    let view = match app.screen {
-        Screen::BranchOverview => "BRANCH",
-        Screen::CommitDetail => "COMMIT",
-        Screen::FileDiffDetail => "DIFF",
-        Screen::Reflog => "REFLOG",
-        Screen::Changes => "CHANGES",
-        Screen::Remotes => "REMOTES",
-    };
-    let focus = match app.focus {
-        FocusPanel::BranchList => "BRANCHES",
-        FocusPanel::CommitList => "COMMITS",
-        FocusPanel::CommitFileList => "CHANGED_FILES",
-        FocusPanel::FileList => "FILES",
-        FocusPanel::DiffView => "DIFF",
-        FocusPanel::ReflogList => "REFLOG",
-        FocusPanel::ChangesTree => "CHANGES_TREE",
-        FocusPanel::ChangesDiff => "CHANGES_DIFF",
-        FocusPanel::RemoteList => "REMOTES",
-        FocusPanel::Popup => "POPUP",
-    };
     let line = if area.width < 100 {
         format!(
-            " {repo} [{}/{}] | {branch} | viewing={viewing} | V={} F={} | {mode}{spinner} | S{} M{} U{} C{} | ↑{}↓{} ",
+            " {repo} [{}/{}] | {branch} | {mode}{spinner} | S{} M{} U{} C{} | ↑{}↓{} ",
             app.active_repository_index.map_or(0, |index| index + 1),
             app.repositories.len(),
-            &view[..1],
-            &focus[..1],
             active_repository.map_or(0, |repo| repo.status.staged),
             active_repository.map_or(0, |repo| repo.status.modified),
             active_repository.map_or(0, |repo| repo.status.untracked),
@@ -194,19 +168,17 @@ fn render_status_bar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         )
     } else if area.width < 140 {
         format!(
-            " repo={repo} ({}/{}) | branch={branch} | viewing={viewing} | view={view} | focus={focus} | op={mode}{spinner} | {counts} | {tracking} | queue={} selected={} ",
+            " repo={repo} ({}/{}) | branch={branch} | op={mode}{spinner} | {counts} | {tracking} | selected={} ",
             app.active_repository_index.map_or(0, |index| index + 1),
             app.repositories.len(),
-            app.cherry_pick_queue.len(),
-            app.commit_copy_selection.len()
+            app.commit_selection.len()
         )
     } else {
         format!(
-            " repo={repo} ({}/{}) | branch={branch} | head={head} | viewing={viewing} | commit={selected_commit} | file={selected_file} | view={view} | focus={focus} | op={mode}{spinner} | {counts} | {tracking} | queue={} selected={} ",
+            " repo={repo} ({}/{}) | branch={branch} | head={head} | commit={selected_commit} | file={selected_file} | op={mode}{spinner} | {counts} | {tracking} | selected={} ",
             app.active_repository_index.map_or(0, |index| index + 1),
             app.repositories.len(),
-            app.cherry_pick_queue.len(),
-            app.commit_copy_selection.len()
+            app.commit_selection.len()
         )
     };
     frame.render_widget(
@@ -330,7 +302,7 @@ fn render_remotes(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let [left, right] = columns(area);
     let items = if app.remotes.is_empty() {
         vec![ListItem::new(Line::styled(
-            "No remotes configured — press a to add one",
+            "No remotes configured — press A to add one",
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
@@ -382,7 +354,7 @@ fn render_remotes(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             vec![
                 Line::styled("No remote selected", Style::default().fg(Color::DarkGray)),
                 Line::raw(""),
-                Line::raw("Press a to add a remote with one URL shared by fetch and push."),
+                Line::raw("Press A to add a remote with one URL shared by fetch and push."),
             ]
         },
         |remote| {
@@ -820,10 +792,25 @@ fn commit_tags(decorations: &str) -> String {
         .join(", ")
 }
 
-fn commit_date(authored_at: &str) -> &str {
-    authored_at
-        .split_once('T')
-        .map_or(authored_at, |(date, _)| date)
+fn commit_date_time(authored_at: &str) -> String {
+    let Some((date, time)) = authored_at.split_once('T') else {
+        return authored_at.to_string();
+    };
+    let Some(hours_and_minutes) = time.get(..5) else {
+        return date.to_string();
+    };
+    let bytes = hours_and_minutes.as_bytes();
+    if bytes.len() == 5
+        && bytes[0].is_ascii_digit()
+        && bytes[1].is_ascii_digit()
+        && bytes[2] == b':'
+        && bytes[3].is_ascii_digit()
+        && bytes[4].is_ascii_digit()
+    {
+        format!("{date} {hours_and_minutes}")
+    } else {
+        date.to_string()
+    }
 }
 
 fn commit_items(app: &AppState, density: CommitListDensity) -> (Vec<ListItem<'static>>, bool) {
@@ -844,15 +831,10 @@ fn commit_items(app: &AppState, density: CommitListDensity) -> (Vec<ListItem<'st
     let items = commits
         .iter()
         .map(|commit| {
-            let queued = app.cherry_pick_queue.contains(&commit.hash);
-            let copy_selected = app.commit_copy_selection.contains(&commit.hash);
+            let selected = app.commit_selection.contains(&commit.hash);
             let mut summary = vec![
                 Span::styled(
-                    if queued { "● " } else { "  " },
-                    Style::default().fg(Color::Magenta),
-                ),
-                Span::styled(
-                    if copy_selected { "✓ " } else { "  " },
+                    if selected { "✓ " } else { "  " },
                     Style::default().fg(Color::Green),
                 ),
                 Span::styled(
@@ -876,33 +858,28 @@ fn commit_items(app: &AppState, density: CommitListDensity) -> (Vec<ListItem<'st
                 }
                 CommitListDensity::Detailed => {
                     let tags = commit_tags(&commit.decorations);
-                    ListItem::new(vec![
-                        Line::from(summary),
-                        Line::from(vec![
-                            Span::raw("      "),
-                            Span::styled("Date: ", Style::default().fg(Color::Cyan)),
-                            Span::styled(
-                                terminal_safe(commit_date(&commit.authored_at)),
-                                Style::default().fg(Color::Gray),
-                            ),
-                            Span::raw("  "),
-                            Span::styled("Author: ", Style::default().fg(Color::Cyan)),
-                            Span::styled(
-                                terminal_safe(&commit.author),
-                                Style::default().fg(Color::Green),
-                            ),
+                    let mut metadata = vec![
+                        Span::raw("  "),
+                        Span::styled("Date: ", Style::default().fg(Color::Cyan)),
+                        Span::styled(
+                            terminal_safe(&commit_date_time(&commit.authored_at)),
+                            Style::default().fg(Color::Gray),
+                        ),
+                        Span::raw("  "),
+                        Span::styled("Author: ", Style::default().fg(Color::Cyan)),
+                        Span::styled(
+                            terminal_safe(&commit.author),
+                            Style::default().fg(Color::Green),
+                        ),
+                    ];
+                    if !tags.is_empty() {
+                        metadata.extend([
                             Span::raw("  "),
                             Span::styled("Tags: ", Style::default().fg(Color::Cyan)),
-                            Span::styled(
-                                terminal_safe(if tags.is_empty() { "—" } else { &tags }),
-                                Style::default().fg(if tags.is_empty() {
-                                    Color::DarkGray
-                                } else {
-                                    Color::Magenta
-                                }),
-                            ),
-                        ]),
-                    ])
+                            Span::styled(terminal_safe(&tags), Style::default().fg(Color::Magenta)),
+                        ]);
+                    }
+                    ListItem::new(vec![Line::from(summary), Line::from(metadata)])
                 }
             }
         })
@@ -912,7 +889,7 @@ fn commit_items(app: &AppState, density: CommitListDensity) -> (Vec<ListItem<'st
 
 fn render_commits(frame: &mut Frame<'_>, app: &AppState, area: Rect, density: CommitListDensity) {
     let (items, empty) = commit_items(app, density);
-    let selection_count = app.commit_copy_selection.len();
+    let selection_count = app.commit_selection.len();
     let title = if app.effective_commit_filter().is_empty() {
         format!("Commits · {selection_count} selected")
     } else {
@@ -1331,6 +1308,7 @@ fn render_hotkeys(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         GlobalMode::Confirming { .. }
         | GlobalMode::TypingConfirmation { .. }
         | GlobalMode::EditingCommitMessage { .. }
+        | GlobalMode::CommandPrompt { .. }
         | GlobalMode::ShortcutHelp { .. }
         | GlobalMode::Error => format!(" {} ", modal_footer()),
         GlobalMode::EditingRemote { kind, field, .. } => match kind {
@@ -1486,8 +1464,41 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let (title, lines, height) = match &app.mode {
+        GlobalMode::CommandPrompt {
+            input,
+            validation_error,
+        } => {
+            let mut lines = vec![
+                Line::raw("Command:"),
+                Line::styled(
+                    terminal_safe(&format!("> {input}_")),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Line::raw(""),
+                Line::styled("Available commands:", Style::default().fg(Color::Cyan)),
+            ];
+            lines.extend(PROMPT_COMMAND_SPECS.iter().map(|command| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("  {:<12}", terminal_safe(command.name)),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::raw(terminal_safe(command.description)),
+                ])
+            }));
+            if let Some(error) = validation_error {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    terminal_safe(error),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::raw("Enter run | Esc cancel"));
+            ("Quick command", lines, 38)
+        }
         GlobalMode::ShortcutHelp { .. } => (
-            "Global shortcut reference — effective bindings and operation sets",
+            "Current shortcut reference — effective bindings for this focus",
             shortcut_help_lines(app),
             90,
         ),
@@ -1699,7 +1710,7 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                     42,
                 )
             }
-            ConfirmDialog::CherryPickQueue { commits, .. } => {
+            ConfirmDialog::CherryPickSelected { commits, .. } => {
                 let mut lines = vec![
                     Line::raw("About to run:"),
                     Line::styled(
@@ -1714,7 +1725,7 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                         Style::default().fg(Color::Yellow),
                     ),
                     Line::raw(""),
-                    Line::raw("Queue:"),
+                    Line::raw("Selected commits (oldest to newest):"),
                 ];
                 for (index, commit) in commits.iter().enumerate() {
                     let subject = app
@@ -1731,7 +1742,7 @@ fn render_popup(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                     ))));
                 }
                 lines.extend([Line::raw(""), Line::raw("Enter confirm | Esc cancel")]);
-                ("Cherry-pick queue", lines, 60)
+                ("Cherry-pick selected commits", lines, 60)
             }
             ConfirmDialog::ResetModeChoice { commit, .. } => (
                 "Choose reset mode",
@@ -2009,16 +2020,16 @@ fn shortcut_help_lines(app: &AppState) -> Vec<Line<'static>> {
     let current_context = ShortcutContext::from_view(app.screen, origin_focus);
     let mut lines = vec![
         Line::styled(
-            "Effective configured bindings. The focused normal-mode table is marked with ▶.",
+            "Only global commands and the originating focus are shown.",
             Style::default().fg(Color::DarkGray),
         ),
         Line::styled(
-            "Normal commands are configurable; modal safety/editor tables are reserved.",
+            "Bindings are resolved from the same configurable command tables used by input.",
             Style::default().fg(Color::DarkGray),
         ),
         Line::raw(""),
     ];
-    for section in app.config.shortcut_help_sections() {
+    for section in app.config.shortcut_help_sections(current_context) {
         let current = section.context.is_some() && section.context == current_context;
         lines.push(Line::styled(
             terminal_safe(&format!(
@@ -2090,6 +2101,23 @@ mod tests {
     }
 
     #[test]
+    fn status_bar_omits_view_focus_and_removed_queue_fields_at_every_width() {
+        for width in [80, 120, 160] {
+            let backend = TestBackend::new(width, 12);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let state = AppState::default();
+            terminal.draw(|frame| render(frame, &state)).unwrap();
+            let rendered = buffer_text(&terminal);
+            assert!(!rendered.contains("view="));
+            assert!(!rendered.contains("viewing="));
+            assert!(!rendered.contains("focus="));
+            assert!(!rendered.contains("queue="));
+            assert!(!rendered.contains(" V="));
+            assert!(!rendered.contains(" F="));
+        }
+    }
+
+    #[test]
     fn renders_detailed_commits_on_the_right_and_compact_commits_on_the_left() {
         let mut state = AppState::default();
         state.branch_commits.items.push(Commit {
@@ -2106,7 +2134,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let rendered = buffer_text(&terminal);
-        assert!(rendered.contains("Date: 2026-07-16"));
+        assert!(rendered.contains("Date: 2026-07-16 10:20"));
         assert!(rendered.contains("Author: Ada Lovelace"));
         assert!(rendered.contains("Tags: v1.2.3"));
 
@@ -2114,10 +2142,32 @@ mod tests {
         state.focus = FocusPanel::CommitList;
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let rendered = buffer_text(&terminal);
-        assert!(!rendered.contains("Date: 2026-07-16"));
+        assert!(!rendered.contains("Date: 2026-07-16 10:20"));
         assert!(!rendered.contains("Author: Ada Lovelace"));
         assert!(!rendered.contains("Tags: v1.2.3"));
         assert!(rendered.contains("show rich commit metadata"));
+    }
+
+    #[test]
+    fn detailed_commit_omits_the_tag_field_when_no_git_tag_exists() {
+        let mut state = AppState::default();
+        state.branch_commits.items.push(Commit {
+            hash: CommitHash("0123456789abcdef".into()),
+            short_hash: "0123456".into(),
+            author: "Ada Lovelace".into(),
+            authored_at: "2026-07-16T09:05:30Z".into(),
+            decorations: "HEAD -> main, origin/main".into(),
+            subject: "no tag on this commit".into(),
+        });
+        state.ensure_valid_commit_selection();
+
+        let backend = TestBackend::new(160, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("Date: 2026-07-16 09:05"));
+        assert!(rendered.contains("Author: Ada Lovelace"));
+        assert!(!rendered.contains("Tags:"));
     }
 
     #[test]
@@ -2159,7 +2209,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_global_shortcut_reference_from_effective_operation_tables() {
+    fn renders_current_focus_shortcut_reference_from_effective_operation_tables() {
         let state = AppState {
             focus: FocusPanel::Popup,
             previous_focus: Some(FocusPanel::CommitList),
@@ -2170,12 +2220,16 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let rendered = buffer_text(&terminal);
-        assert!(rendered.contains("Global shortcut reference"));
-        assert!(rendered.contains("Ctrl+?"));
+        assert!(rendered.contains("Current shortcut reference"));
         assert!(rendered.contains("app.shortcuts"));
+        assert!(rendered.contains("app.command_prompt"));
+        assert!(!rendered.contains("Ctrl+?"));
         assert!(rendered.contains("overview.commits"));
         assert!(rendered.contains("commit.copy.message"));
         assert!(rendered.contains("▶ Commits"));
+        assert!(!rendered.contains("branch.tree"));
+        assert!(!rendered.contains("file.copy.absolute_path"));
+        assert!(!rendered.contains("commit submission"));
 
         let state = AppState {
             focus: FocusPanel::Popup,
@@ -2188,7 +2242,32 @@ mod tests {
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let rendered = buffer_text(&terminal);
         assert!(rendered.contains("shortcut reference"));
-        assert!(rendered.contains("close reference"));
+        assert!(rendered.contains("h/Enter/Esc/q close"));
+        assert!(!rendered.contains("Quick command · accepted commands"));
+    }
+
+    #[test]
+    fn renders_quick_command_prompt_and_validation() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            focus: FocusPanel::Popup,
+            previous_focus: Some(FocusPanel::BranchList),
+            mode: GlobalMode::CommandPrompt {
+                input: "unknown".into(),
+                validation_error: Some(
+                    "Unknown command `unknown`. Type `help` for the shortcut guide.".into(),
+                ),
+            },
+            ..AppState::default()
+        };
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("Quick command"));
+        assert!(rendered.contains("> unknown_"));
+        assert!(rendered.contains("help"));
+        assert!(rendered.contains("open the shortcut guide"));
+        assert!(rendered.contains("Unknown command `unknown`"));
     }
 
     #[test]
@@ -2311,7 +2390,7 @@ mod tests {
         assert!(rendered.contains("ssh://fetch.example/repo.git"));
         assert!(rendered.contains("ssh://push.example/repo.git"));
         assert!(rendered.contains("BLOCKED"));
-        assert!(rendered.contains("a add remote"));
+        assert!(rendered.contains("A add remote"));
         assert!(rendered.contains("u set upstream"));
     }
 

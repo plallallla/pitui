@@ -15,6 +15,7 @@ use super::{
 pub enum CommandId {
     AppQuit,
     AppShortcutHelp,
+    AppCommandPrompt,
     AppRefresh,
     ViewChangesToggle,
     FocusNext,
@@ -39,8 +40,7 @@ pub enum CommandId {
     ListFilter,
     CommitOpenDetail,
     CommitToggleSelection,
-    CommitQueueCherryPick,
-    CommitApplyCherryPickQueue,
+    CommitCherryPickSelected,
     CommitReset,
     CommitFileToggleExpanded,
     CommitFileOpenDiff,
@@ -260,14 +260,26 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     command_spec!(
         AppShortcutHelp,
         "app.shortcuts",
-        &["Ctrl+?", "?"],
-        "shortcuts",
+        &["h"],
+        "help",
         true,
         Global,
         None,
         Global,
         ALL_CONTEXTS,
         |_| Some(Action::OpenShortcutHelp)
+    ),
+    command_spec!(
+        AppCommandPrompt,
+        "app.command_prompt",
+        &["Ctrl+`"],
+        "command",
+        true,
+        Global,
+        None,
+        Global,
+        ALL_CONTEXTS,
+        |_| Some(Action::OpenCommandPrompt)
     ),
     command_spec!(
         AppRefresh,
@@ -333,7 +345,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     command_spec!(
         NavigationUp,
         "navigation.up",
-        &["Up", "k"],
+        &["w", "Up", "k"],
         "up",
         false,
         Navigation,
@@ -345,7 +357,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     command_spec!(
         NavigationDown,
         "navigation.down",
-        &["Down", "j"],
+        &["s", "Down", "j"],
         "down",
         false,
         Navigation,
@@ -357,7 +369,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     command_spec!(
         NavigationLeft,
         "navigation.left",
-        &["Left", "h"],
+        &["a", "Left"],
         "left",
         false,
         Navigation,
@@ -369,7 +381,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     command_spec!(
         NavigationRight,
         "navigation.right",
-        &["Right", "l"],
+        &["d", "Right", "l"],
         "right",
         false,
         Navigation,
@@ -509,7 +521,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     command_spec!(
         BranchSwitch,
         "branch.switch",
-        &["s"],
+        &["S"],
         "switch",
         true,
         Primary,
@@ -570,31 +582,22 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         None,
         Focus,
         BRANCH_COMMITS | DETAIL_COMMITS,
-        |app| (app.selected_commit().is_some()).then_some(Action::ToggleCommitCopySelection)
+        |app| (app.selected_commit().is_some()).then_some(Action::ToggleCommitSelection)
     ),
     command_spec!(
-        CommitQueueCherryPick,
-        "commit.cherry_pick.queue",
+        CommitCherryPickSelected,
+        "commit.cherry_pick.selected",
         &["y"],
-        "queue",
-        true,
-        Primary,
-        None,
-        Focus,
-        BRANCH_COMMITS | DETAIL_COMMITS,
-        |app| (app.selected_commit().is_some()).then_some(Action::QueueCherryPickSelectedCommit)
-    ),
-    command_spec!(
-        CommitApplyCherryPickQueue,
-        "commit.cherry_pick.apply_queue",
-        &["Y"],
         "cherry-pick",
         true,
         Primary,
         None,
         Focus,
         BRANCH_COMMITS | DETAIL_COMMITS,
-        |app| (!app.cherry_pick_queue.is_empty()).then_some(Action::OpenCherryPickQueueDialog)
+        |app| (!app.commit_selection.is_empty()
+            && app.commit_selection_repository_index.is_some()
+            && app.commit_selection_repository_index == app.branch_commits_repository_index)
+            .then_some(Action::OpenCherryPickSelectedDialog)
     ),
     command_spec!(
         CommitReset,
@@ -689,7 +692,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     command_spec!(
         DiffWrapToggle,
         "diff.wrap.toggle",
-        &["w"],
+        &["W"],
         "wrap",
         true,
         Contextual,
@@ -725,7 +728,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     command_spec!(
         ChangesStage,
         "changes.stage",
-        &["s"],
+        &["S"],
         "stage",
         true,
         Primary,
@@ -763,7 +766,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     command_spec!(
         RemoteAdd,
         "remote.add",
-        &["a"],
+        &["A"],
         "add remote",
         true,
         Primary,
@@ -883,6 +886,7 @@ impl CommandId {
     pub const ALL: &'static [Self] = &[
         Self::AppQuit,
         Self::AppShortcutHelp,
+        Self::AppCommandPrompt,
         Self::AppRefresh,
         Self::ViewChangesToggle,
         Self::FocusNext,
@@ -907,8 +911,7 @@ impl CommandId {
         Self::ListFilter,
         Self::CommitOpenDetail,
         Self::CommitToggleSelection,
-        Self::CommitQueueCherryPick,
-        Self::CommitApplyCherryPickQueue,
+        Self::CommitCherryPickSelected,
         Self::CommitReset,
         Self::CommitFileToggleExpanded,
         Self::CommitFileOpenDiff,
@@ -1021,6 +1024,7 @@ pub enum ModalShortcutSetId {
     RemoteAdd,
     RemoteUrl,
     Error,
+    CommandPrompt,
     ShortcutHelp,
 }
 
@@ -1049,6 +1053,7 @@ impl ModalShortcutSetId {
         Self::RemoteAdd,
         Self::RemoteUrl,
         Self::Error,
+        Self::CommandPrompt,
         Self::ShortcutHelp,
     ];
 
@@ -1155,18 +1160,56 @@ pub static MODAL_SHORTCUT_SETS: &[ModalShortcutSet] = &[
         )],
     },
     ModalShortcutSet {
+        id: ModalShortcutSetId::CommandPrompt,
+        title: "Mode · quick command prompt",
+        footer: "Text input | Backspace delete | Enter run | Esc cancel",
+        hints: &[
+            modal_hint!("text", "append command", "UpdateCommandPrompt"),
+            modal_hint!("Backspace", "delete character", "UpdateCommandPrompt"),
+            modal_hint!("Enter", "run command", "SubmitCommandPrompt"),
+            modal_hint!("Esc", "cancel command", "Cancel"),
+        ],
+    },
+    ModalShortcutSet {
         id: ModalShortcutSetId::ShortcutHelp,
         title: "Mode · shortcut reference",
-        footer: "↑/↓ scroll | PageUp/PageDown page | Home/End jump | Esc close",
+        footer: "w/s or ↑/↓ scroll | PageUp/PageDown page | Home/End jump | h/Enter/Esc/q close",
         hints: &[
-            modal_hint!("Up / k", "scroll up", "MoveUp"),
-            modal_hint!("Down / j", "scroll down", "MoveDown"),
+            modal_hint!("w / Up / k", "scroll up", "MoveUp"),
+            modal_hint!("s / Down / j", "scroll down", "MoveDown"),
             modal_hint!("PageUp / PageDown", "scroll page", "PageUp/PageDown"),
             modal_hint!("Home / End", "jump start/end", "Home/End"),
-            modal_hint!("Ctrl+? / ? / Enter / Esc / q", "close reference", "Cancel"),
+            modal_hint!("h / Enter / Esc / q", "close reference", "Cancel"),
         ],
     },
 ];
+
+pub type PromptCommandHandler = fn() -> Action;
+
+/// A command accepted by the quick command prompt. Keeping accepted names and
+/// their callable actions in one table makes the prompt expandable without a
+/// second input `match` drifting away from the help reference.
+#[derive(Clone, Copy)]
+pub struct PromptCommandSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub operation: &'static str,
+    pub invoke: PromptCommandHandler,
+}
+
+pub static PROMPT_COMMAND_SPECS: &[PromptCommandSpec] = &[PromptCommandSpec {
+    name: "help",
+    description: "open the shortcut guide",
+    operation: "OpenShortcutHelp",
+    invoke: || Action::OpenShortcutHelp,
+}];
+
+pub fn prompt_command(input: &str) -> Option<&'static PromptCommandSpec> {
+    let name = input.trim();
+    PROMPT_COMMAND_SPECS
+        .iter()
+        .find(|command| command.name.eq_ignore_ascii_case(name))
+}
 
 pub fn modal_shortcut_set_id(mode: &GlobalMode) -> Option<ModalShortcutSetId> {
     match mode {
@@ -1183,6 +1226,7 @@ pub fn modal_shortcut_set_id(mode: &GlobalMode) -> Option<ModalShortcutSetId> {
         } => Some(ModalShortcutSetId::RemoteAdd),
         GlobalMode::EditingRemote { .. } => Some(ModalShortcutSetId::RemoteUrl),
         GlobalMode::Error => Some(ModalShortcutSetId::Error),
+        GlobalMode::CommandPrompt { .. } => Some(ModalShortcutSetId::CommandPrompt),
         GlobalMode::ShortcutHelp { .. } => Some(ModalShortcutSetId::ShortcutHelp),
         GlobalMode::Normal | GlobalMode::Chord { .. } => None,
     }
@@ -1383,7 +1427,10 @@ fn change_operation_paths(app: &AppState, group: ChangeGroup) -> Vec<GitPath> {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{COMMAND_SPECS, CommandId, MODAL_SHORTCUT_SETS, ModalShortcutSetId};
+    use super::{
+        Action, COMMAND_SPECS, CommandId, MODAL_SHORTCUT_SETS, ModalShortcutSetId,
+        PROMPT_COMMAND_SPECS, prompt_command,
+    };
 
     #[test]
     fn registry_lists_every_command_once_and_ids_round_trip() {
@@ -1405,5 +1452,27 @@ mod tests {
             assert_eq!(MODAL_SHORTCUT_SETS[index].id, id);
             assert!(!id.spec().hints.is_empty());
         }
+    }
+
+    #[test]
+    fn prompt_commands_are_callable_and_resolved_case_insensitively() {
+        assert_eq!(PROMPT_COMMAND_SPECS.len(), 1);
+        let help = prompt_command("  HELP ").expect("help command");
+        assert_eq!(help.name, "help");
+        assert_eq!((help.invoke)(), Action::OpenShortcutHelp);
+        assert!(prompt_command("unknown").is_none());
+    }
+
+    #[test]
+    fn wasd_navigation_keeps_conflicting_operations_on_uppercase_keys() {
+        assert_eq!(CommandId::NavigationUp.default_bindings()[0], "w");
+        assert_eq!(CommandId::NavigationLeft.default_bindings()[0], "a");
+        assert_eq!(CommandId::NavigationDown.default_bindings()[0], "s");
+        assert_eq!(CommandId::NavigationRight.default_bindings()[0], "d");
+        assert_eq!(CommandId::BranchSwitch.default_bindings(), &["S"]);
+        assert_eq!(CommandId::ChangesStage.default_bindings(), &["S"]);
+        assert_eq!(CommandId::DiffWrapToggle.default_bindings(), &["W"]);
+        assert_eq!(CommandId::RemoteAdd.default_bindings(), &["A"]);
+        assert_eq!(CommandId::AppCommandPrompt.default_bindings(), &["Ctrl+`"]);
     }
 }

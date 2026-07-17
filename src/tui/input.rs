@@ -53,6 +53,10 @@ static MODE_KEY_TABLES: &[ModeKeyTable] = &[
         handle: map_error_table,
     },
     ModeKeyTable {
+        id: ModalShortcutSetId::CommandPrompt,
+        handle: map_command_prompt_table,
+    },
+    ModeKeyTable {
         id: ModalShortcutSetId::ShortcutHelp,
         handle: map_shortcut_help_table,
     },
@@ -143,22 +147,44 @@ fn map_error_table(_app: &AppState, event: KeyEvent) -> Option<Action> {
     }
 }
 
-fn map_shortcut_help_table(_app: &AppState, event: KeyEvent) -> Option<Action> {
-    if event.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(event.code, KeyCode::Char('?') | KeyCode::Char('/'))
-    {
-        return Some(Action::Cancel);
-    }
+fn map_command_prompt_table(app: &AppState, event: KeyEvent) -> Option<Action> {
+    let GlobalMode::CommandPrompt { input, .. } = &app.mode else {
+        return None;
+    };
     match event.code {
-        KeyCode::Up | KeyCode::Char('k') => Some(Action::MoveUp),
-        KeyCode::Down | KeyCode::Char('j') => Some(Action::MoveDown),
+        KeyCode::Char(character)
+            if !event
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            let mut next = input.clone();
+            next.push(character);
+            Some(Action::UpdateCommandPrompt(next))
+        }
+        KeyCode::Backspace => {
+            let mut next = input.clone();
+            next.pop();
+            Some(Action::UpdateCommandPrompt(next))
+        }
+        KeyCode::Enter => Some(Action::SubmitCommandPrompt),
+        KeyCode::Esc => Some(Action::Cancel),
+        _ => None,
+    }
+}
+
+fn map_shortcut_help_table(_app: &AppState, event: KeyEvent) -> Option<Action> {
+    match event.code {
+        KeyCode::Up | KeyCode::Char('w' | 'k') => Some(Action::MoveUp),
+        KeyCode::Down | KeyCode::Char('s' | 'j') => Some(Action::MoveDown),
         KeyCode::PageUp => Some(Action::PageUp),
         KeyCode::PageDown => Some(Action::PageDown),
         KeyCode::Home => Some(Action::Home),
         KeyCode::End => Some(Action::End),
-        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
-            Some(Action::Cancel)
-        }
+        KeyCode::Enter
+        | KeyCode::Esc
+        | KeyCode::Char('q')
+        | KeyCode::Char('h')
+        | KeyCode::Char('H') => Some(Action::Cancel),
         _ => None,
     }
 }
@@ -441,10 +467,45 @@ mod tests {
     }
 
     #[test]
+    fn wasd_maps_to_up_left_down_right_in_the_current_focus() {
+        let mut state = AppState {
+            focus: FocusPanel::CommitList,
+            ..AppState::default()
+        };
+        for index in 0..3 {
+            state.branch_commits.items.push(Commit {
+                hash: CommitHash(format!("{index:040x}")),
+                short_hash: format!("{index:07x}"),
+                author: "Ada".into(),
+                authored_at: "2026-07-16".into(),
+                decorations: String::new(),
+                subject: format!("commit {index}"),
+            });
+        }
+        state.selection.selected_commit_index = Some(1);
+
+        for (key, action) in [
+            ('w', Action::MoveUp),
+            ('a', Action::MoveLeft),
+            ('s', Action::MoveDown),
+            ('d', Action::MoveRight),
+        ] {
+            assert_eq!(
+                map_key(
+                    &state,
+                    KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
+                ),
+                Some(action.clone()),
+                "{key} should map to {action:?}"
+            );
+        }
+    }
+
+    #[test]
     fn confirmation_q_cancels_instead_of_quitting() {
         let state = AppState {
             mode: GlobalMode::Confirming {
-                dialog: crate::app::ConfirmDialog::CherryPickQueue {
+                dialog: crate::app::ConfirmDialog::CherryPickSelected {
                     repository_index: 0,
                     commits: vec![],
                 },
@@ -561,9 +622,16 @@ mod tests {
         assert_eq!(
             map_key(
                 &state,
-                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)
+                KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)
             ),
             Some(Action::OpenAddRemoteEditor)
+        );
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)
+            ),
+            None
         );
         assert_eq!(
             map_key(
@@ -625,7 +693,35 @@ mod tests {
                 &state,
                 KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)
             ),
-            Some(Action::ToggleCommitCopySelection)
+            Some(Action::ToggleCommitSelection)
+        );
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)
+            ),
+            None,
+            "cherry-pick must stay unavailable until a commit is explicitly selected"
+        );
+        state.branch_commits_repository_index = Some(0);
+        state.commit_selection_repository_index = Some(0);
+        state
+            .commit_selection
+            .insert(crate::domain::CommitHash("0123456789abcdef".into()));
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)
+            ),
+            Some(Action::OpenCherryPickSelectedDialog)
+        );
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT)
+            ),
+            None,
+            "the former queue-apply shortcut must stay removed"
         );
         assert_eq!(
             map_key(
@@ -748,18 +844,23 @@ mod tests {
 
     #[test]
     fn global_shortcut_reference_opens_and_uses_its_own_modal_table() {
-        let state = AppState::default();
+        let state = AppState {
+            screen: Screen::CommitDetail,
+            focus: FocusPanel::CommitFileList,
+            ..AppState::default()
+        };
         let ctrl_question = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL);
-        assert_eq!(
-            map_key(&state, ctrl_question),
-            Some(Action::OpenShortcutHelp)
-        );
         assert_eq!(
             map_key(
                 &state,
-                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)
+                KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)
             ),
             Some(Action::OpenShortcutHelp)
+        );
+        assert_eq!(map_key(&state, ctrl_question), None);
+        assert_eq!(
+            map_key(&state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            Some(Action::MoveLeft)
         );
 
         let help = AppState {
@@ -772,9 +873,69 @@ mod tests {
             map_key(&help, KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
             Some(Action::PageDown)
         );
-        assert_eq!(map_key(&help, ctrl_question), Some(Action::Cancel));
         assert_eq!(
-            map_key(&help, KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
+            map_key(&help, KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            Some(Action::MoveUp)
+        );
+        assert_eq!(
+            map_key(&help, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            Some(Action::MoveDown)
+        );
+        assert_eq!(map_key(&help, ctrl_question), None);
+        assert_eq!(
+            map_key(&help, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+            Some(Action::Cancel)
+        );
+    }
+
+    #[test]
+    fn quick_command_prompt_opens_with_ctrl_backtick_and_accepts_text() {
+        let state = AppState::default();
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('`'), KeyModifiers::CONTROL)
+            ),
+            Some(Action::OpenCommandPrompt)
+        );
+        // Ctrl+Space is intentionally unbound; only the requested Ctrl+`
+        // sequence opens the command prompt.
+        assert_eq!(
+            map_key(
+                &state,
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)
+            ),
+            None
+        );
+
+        let prompt = AppState {
+            mode: GlobalMode::CommandPrompt {
+                input: "hel".into(),
+                validation_error: Some("old error".into()),
+            },
+            focus: FocusPanel::Popup,
+            ..AppState::default()
+        };
+        assert_eq!(
+            map_key(
+                &prompt,
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)
+            ),
+            Some(Action::UpdateCommandPrompt("help".into()))
+        );
+        assert_eq!(
+            map_key(
+                &prompt,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+            ),
+            Some(Action::UpdateCommandPrompt("he".into()))
+        );
+        assert_eq!(
+            map_key(&prompt, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::SubmitCommandPrompt)
+        );
+        assert_eq!(
+            map_key(&prompt, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Some(Action::Cancel)
         );
     }
@@ -807,7 +968,7 @@ mod tests {
         ]);
         for (key, expected) in [
             (KeyCode::Char(' '), Action::ToggleChangeSelection),
-            (KeyCode::Char('s'), Action::StageSelectedChanges),
+            (KeyCode::Char('S'), Action::StageSelectedChanges),
             (KeyCode::Char('u'), Action::UnstageSelectedChanges),
             (KeyCode::Char('c'), Action::OpenCommitDialog),
         ] {

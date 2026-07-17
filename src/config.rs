@@ -14,8 +14,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
 use crate::app::{
-    Action, AppState, CommandId, CommandMount, DiffViewMode, FooterGroup, ModalShortcutSetId,
-    ShortcutContext,
+    Action, AppState, CommandId, CommandMount, DiffViewMode, FooterGroup, ShortcutContext,
 };
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -622,11 +621,14 @@ impl ResolvedConfig {
         Arc::new(Self::default())
     }
 
-    /// Builds the global shortcut reference from the same command and modal
-    /// operation tables used by input resolution and the footer. Empty
-    /// bindings remain visible as `(unbound)` so the popup is also an
-    /// effective-configuration inspector.
-    pub fn shortcut_help_sections(&self) -> Vec<ShortcutHelpSection> {
+    /// Builds the shortcut reference for one originating normal-mode focus.
+    /// Only global commands and that focus's mounted operation table are
+    /// included. Empty bindings remain visible as `(unbound)` so the popup is
+    /// also an effective-configuration inspector for the current interface.
+    pub fn shortcut_help_sections(
+        &self,
+        context: Option<ShortcutContext>,
+    ) -> Vec<ShortcutHelpSection> {
         let command_item = |command: CommandId| ShortcutHelpItem {
             key: {
                 let bindings = self.keymap.bindings_for(command);
@@ -655,7 +657,7 @@ impl ResolvedConfig {
                 .map(command_item)
                 .collect(),
         });
-        for context in ShortcutContext::ALL.iter().copied() {
+        if let Some(context) = context {
             sections.push(ShortcutHelpSection {
                 title: format!("{}  [{}]", context.title(), context.id()),
                 context: Some(context),
@@ -668,28 +670,12 @@ impl ResolvedConfig {
                     .collect(),
             });
         }
-        for id in ModalShortcutSetId::ALL.iter().copied() {
-            let set = id.spec();
-            sections.push(ShortcutHelpSection {
-                title: format!("{}  [safety-reserved]", set.title),
-                context: None,
-                items: set
-                    .hints
-                    .iter()
-                    .map(|hint| ShortcutHelpItem {
-                        key: hint.key.into(),
-                        label: hint.label.into(),
-                        operation: hint.operation.into(),
-                    })
-                    .collect(),
-            });
-        }
         sections
     }
 
-    pub fn shortcut_help_line_count(&self) -> usize {
+    pub fn shortcut_help_line_count(&self, context: Option<ShortcutContext>) -> usize {
         3 + self
-            .shortcut_help_sections()
+            .shortcut_help_sections(context)
             .iter()
             .map(|section| section.items.len() + 2)
             .sum::<usize>()
@@ -1770,9 +1756,13 @@ bindings = ["Alt+R"]
                 .any(|item| item.key == "Ctrl+C" && item.label == "copy…")
         );
         assert!(
+            root.iter()
+                .any(|item| item.key == "h" && item.label == "help")
+        );
+        assert!(
             !root
                 .iter()
-                .any(|item| matches!(item.key.as_str(), "h" | "i" | "m"))
+                .any(|item| matches!(item.label.as_str(), "hash" | "info" | "message"))
         );
 
         let prefix = vec![KeyStroke::parse("Ctrl+C").unwrap()];
@@ -1861,9 +1851,10 @@ bindings = ["Alt+R"]
     }
 
     #[test]
-    fn shortcut_reference_is_generated_from_focus_and_modal_operation_sets() {
+    fn shortcut_reference_contains_only_global_and_current_focus_operations() {
         let config = ResolvedConfig::default();
-        let sections = config.shortcut_help_sections();
+        let sections = config.shortcut_help_sections(Some(ShortcutContext::DetailCommits));
+        assert_eq!(sections.len(), 2);
         let commit = sections
             .iter()
             .find(|section| section.context == Some(ShortcutContext::DetailCommits))
@@ -1880,6 +1871,12 @@ bindings = ["Alt+R"]
                 .iter()
                 .all(|item| !item.operation.starts_with("file.copy."))
         );
+        assert!(sections.iter().all(|section| {
+            section.context.is_none() || section.context == Some(ShortcutContext::DetailCommits)
+        }));
+
+        let sections = config.shortcut_help_sections(Some(ShortcutContext::CommitFiles));
+        assert_eq!(sections.len(), 2);
         let files = sections
             .iter()
             .find(|section| section.context == Some(ShortcutContext::CommitFiles))
@@ -1896,13 +1893,10 @@ bindings = ["Alt+R"]
                 .iter()
                 .all(|item| !item.operation.starts_with("commit.copy."))
         );
-        assert!(sections.iter().any(|section| {
-            section.title.contains("commit submission")
-                && section
-                    .items
-                    .iter()
-                    .any(|item| item.operation == "SubmitCommit")
+        assert!(sections.iter().all(|section| {
+            section.context.is_none() || section.context == Some(ShortcutContext::CommitFiles)
         }));
+        assert_eq!(config.shortcut_help_sections(None).len(), 1);
     }
 
     #[test]

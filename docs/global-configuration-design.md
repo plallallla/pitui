@@ -192,6 +192,7 @@ remotes.list         -> Remote Management 操作集
 ```text
 app.quit
 app.shortcuts
+app.command_prompt
 app.refresh
 view.changes.toggle
 navigation.up
@@ -266,7 +267,22 @@ chord_timeout_ms = 0 # 0 表示等待下一键，直到完成或 Esc 取消
 bindings = ["Ctrl+R"]
 
 [keybindings.commands."app.shortcuts"]
-bindings = ["Ctrl+?", "?"]
+bindings = ["h"]
+
+[keybindings.commands."app.command_prompt"]
+bindings = ["Ctrl+`"]
+
+[keybindings.commands."navigation.up"]
+bindings = ["w", "Up", "k"]
+
+[keybindings.commands."navigation.left"]
+bindings = ["a", "Left"]
+
+[keybindings.commands."navigation.down"]
+bindings = ["s", "Down", "j"]
+
+[keybindings.commands."navigation.right"]
+bindings = ["d", "Right", "l"]
 
 [keybindings.commands."view.changes.toggle"]
 bindings = ["Ctrl+G"]
@@ -369,25 +385,33 @@ GlobalMode::Chord {
 
 - 确认弹窗的 `Enter` 与取消弹窗的 `Esc`；
 - hard reset 模式选择和目标哈希准确输入；
-- commit message、filter、remote name/URL 编辑时的字符输入；
+- quick command、commit message、filter、remote name/URL 编辑时的字符输入；
 - 错误弹窗的安全关闭路径。
 
 这保证快捷键配置不能绕过二次确认，也不能将输入的 commit message 或 remote URL
 误解释为命令。
 
-### 6.6 全局快捷键参考框
+### 6.6 当前 Focus 快捷键参考框
 
-`app.shortcuts` 默认绑定为 `Ctrl+?` 与 plain `?` fallback，在任意 Normal focus 打开
-`GlobalMode::ShortcutHelp { scroll }`。弹窗不是手写静态清单，而是依次读取：
+`app.shortcuts` 默认绑定为 `h`，在任意 Normal focus 打开
+`GlobalMode::ShortcutHelp { scroll }`。左向层级移动使用 `a / Left`，而 `Ctrl+C → h` 等
+chord 第二级与 hard-reset modal 中的 `h` 不受影响。弹窗不是全量操作手册，也不会列出
+其他 View、其他 focus 或 modal 表；它只读取：
 
 1. 当前有效 `ResolvedKeymap` 中的 Global commands；
-2. 十个 `ShortcutContext` 的 focus command tables；
-3. `MODAL_SHORTCUT_SETS` 中 filter、confirmation、commit submission、remote editor、
-   error 与 help 自身的安全保留操作集。
+2. 打开帮助前来源 focus 对应的唯一 `ShortcutContext` command table。
 
 每行同时显示有效 sequence、label 和稳定 operation id；解除绑定的命令显示 `(unbound)`，
-当前 focus 表用 `▶` 标记。`↑/↓`、PageUp/PageDown、Home/End 滚动，`Ctrl+?`、`?`、Enter、Esc
+当前 focus 表用 `▶` 标记。`w/s`、`↑/↓`、PageUp/PageDown、Home/End 滚动，`h`、Enter、Esc
 或 `q` 关闭并恢复原 focus。帮助框本身使用独占 modal input table，不能触发其背后的命令。
+
+### 6.7 快捷命令框
+
+`app.command_prompt` 只绑定 Ctrl+Backtick，`Ctrl+Space` 明确保留为空。打开后进入
+`GlobalMode::CommandPrompt { input, validation_error }`，字符和 Backspace 编辑，Enter 执行，
+Esc 取消。命令通过 `PROMPT_COMMAND_SPECS` 可调用表解析，而不是散落在 input 分支中。
+首个命令为 `help`，执行后关闭命令框并打开同一个当前-focus 快捷键指南；空命令或未知命令留在
+原弹窗内显示校验错误。
 
 ---
 
@@ -417,7 +441,12 @@ priority = 110
 
 [ui.footer.commands."app.shortcuts"]
 visible = true
-label = "shortcuts"
+label = "help"
+priority = 100
+
+[ui.footer.commands."app.command_prompt"]
+visible = true
+label = "command"
 priority = 100
 
 [ui.footer.commands."app.refresh"]
@@ -773,7 +802,12 @@ priority = 110
 
 [ui.footer.commands."app.shortcuts"]
 visible = true
-label = "shortcuts"
+label = "help"
+priority = 100
+
+[ui.footer.commands."app.command_prompt"]
+visible = true
+label = "command"
 priority = 100
 
 [ui.footer.commands."app.refresh"]
@@ -817,7 +851,34 @@ chord_timeout_ms = 0
 bindings = ["Ctrl+R"]
 
 [keybindings.commands."app.shortcuts"]
-bindings = ["Ctrl+?", "?"]
+bindings = ["h"]
+
+[keybindings.commands."app.command_prompt"]
+bindings = ["Ctrl+`"]
+
+[keybindings.commands."navigation.up"]
+bindings = ["w", "Up", "k"]
+
+[keybindings.commands."navigation.left"]
+bindings = ["a", "Left"]
+
+[keybindings.commands."navigation.down"]
+bindings = ["s", "Down", "j"]
+
+[keybindings.commands."navigation.right"]
+bindings = ["d", "Right", "l"]
+
+[keybindings.commands."branch.switch"]
+bindings = ["S"]
+
+[keybindings.commands."changes.stage"]
+bindings = ["S"]
+
+[keybindings.commands."diff.wrap.toggle"]
+bindings = ["W"]
+
+[keybindings.commands."remote.add"]
+bindings = ["A"]
 
 [keybindings.commands."view.changes.toggle"]
 bindings = ["Ctrl+G"]
@@ -897,10 +958,14 @@ git_worker = "info"
 - 隐藏提示不解除 binding，解除 binding 后提示必然消失。
 - footer 在窄终端、宽字符 label、1..3 行限制下不越界。
 - modal、编辑器和 hard reset 安全键不能被配置绕过。
-- `MODE_KEY_TABLES` 与 `MODAL_SHORTCUT_SETS` id 对齐；commit submission 与 Remote Add/URL
-  显示并响应不同的操作集。
-- `Ctrl+?` 从各 Normal focus 打开全局参考框，列出有效 binding/operation id、标记原 focus，
-  滚动和关闭后恢复原 focus。
+- `MODE_KEY_TABLES` 与 `MODAL_SHORTCUT_SETS` id 对齐；quick command、commit submission 与
+  Remote Add/URL 显示并响应不同的操作集。
+- `w/a/s/d` 在所有挂载 navigation 的 Normal focus 分别映射 up/left/down/right；原有冲突
+  操作使用 `W/S/A`，箭头与 `k/j/l` 仍作为替代绑定。
+- `h` 从各 Normal focus 打开当前-focus 参考框，只列 Global 与来源 `ShortcutContext` 的有效
+  binding/operation id；不得出现其他 focus、modal 或 prompt command 表。
+- Ctrl+Backtick 打开快捷命令框，`Ctrl+Space` 不绑定；`help` 跳转到当前-focus 快捷键
+  指南，空输入和未知命令显示原位校验错误。
 - Chord 取消、超时和未匹配输入不改变原 focus/selection。
 
 ### 14.3 Diff 配置
@@ -944,8 +1009,17 @@ Phase 4  next-action-only footer + progressive chord hints + visibility policy
 Phase 5  configurable diff default mode
 Phase 6  configurable logging path/level/flush/rotation/retention
 Phase 7  transactional manual reload（可选，不做 watcher）
-Phase 8  focus-mounted callable tables + global shortcut reference
+Phase 8  focus-mounted callable tables + current-focus shortcut reference
 ```
 
 每个 phase 都应保持可独立回退；尤其 Phase 2 必须先证明默认 keymap 与当前行为等价，
 再开放用户覆盖。
+
+---
+
+## 16. 下一阶段：按 Data View 分层
+
+Schema v2 将配置拆成 Global → View → Panel → Fields / Operations，使同一 Commit 数据在
+Overview 与 Detail 使用不同密度、字段和操作绑定。完整选项、继承优先级、各 View 字段与
+安全边界见 [`view-configuration-design.md`](view-configuration-design.md)。该方案目前仅完成
+设计，Schema v1 解析器会继续严格拒绝尚未实现的 `[views]` 字段。
