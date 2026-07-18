@@ -34,6 +34,11 @@ pitui         composition root、binary 与端到端验收
   Collection Manager 与 Render Proxy。Files 默认 Tree View，可按 `v` 切换为只显示 File 后代的
   flat List View，再切回 Tree，期间不会重建或改写目录/文件实体关系。
 - 单一 `ActiveUiContext`、`ActiveRenderMode`、`ResolvedOperationSet`。
+- `pitui-tui` Input Listener 只解析终端事件；Operation Executor 从当前 Active Dataset 的
+  `ResolvedOperationSet` 缓存查询绑定并构造调用上下文，未绑定输入直接忽略。
+- `OperationManager` 维护直接的 `OperationId -> Bevy SystemId` 函数表；Dataset Template 绑定
+  Operation，Command 仅保留命令名称/作用域元数据，System 通过 typed ECS 参数修改 Active、全局状态或
+  发出 Git/Context/Clipboard 等数据。
 - Template/Proxy/Mode/Operation/Command/Availability 跨 Registry 启动校验。
 - History、Commit、File Diff、Changes、Reflog、Git Operation Log Render Mode。
 - Commit 下的 Files、Changes 的 staged/unstaged 边界和 WorkingTreeFiles 使用共享 `PathTree`
@@ -69,9 +74,10 @@ reset/rebase 尚未进入 `GitCommand` 数据协议。
 
 ```text
 InputIntent
-  -> resolve current Operation Set
-  -> CommandInvocation
-  -> registered ECS System
+  -> query Active Dataset Operation Set cache
+  -> OperationInvocation
+  -> OperationManager[OperationId]
+  -> registered ECS Operation System
   -> Dataset mutation / ContextTransitionRequest / GitCommandData
   -> GitResultData
   -> transactional Dataset snapshot application
@@ -101,7 +107,8 @@ cargo test --workspace --doc
 
 ## 后续优先级
 
-1. 将 `operation_runtime.rs` 按 interaction、active handoff、changes、copy/scroll 拆分。
+1. 在不改变 Operation Manager 边界的前提下，将 `operation/systems.rs` 再按 interaction、active、changes、
+   copy/scroll 拆为领域 System 模块。
 2. 将 `git_runtime.rs` 按 lifecycle/log、snapshot planning 和 payload adapter 拆分。
 3. 将根 `src/tests.rs` 拆为共享 fixture 与按语义分类的集成测试模块。
 4. 设计保持 typed data 边界的异步 Git task/result 通道。

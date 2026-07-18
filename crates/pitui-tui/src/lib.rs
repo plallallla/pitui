@@ -5,10 +5,12 @@
 
 #![forbid(unsafe_code)]
 
-mod input;
+mod input_listener;
 mod render;
 mod terminal;
 
-pub use input::{TerminalEvent, event_to_intent, event_to_terminal_event, key_event_to_stroke};
+pub use input_listener::{
+    TerminalEvent, event_to_intent, event_to_terminal_event, key_event_to_stroke,
+};
 pub use render::render;
 pub use terminal::TerminalSession;

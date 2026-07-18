@@ -1,3 +1,8 @@
+//! Terminal input listener.
+//!
+//! This adapter only parses crossterm events into typed `InputIntent` data. It
+//! does not know the Active Dataset, Operation Set, or executable Systems.
+
 use crossterm::event::{
     Event, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyModifiers as CrosstermModifiers,
 };

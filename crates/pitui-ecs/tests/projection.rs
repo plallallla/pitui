@@ -74,7 +74,7 @@ fn configured_runtime() -> DatasetRuntime {
     }
     runtime.set_global_operations(pitui_config::builtin_global_operations());
     runtime.set_active_handoffs(pitui_config::builtin_active_handoffs());
-    runtime.register_builtin_interaction_systems().unwrap();
+    runtime.register_builtin_operation_systems().unwrap();
     runtime
 }
 

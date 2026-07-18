@@ -160,7 +160,7 @@ impl App {
         runtime.set_global_operations(pitui_config::builtin_global_operations());
         runtime.set_active_handoffs(pitui_config::builtin_active_handoffs());
         runtime
-            .register_builtin_interaction_systems()
+            .register_builtin_operation_systems()
             .map_err(|error| AppError::BuiltinInteraction(format!("{error:?}")))?;
         let contract_errors = runtime.validate_registration_contracts();
         if !contract_errors.is_empty() {

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use bevy_ecs::prelude::{Entity, Message, Resource};
 
 use crate::{
-    AvailabilityRuleId, CommandId, CommandSystemId, DatasetKind, OperationId, RenderBindingId,
+    AvailabilityRuleId, CommandId, DatasetKind, OperationId, RenderBindingId,
     ResolvedOperationSetId,
 };
 
@@ -18,7 +18,6 @@ pub struct CommandSpec {
     pub id: CommandId,
     pub name: String,
     pub scope: CommandScope,
-    pub system: CommandSystemId,
 }
 
 #[derive(Resource, Clone, Debug, Default)]
@@ -250,6 +249,9 @@ pub struct ResolvedKeyBinding {
 
 #[derive(Resource, Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedOperationSet {
+    /// Active Dataset that owns this effective Operation Set. This resource is
+    /// the executor's query cache; input adapters never inspect Dataset state.
+    pub active_dataset: Option<Entity>,
     pub id: ResolvedOperationSetId,
     pub operations: Vec<ResolvedOperation>,
     pub key_bindings: HashMap<KeyStroke, ResolvedKeyBinding>,
@@ -260,6 +262,7 @@ pub struct ResolvedOperationSet {
 impl Default for ResolvedOperationSet {
     fn default() -> Self {
         Self {
+            active_dataset: None,
             id: ResolvedOperationSetId::from("unresolved"),
             operations: Vec::new(),
             key_bindings: HashMap::new(),
@@ -286,7 +289,11 @@ pub enum InvocationSource {
 }
 
 #[derive(Message, Clone, Debug, Eq, PartialEq)]
-pub struct CommandInvocation {
+pub struct OperationInvocation {
+    pub operation: OperationId,
+    /// Command metadata is retained for palette lookup and user-facing names;
+    /// executable code is selected directly by `operation` in the ECS
+    /// Operation Manager.
     pub command: CommandId,
     pub source_dataset: Entity,
     pub targets: Vec<Entity>,
@@ -306,8 +313,11 @@ pub enum OperationNotice {
     UnknownCommand(String),
     CommandArgumentsUnsupported(String),
     TargetUnavailable(OperationId),
-    CommandSystemUnavailable(CommandId),
-    CommandRejected { command: CommandId, message: String },
+    OperationSystemUnavailable(OperationId),
+    OperationRejected {
+        operation: OperationId,
+        message: String,
+    },
     ContextTransitionRejected(String),
 }
 

@@ -12,8 +12,8 @@ use pitui_data::{
     ResolvedKeyAction, ResolvedOperationSet, UiFrame, UiLayoutProjection,
 };
 use pitui_ecs::{
-    ClipboardRequests, CommandExecution, CommandExecutionLog, GitExecutionFailures,
-    GitMutationSuccesses, OperationNotices, PendingInteractionNotices, ProjectionDiagnostics,
+    ClipboardRequests, GitExecutionFailures, GitMutationSuccesses, OperationExecution,
+    OperationExecutionLog, OperationNotices, PendingInteractionNotices, ProjectionDiagnostics,
     RenderReconcileDiagnostics,
 };
 
@@ -239,10 +239,10 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     assert!(matches!(
         app.runtime()
             .world()
-            .resource::<CommandExecutionLog>()
+            .resource::<OperationExecutionLog>()
             .0
             .last(),
-        Some((_, CommandExecution::Completed))
+        Some((_, OperationExecution::Completed))
     ));
 
     let (repository_key, root_path, branch) = {
@@ -920,7 +920,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     let executions_before_deepest_right = app
         .runtime()
         .world()
-        .resource::<CommandExecutionLog>()
+        .resource::<OperationExecutionLog>()
         .0
         .len();
     app.runtime_mut()
@@ -937,7 +937,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     assert_eq!(
         app.runtime()
             .world()
-            .resource::<CommandExecutionLog>()
+            .resource::<OperationExecutionLog>()
             .0
             .len(),
         executions_before_deepest_right,
@@ -1086,7 +1086,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
 
     // Selection is owned by the global Changes Dataset even when the
     // reusable diff panel is active. Whole-file stage/unstage and commit
-    // all travel through the same CommandInvocation -> GitCommand path.
+    // all travel through the same OperationInvocation -> GitCommand path.
     app.dispatch_input(pitui_data::InputIntent::Key(KeyStroke::character('d')));
     assert_eq!(
         app.runtime()
@@ -1490,7 +1490,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     app.runtime_mut().run_schedule();
     assert!(
         app.quit_requested(),
-        "the palette emits the same deferred quit CommandInvocation"
+        "the palette emits the same deferred quit OperationInvocation"
     );
 }
 

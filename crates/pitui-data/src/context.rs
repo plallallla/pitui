@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use bevy_ecs::prelude::{Component, Entity, Message, Resource};
 
 use crate::{
-    CommandInvocation, DatasetKind, RenderModeId, RenderProxyId, ResolvedKeyBinding,
+    DatasetKind, OperationInvocation, RenderModeId, RenderProxyId, ResolvedKeyBinding,
     ResolvedOperationSetId,
 };
 
@@ -85,7 +85,7 @@ pub struct ShortcutHelpEntry {
 pub struct PaletteCommandEntry {
     pub name: String,
     pub label: String,
-    pub invocation: CommandInvocation,
+    pub invocation: OperationInvocation,
 }
 
 impl PaletteCommandEntry {
@@ -125,7 +125,7 @@ pub enum InteractionContextKind {
         prompt: String,
         options: Vec<String>,
         selected: usize,
-        pending: Box<CommandInvocation>,
+        pending: Box<OperationInvocation>,
     },
     TextInput {
         title: String,
@@ -133,7 +133,7 @@ pub enum InteractionContextKind {
         purpose: TextInputPurpose,
         input: String,
         error: Option<String>,
-        pending: Option<Box<CommandInvocation>>,
+        pending: Option<Box<OperationInvocation>>,
     },
 }
 

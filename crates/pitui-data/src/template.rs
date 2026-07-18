@@ -33,7 +33,6 @@ string_id!(DatasetTemplateId);
 string_id!(DatasetViewId);
 string_id!(OperationId);
 string_id!(CommandId);
-string_id!(CommandSystemId);
 string_id!(AvailabilityRuleId);
 string_id!(RenderProxyId);
 string_id!(RenderModeId);

@@ -1,13 +1,13 @@
 use bevy_ecs::prelude::{In, Resource};
 use pitui_data::{
-    AvailabilityRule, AvailabilityRuleId, CommandId, CommandInvocation, CommandScope, CommandSpec,
-    CommandSystemId, DatasetIdentity, DatasetKind, DatasetTemplate, DatasetTemplateId, InputIntent,
-    InvocationSource, KeyCode, KeySequence, KeyStroke, LayoutConstraint, OperationId,
-    OperationNotice, OperationSpec, RenderContextBindings, RenderModeId, RenderProxyId,
-    ResolvedKeyAction, ResolvedOperationSet, ResolvedRenderLayout, TargetSource,
+    AvailabilityRule, AvailabilityRuleId, CommandId, CommandScope, CommandSpec, DatasetIdentity,
+    DatasetKind, DatasetTemplate, DatasetTemplateId, InputIntent, InvocationSource, KeyCode,
+    KeySequence, KeyStroke, LayoutConstraint, OperationId, OperationInvocation, OperationNotice,
+    OperationSpec, RenderContextBindings, RenderModeId, RenderProxyId, ResolvedKeyAction,
+    ResolvedOperationSet, ResolvedRenderLayout, TargetSource,
 };
 use pitui_ecs::{
-    CommandExecution, CommandExecutionLog, DatasetRuntime, OperationNotices,
+    DatasetRuntime, OperationExecution, OperationExecutionLog, OperationNotices,
     OperationResolutionDiagnostics, OperationResolutionError,
 };
 
@@ -31,12 +31,11 @@ fn register_template(
     id
 }
 
-fn command(id: &str, name: &str, system: &str, scope: CommandScope) -> CommandSpec {
+fn command(id: &str, name: &str, scope: CommandScope) -> CommandSpec {
     CommandSpec {
         id: CommandId::from(id),
         name: name.into(),
         scope,
-        system: CommandSystemId::from(system),
     }
 }
 
@@ -82,20 +81,10 @@ fn global_command_name_wins_while_duplicate_keys_fail_resolution() {
         .register_availability_rule(AvailabilityRuleId::from("always"), AvailabilityRule::Always)
         .unwrap();
     runtime
-        .register_command(command(
-            "global.command",
-            "same",
-            "global.system",
-            CommandScope::Global,
-        ))
+        .register_command(command("global.command", "same", CommandScope::Global))
         .unwrap();
     runtime
-        .register_command(command(
-            "local.command",
-            "same",
-            "local.system",
-            CommandScope::Dataset,
-        ))
+        .register_command(command("local.command", "same", CommandScope::Dataset))
         .unwrap();
     let global = operation("global.same", "global.command", 'g', TargetSource::None);
     let local = operation("local.same", "local.command", 'l', TargetSource::None);
@@ -181,14 +170,160 @@ fn global_command_name_wins_while_duplicate_keys_fail_resolution() {
 }
 
 #[derive(Resource, Default)]
-struct CapturedInvocations(Vec<CommandInvocation>);
+struct CapturedInvocations(Vec<OperationInvocation>);
 
 fn capture_invocation(
-    In(invocation): In<CommandInvocation>,
+    In(invocation): In<OperationInvocation>,
     mut captured: bevy_ecs::prelude::ResMut<CapturedInvocations>,
-) -> CommandExecution {
+) -> OperationExecution {
     captured.0.push(invocation);
-    CommandExecution::Completed
+    OperationExecution::Completed
+}
+
+#[derive(Resource, Default)]
+struct ExecutedOperations(Vec<&'static str>);
+
+fn execute_first(
+    In(_invocation): In<OperationInvocation>,
+    mut executed: bevy_ecs::prelude::ResMut<ExecutedOperations>,
+) -> OperationExecution {
+    executed.0.push("first");
+    OperationExecution::Completed
+}
+
+fn execute_second(
+    In(_invocation): In<OperationInvocation>,
+    mut executed: bevy_ecs::prelude::ResMut<ExecutedOperations>,
+) -> OperationExecution {
+    executed.0.push("second");
+    OperationExecution::Completed
+}
+
+#[test]
+fn active_dataset_operation_set_dispatches_only_its_directly_registered_system() {
+    let mut runtime = DatasetRuntime::new();
+    let first_operation = OperationId::from("dataset.first");
+    let second_operation = OperationId::from("dataset.second");
+    let first_template = register_template(
+        &mut runtime,
+        "first",
+        DatasetKind::Repository,
+        vec![first_operation.clone()],
+    );
+    let second_template = register_template(
+        &mut runtime,
+        "second",
+        DatasetKind::Commits,
+        vec![second_operation.clone()],
+    );
+    runtime
+        .register_availability_rule(AvailabilityRuleId::from("always"), AvailabilityRule::Always)
+        .unwrap();
+    runtime
+        .register_command(command("run", "run", CommandScope::Dataset))
+        .unwrap();
+    for operation_id in [&first_operation, &second_operation] {
+        runtime
+            .register_operation(OperationSpec {
+                id: operation_id.clone(),
+                label: operation_id.0.clone(),
+                command: CommandId::from("run"),
+                bindings: vec![KeySequence::single(KeyStroke::character('x'))],
+                target_source: TargetSource::ActiveDataset,
+                availability: AvailabilityRuleId::from("always"),
+            })
+            .unwrap();
+    }
+    runtime
+        .world_mut()
+        .insert_resource(ExecutedOperations::default());
+    runtime
+        .register_operation_system(first_operation.clone(), execute_first)
+        .unwrap();
+    runtime
+        .register_operation_system(second_operation.clone(), execute_second)
+        .unwrap();
+
+    let repository = pitui_data::RepositoryKey::new("/repo");
+    let first = runtime
+        .ensure_dataset(
+            DatasetIdentity::Repository(repository.clone()),
+            DatasetKind::Repository,
+            first_template,
+        )
+        .unwrap();
+    let second = runtime
+        .ensure_dataset(
+            DatasetIdentity::Commits {
+                repository,
+                branch: pitui_core::BranchName("main".into()),
+            },
+            DatasetKind::Commits,
+            second_template,
+        )
+        .unwrap();
+    runtime.add_root(first).unwrap();
+    runtime.add_root(second).unwrap();
+    let layout = ResolvedRenderLayout::Row(vec![
+        ResolvedRenderLayout::Dataset {
+            dataset: first,
+            proxy: RenderProxyId::from("test"),
+            constraint: LayoutConstraint::Fill(1),
+            activatable: true,
+        },
+        ResolvedRenderLayout::Dataset {
+            dataset: second,
+            proxy: RenderProxyId::from("test"),
+            constraint: LayoutConstraint::Fill(1),
+            activatable: true,
+        },
+    ]);
+    runtime
+        .initialize_ui(
+            first,
+            RenderModeId::from("test"),
+            RenderContextBindings::default(),
+            layout.clone(),
+            ResolvedOperationSet::default(),
+        )
+        .unwrap();
+    runtime.run_schedule();
+    assert_eq!(
+        runtime
+            .world()
+            .resource::<ResolvedOperationSet>()
+            .active_dataset,
+        Some(first)
+    );
+    runtime.enqueue_input_intent(InputIntent::Key(KeyStroke::character('x')));
+    runtime.run_schedule();
+
+    runtime
+        .replace_context(
+            second,
+            RenderModeId::from("test"),
+            RenderContextBindings::default(),
+            layout,
+            ResolvedOperationSet::default(),
+        )
+        .unwrap();
+    runtime.run_schedule();
+    assert_eq!(
+        runtime
+            .world()
+            .resource::<ResolvedOperationSet>()
+            .active_dataset,
+        Some(second)
+    );
+    runtime.enqueue_input_intent(InputIntent::Key(KeyStroke::character('z')));
+    runtime.enqueue_input_intent(InputIntent::Key(KeyStroke::character('x')));
+    runtime.run_schedule();
+
+    assert_eq!(
+        runtime.world().resource::<ExecutedOperations>().0,
+        vec!["first", "second"],
+        "an unbound key is ignored and the same key executes only the Active Dataset's System"
+    );
 }
 
 #[test]
@@ -207,12 +342,7 @@ fn command_palette_and_key_input_emit_the_same_ordered_invocation_data() {
         .register_availability_rule(AvailabilityRuleId::from("always"), AvailabilityRule::Always)
         .unwrap();
     runtime
-        .register_command(command(
-            "capture",
-            "capture",
-            "capture.system",
-            CommandScope::Dataset,
-        ))
+        .register_command(command("capture", "capture", CommandScope::Dataset))
         .unwrap();
     runtime
         .register_operation(operation(
@@ -226,7 +356,7 @@ fn command_palette_and_key_input_emit_the_same_ordered_invocation_data() {
         .world_mut()
         .insert_resource(CapturedInvocations::default());
     runtime
-        .register_command_system(CommandSystemId::from("capture.system"), capture_invocation)
+        .register_operation_system(operation_id, capture_invocation)
         .unwrap();
 
     let repository = pitui_data::RepositoryKey::new("/repo");
@@ -281,7 +411,10 @@ fn command_palette_and_key_input_emit_the_same_ordered_invocation_data() {
     assert_eq!(captured[1].targets, vec![first, second]);
     assert_eq!(captured[0].source, InvocationSource::KeyBinding);
     assert_eq!(captured[1].source, InvocationSource::CommandPalette);
-    assert_eq!(runtime.world().resource::<CommandExecutionLog>().0.len(), 2);
+    assert_eq!(
+        runtime.world().resource::<OperationExecutionLog>().0.len(),
+        2
+    );
 
     runtime.enqueue_input_intent(InputIntent::CommandLine("capture extra".into()));
     runtime.enqueue_input_intent(InputIntent::CommandLine("missing".into()));
@@ -316,7 +449,7 @@ fn a_chord_prefix_replaces_the_single_active_key_map() {
         .unwrap();
     for (id, name) in [("hash", "hash"), ("info", "info")] {
         runtime
-            .register_command(command(id, name, id, CommandScope::Dataset))
+            .register_command(command(id, name, CommandScope::Dataset))
             .unwrap();
     }
     for (id, command, suffix) in [("copy.hash", "hash", 'h'), ("copy.info", "info", 'i')] {

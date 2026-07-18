@@ -74,10 +74,12 @@ cargo run -- /repo/one /repo/two
 
 ```text
 Terminal Event
+    -> pitui-tui Input Listener
     -> InputIntent
-    -> ResolvedOperationSet
-    -> CommandInvocation
-    -> ECS Command System
+    -> Active Dataset ResolvedOperationSet cache
+    -> OperationInvocation
+    -> OperationManager[OperationId]
+    -> ECS Operation System
          -> Dataset/Collection/ActiveElement/Selection/ActiveHandoff
          -> GitCommandData -> GitExecutor -> GitResultData
     -> Reconcile bindings/layout/operations
@@ -91,6 +93,10 @@ Terminal Event
 - 一个 Render 同时只有一个 Active Dataset；每个 Dataset 最多保留一个 Active Element，空集合为
   `None`。只有 Active Dataset 的 Active Element 会高亮。
 - 同一时间只有一个 `ActiveRenderMode` 和一个 `ResolvedOperationSet`。
+- Input Listener 只把终端事件解析为 `InputIntent`；Operation Executor 使用当前 Active Dataset 对应的
+  `ResolvedOperationSet` 缓存查询快捷键，未绑定的输入不会进入执行阶段。
+- Dataset Template 绑定 `OperationId`，`OperationManager` 将 `OperationId` 直接映射到 Bevy ECS System；
+  Command 只保留命令面板名称等数据，不参与函数寻址。
 - Dataset Template 同时声明 Collection Manager、可切换 Dataset View、Render Proxy 与 Operation；
   `DatasetViewState` 选择 View，View 决定当前 Manager 和 Proxy，但不修改 Dataset ownership DAG。
 - `TreeManager` 统一管理 Repositories/Branches、Files 和 Changes 的可见节点类型、有序 Element、

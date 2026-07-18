@@ -79,20 +79,24 @@ pitui-git -> pitui-core
 |---|---|
 | `src/lib.rs` | World/Schedule、注册契约、Dataset 生命周期、DAG、GC 和不变量 |
 | `src/collection.rs` | 通用 List/Tree Manager：直接/后代来源、可见节点过滤、排序、展平、深度和父子级联选择 |
-| `src/operation_runtime.rs` | 输入解析、唯一 Operation Set、Command System 和 Context 操作 |
+| `src/operation/mod.rs` | Operation 层消息/资源初始化和模块边界 |
+| `src/operation/executor.rs` | 查询 Active Dataset 的 Operation Set 缓存、解析快捷键/chord、构造调用上下文 |
+| `src/operation/resolver.rs` | 从全局及 Dataset Template 声明生成唯一有效 Operation Set 缓存 |
+| `src/operation/manager.rs` | `OperationId -> ECS SystemId` 注册、调用、结果和 Notice 收集 |
+| `src/operation/systems.rs` | 修改 Active/全局状态并发出 typed effect 数据的内置 Operation Systems |
 | `src/git_runtime.rs` | Git messages、执行结果、事务 Snapshot plan 和 session log Dataset |
 | `src/binding_reconcile.rs` | Active handoff、Context transition、render bindings 与 layout reconcile |
 | `src/projection.rs` | ECS World 到不可变 `UiFrame` 的单向投影，消费 Manager 生成的 Collection Element 数据 |
 | `src/tests.rs` | crate 私有内核测试 |
 | `tests/read_vertical.rs` | Repository→Branch→Commit→File 读取纵向测试 |
-| `tests/operations.rs` | Operation resolution、target 和 command tests |
+| `tests/operations.rs` | Active Dataset Operation Set、target、System dispatch 和 command metadata tests |
 | `tests/projection.rs` | Proxy、layout、footer、diff projection tests |
 
 ### `pitui-tui`
 
 | 文件 | 职责 |
 |---|---|
-| `src/input.rs` | crossterm event → `InputIntent` |
+| `src/input_listener.rs` | 只负责 crossterm event → `InputIntent`，不查询 Dataset 或 Operation |
 | `src/render.rs` | 只消费 `UiFrame` 的 ratatui renderer |
 | `src/terminal.rs` | raw mode、alternate screen、OSC 52 与 RAII 清理 |
 | `src/lib.rs` | adapter 公共出口 |

@@ -561,15 +561,16 @@ fn stable_dataset_identity_rejects_a_caller_selected_wrong_kind() {
 }
 
 #[test]
-fn registration_contracts_reject_dangling_proxy_and_command_system_references() {
+fn registration_contracts_reject_dangling_proxy_and_operation_system_references() {
     let mut runtime = DatasetRuntime::new();
+    let operation_id = OperationId::from("missing-system");
     runtime
         .register_default_template(DatasetTemplate {
             id: DatasetTemplateId::from("changes"),
             kind: DatasetKind::Changes,
             collection: pitui_data::CollectionManagerSpec::default(),
             views: Vec::new(),
-            operations: Vec::new(),
+            operations: vec![operation_id.clone()],
             render_proxies: vec![RenderProxyId::from("missing.proxy")],
         })
         .unwrap();
@@ -578,7 +579,19 @@ fn registration_contracts_reject_dangling_proxy_and_command_system_references() 
             id: CommandId::from("missing-system"),
             name: "missing-system".into(),
             scope: pitui_data::CommandScope::Dataset,
-            system: CommandSystemId::from("missing-system"),
+        })
+        .unwrap();
+    runtime
+        .register_availability_rule(AvailabilityRuleId::from("always"), AvailabilityRule::Always)
+        .unwrap();
+    runtime
+        .register_operation(OperationSpec {
+            id: operation_id.clone(),
+            label: "missing-system".into(),
+            command: CommandId::from("missing-system"),
+            bindings: Vec::new(),
+            target_source: pitui_data::TargetSource::None,
+            availability: AvailabilityRuleId::from("always"),
         })
         .unwrap();
 
@@ -590,9 +603,8 @@ fn registration_contracts_reject_dangling_proxy_and_command_system_references() 
         })
     );
     assert!(
-        errors.contains(&RegistrationContractError::CommandSystemMissing {
-            command: CommandId::from("missing-system"),
-            system: CommandSystemId::from("missing-system"),
-        })
+        errors.contains(&RegistrationContractError::OperationSystemMissing(
+            operation_id
+        ))
     );
 }

@@ -14,22 +14,22 @@ use bevy_ecs::{
 use pitui_data::{
     ActiveHandoffRegistry, ActiveRenderMode, ActiveUiContext, AvailabilityRegistryError,
     AvailabilityRule, AvailabilityRuleId, AvailabilityRuleRegistry, CollectionElement,
-    CollectionManagerSpec, CommandId, CommandInvocation, CommandRegistry, CommandRegistryError,
-    CommandSpec, CommandSystemId, ContextStack, Dataset, DatasetActiveElement, DatasetBinding,
-    DatasetBundle, DatasetChildren, DatasetCollection, DatasetIdentity, DatasetIndex, DatasetKey,
-    DatasetKind, DatasetRevision, DatasetRoots, DatasetSelection, DatasetTemplate,
-    DatasetTemplateId, DatasetTemplateRef, DatasetTemplateRegistry, DatasetType, DatasetViewId,
-    DatasetViewState, DefaultDatasetTemplates, GlobalOperationSet, HasSnapshot, InputIntent,
-    OperationId, OperationRegistry, OperationRegistryError, OperationSpec, PendingChordState,
-    QuitRequested, RenderContextBindings, RenderLayout, RenderModeId, RenderModeRegistry,
-    RenderModeSpec, RenderProxyId, RenderProxyRegistry, RenderProxySpec, RenderRegistryError,
-    ResolvedOperationSet, ResolvedRenderLayout, UiContextSnapshot, UiFrame, ViewportMeasurement,
+    CollectionManagerSpec, CommandId, CommandRegistry, CommandRegistryError, CommandSpec,
+    ContextStack, Dataset, DatasetActiveElement, DatasetBinding, DatasetBundle, DatasetChildren,
+    DatasetCollection, DatasetIdentity, DatasetIndex, DatasetKey, DatasetKind, DatasetRevision,
+    DatasetRoots, DatasetSelection, DatasetTemplate, DatasetTemplateId, DatasetTemplateRef,
+    DatasetTemplateRegistry, DatasetType, DatasetViewId, DatasetViewState, DefaultDatasetTemplates,
+    GlobalOperationSet, HasSnapshot, InputIntent, OperationId, OperationInvocation,
+    OperationRegistry, OperationRegistryError, OperationSpec, PendingChordState, QuitRequested,
+    RenderContextBindings, RenderLayout, RenderModeId, RenderModeRegistry, RenderModeSpec,
+    RenderProxyId, RenderProxyRegistry, RenderProxySpec, RenderRegistryError, ResolvedOperationSet,
+    ResolvedRenderLayout, UiContextSnapshot, UiFrame, ViewportMeasurement,
 };
 
 mod binding_reconcile;
 mod collection;
 mod git_runtime;
-mod operation_runtime;
+mod operation;
 mod projection;
 
 pub use binding_reconcile::RenderReconcileDiagnostics;
@@ -37,9 +37,9 @@ pub use git_runtime::{
     GitCommandData, GitDataError, GitExecutionFailure, GitExecutionFailures, GitExecutorResource,
     GitMutationSuccess, GitMutationSuccesses, GitOperationLogSinkResource, GitResultData,
 };
-pub use operation_runtime::{
-    ClipboardRequests, CommandExecution, CommandExecutionLog, CommandSystemRegistrationError,
-    OperationNotices, OperationResolutionDiagnostics, OperationResolutionError,
+pub use operation::{
+    ClipboardRequests, OperationExecution, OperationExecutionLog, OperationNotices,
+    OperationResolutionDiagnostics, OperationResolutionError, OperationSystemRegistrationError,
     PendingInteractionNotices,
 };
 pub use projection::{ProjectionDiagnostic, ProjectionDiagnostics};
@@ -193,10 +193,7 @@ pub enum RegistrationContractError {
         operation: OperationId,
         availability: AvailabilityRuleId,
     },
-    CommandSystemMissing {
-        command: CommandId,
-        system: CommandSystemId,
-    },
+    OperationSystemMissing(OperationId),
     RenderModeMissingProxy {
         mode: RenderModeId,
         proxy: RenderProxyId,
@@ -293,7 +290,7 @@ impl DatasetRuntime {
         world.init_resource::<RenderReconcileDiagnostics>();
         binding_reconcile::initialize_binding_reconcile(&mut world);
         git_runtime::initialize_git_runtime(&mut world, executor, log_sink);
-        operation_runtime::initialize_operation_runtime(&mut world);
+        operation::initialize_operation_layer(&mut world);
 
         let mut schedule = Schedule::new(PituiSchedule);
         schedule.configure_sets(
@@ -309,25 +306,25 @@ impl DatasetRuntime {
         );
         schedule.add_systems(
             (
-                operation_runtime::apply_text_edits,
-                operation_runtime::collect_command_invocations,
-                operation_runtime::dispatch_pending_commands,
+                operation::apply_text_edits,
+                operation::collect_operation_invocations,
+                operation::dispatch_pending_operations,
                 binding_reconcile::update_dependent_render_bindings,
                 git_runtime::enqueue_dependent_reads,
                 git_runtime::execute_git_commands,
                 git_runtime::collect_git_results,
                 git_runtime::apply_pending_git_results,
-                operation_runtime::collect_clipboard_requests,
-                operation_runtime::collect_operation_notices,
-                operation_runtime::collect_interaction_notice_requests,
+                operation::collect_clipboard_requests,
+                operation::collect_operation_notices,
+                operation::collect_interaction_notice_requests,
             )
                 .chain()
                 .in_set(RuntimeSet::Execute),
         );
         schedule.add_systems(
             (
-                operation_runtime::release_deferred_invocations,
-                operation_runtime::resolve_input_intents,
+                operation::release_deferred_invocations,
+                operation::execute_operation_inputs,
             )
                 .chain()
                 .in_set(RuntimeSet::Resolve),
@@ -338,13 +335,13 @@ impl DatasetRuntime {
             (
                 collection::rebuild_collections,
                 collection::repair_active_elements,
-                operation_runtime::reconcile_pending_changes_active,
+                operation::reconcile_pending_changes_active,
                 binding_reconcile::collect_context_transitions,
                 binding_reconcile::apply_context_transitions,
                 binding_reconcile::update_dependent_render_bindings,
                 binding_reconcile::resolve_active_render_mode,
-                operation_runtime::present_next_interaction_notice,
-                operation_runtime::resolve_active_operation_set,
+                operation::present_next_interaction_notice,
+                operation::resolve_active_operation_set,
                 projection::update_dataset_viewports,
                 collect_unreachable_datasets,
             )
@@ -574,12 +571,11 @@ impl DatasetRuntime {
                 });
             }
         }
-        for command in commands.commands.values() {
-            if !operation_runtime::command_system_registered(&self.world, &command.system) {
-                errors.push(RegistrationContractError::CommandSystemMissing {
-                    command: command.id.clone(),
-                    system: command.system.clone(),
-                });
+        for operation in operations.operations.values() {
+            if !operation::operation_system_registered(&self.world, &operation.id) {
+                errors.push(RegistrationContractError::OperationSystemMissing(
+                    operation.id.clone(),
+                ));
             }
         }
         for mode in modes.modes.values() {
@@ -589,176 +585,22 @@ impl DatasetRuntime {
         errors
     }
 
-    pub fn register_command_system<M, S>(
+    pub fn register_operation_system<M, S>(
         &mut self,
-        id: CommandSystemId,
+        id: OperationId,
         system: S,
-    ) -> Result<(), CommandSystemRegistrationError>
+    ) -> Result<(), OperationSystemRegistrationError>
     where
-        S: IntoSystem<In<CommandInvocation>, CommandExecution, M> + 'static,
+        S: IntoSystem<In<OperationInvocation>, OperationExecution, M> + 'static,
         M: 'static,
     {
-        operation_runtime::register_command_system(&mut self.world, id, system)
+        operation::register_operation_system(&mut self.world, id, system)
     }
 
-    pub fn register_builtin_interaction_systems(
+    pub fn register_builtin_operation_systems(
         &mut self,
-    ) -> Result<(), CommandSystemRegistrationError> {
-        self.register_command_system(
-            CommandSystemId::from("quit"),
-            operation_runtime::request_quit,
-        )?;
-        self.register_command_system(CommandSystemId::from("help"), operation_runtime::open_help)?;
-        self.register_command_system(
-            CommandSystemId::from("command-palette"),
-            operation_runtime::open_command_palette,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("changes"),
-            operation_runtime::open_changes,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("reflog"),
-            operation_runtime::open_reflog,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("logs"),
-            operation_runtime::open_git_operation_log,
-        )?;
-        for id in ["remotes", "fetch", "pull", "push", "sync"] {
-            self.register_command_system(
-                CommandSystemId::from(id),
-                operation_runtime::reject_unimplemented,
-            )?;
-        }
-        self.register_command_system(
-            CommandSystemId::from("refresh"),
-            operation_runtime::refresh_active_context,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("interaction.close"),
-            operation_runtime::close_interaction,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("palette.up"),
-            operation_runtime::palette_up,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("palette.down"),
-            operation_runtime::palette_down,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("palette.submit"),
-            operation_runtime::submit_palette_command,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("active.up"),
-            operation_runtime::activate_previous_element,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("active.down"),
-            operation_runtime::activate_next_element,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("active.left"),
-            operation_runtime::transfer_active_left,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("active.right"),
-            operation_runtime::transfer_active_right,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("selection.toggle"),
-            operation_runtime::toggle_selection,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("collection.view.next"),
-            operation_runtime::cycle_collection_view,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("commits.cherry-pick"),
-            operation_runtime::cherry_pick_selected,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("changes.selection.toggle"),
-            operation_runtime::toggle_changes_selection,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("changes.stage"),
-            operation_runtime::stage_changes,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("changes.unstage"),
-            operation_runtime::unstage_changes,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("changes.commit"),
-            operation_runtime::open_commit_creation,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("commit-creation.cancel"),
-            operation_runtime::navigate_back,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("commit-creation.submit"),
-            operation_runtime::submit_commit_creation,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("text.submit"),
-            operation_runtime::submit_text_input,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("back"),
-            operation_runtime::navigate_back,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("copy.commit.hash"),
-            operation_runtime::copy_commit_hashes,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("copy.commit.info"),
-            operation_runtime::copy_commit_info,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("copy.commit.message"),
-            operation_runtime::copy_commit_message,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("copy.commit-field.values"),
-            operation_runtime::copy_commit_field_values,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("copy.reflog.hash"),
-            operation_runtime::copy_reflog_hash,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("copy.file.name"),
-            operation_runtime::copy_file_name,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("copy.file.absolute"),
-            operation_runtime::copy_file_absolute_path,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("copy.file.relative"),
-            operation_runtime::copy_file_relative_path,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("scroll.home"),
-            operation_runtime::scroll_home,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("scroll.end"),
-            operation_runtime::scroll_end,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("scroll.page-up"),
-            operation_runtime::scroll_page_up,
-        )?;
-        self.register_command_system(
-            CommandSystemId::from("scroll.page-down"),
-            operation_runtime::scroll_page_down,
-        )
+    ) -> Result<(), OperationSystemRegistrationError> {
+        operation::register_builtin_operation_systems(&mut self.world)
     }
 
     pub fn enqueue_input_intent(&mut self, intent: InputIntent) {
@@ -1080,7 +922,7 @@ impl DatasetRuntime {
     pub fn run_schedule(&mut self) {
         self.schedule.run(&mut self.world);
         git_runtime::update_git_messages(&mut self.world);
-        operation_runtime::update_operation_messages(&mut self.world);
+        operation::update_operation_messages(&mut self.world);
         self.world
             .resource_mut::<bevy_ecs::prelude::Messages<ViewportMeasurement>>()
             .update();

@@ -12,12 +12,12 @@ use std::{env, path::PathBuf, time::Duration};
 use pitui_data::{
     ActiveDirection, ActiveHandoffRegistry, ActiveHandoffSpec, ActiveHandoffTarget,
     AvailabilityRule, AvailabilityRuleId, CollectionManagerSpec, CommandId, CommandScope,
-    CommandSpec, CommandSystemId, DatasetBinding, DatasetIdentity, DatasetKind, DatasetTemplate,
-    DatasetTemplateId, DatasetViewId, DatasetViewSpec, DateTimePrecision, FieldFormat, FieldId,
-    FieldSpec, InteractionContextType, KeyCode, KeySequence, KeyStroke, LayoutConstraint,
-    ListManagerSpec, ListSource, OperationId, OperationSpec, RenderBindingId, RenderLayout,
-    RenderModeId, RenderModeSpec, RenderProxyId, RenderProxySpec, RendererKind, StyleSpec,
-    TargetSource, TreeManagerSpec, TreeSelectionMode, TreeSiblingOrder,
+    CommandSpec, DatasetBinding, DatasetIdentity, DatasetKind, DatasetTemplate, DatasetTemplateId,
+    DatasetViewId, DatasetViewSpec, DateTimePrecision, FieldFormat, FieldId, FieldSpec,
+    InteractionContextType, KeyCode, KeySequence, KeyStroke, LayoutConstraint, ListManagerSpec,
+    ListSource, OperationId, OperationSpec, RenderBindingId, RenderLayout, RenderModeId,
+    RenderModeSpec, RenderProxyId, RenderProxySpec, RendererKind, StyleSpec, TargetSource,
+    TreeManagerSpec, TreeSelectionMode, TreeSiblingOrder,
 };
 
 /// Version of the Data Driven configuration schema.
@@ -788,7 +788,6 @@ fn command(id: &str, name: &str, scope: CommandScope) -> CommandSpec {
         id: CommandId::from(id),
         name: name.into(),
         scope,
-        system: CommandSystemId::from(id),
     }
 }
 
