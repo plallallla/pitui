@@ -4,8 +4,8 @@
 > 是下一代的产品行为参考，不是目标代码架构。第 3–18 节中的
 > `Screen`、`FocusPanel`、`RepositoryState` 及详情 cache 代码片段仅是历史记录，不是当前
 > API；当前 Legacy 实现说明见 [`model-driven-architecture.md`](model-driven-architecture.md)。
-> 下一代将使用 `bevy_ecs` 按 Dataset ECS 完整重写，最终目标、资产复用矩阵和实施计划见
-> [`../最终设计方案.md`](../最终设计方案.md)。新实现不得复制本文的旧页面状态机。
+> 下一代使用 `bevy_ecs` 按 Dataset ECS 独立开发；当前实现证据、缺口与验收门禁见
+> [`../next-development-status.md`](../next-development-status.md)。新实现不得复制本文的旧页面状态机。
 
 > 目标：实现一个安全、克制、以分支 / commit / diff 浏览为核心的 Git TUI。
 >

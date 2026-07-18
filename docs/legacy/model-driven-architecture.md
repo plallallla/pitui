@@ -1,8 +1,8 @@
 # Pitui Model-Driven Architecture
 
 > 状态：**当前 0.1.0 Legacy 实现说明**。本文用于解释和审计现有代码资产，不再是下一代
-> 开发目标。下一代将使用独立 `bevy_ecs` crate 按 Dataset ECS 重新开发，权威设计、复用
-> 边界与计划见 [`../最终设计方案.md`](../最终设计方案.md)。历史产品设计中的 `Screen`、
+> 开发目标。下一代使用独立 `bevy_ecs` crate 按 Dataset ECS 重新开发；当前实现证据、复用
+> 边界与缺口见 [`../next-development-status.md`](../next-development-status.md)。历史产品设计中的 `Screen`、
 > `FocusPanel`、`RepositoryState` 和详情缓存代码片段也不代表当前实现。
 
 ## 1. 结论

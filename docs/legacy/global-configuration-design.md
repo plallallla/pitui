@@ -2,7 +2,8 @@
 
 > 本文描述当前 0.1.0 Legacy 配置资产。配置文件发现、严格 TOML、KeyStroke 和日志策略可
 > 复用；依赖 `AppState/OperationId/ViewId` 的 resolver 将按下一代 Dataset/Render Proxy/
-> Command Registry 重写。目标见 [`../最终设计方案.md`](../最终设计方案.md)。
+> Command Registry 重写。Next 当前实现与缺口见
+> [`../next-development-status.md`](../next-development-status.md)。
 
 > 状态：**第一阶段已实现**（启动时加载；不包含运行时 reload、文件 watcher 或 TUI 编辑器）  
 > 目标：提供统一、可验证、可扩展的全局配置基础；除本文明确要求的

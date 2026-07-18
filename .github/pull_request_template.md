@@ -8,9 +8,10 @@
 
 ## Verification
 
-- [ ] `cargo fmt --check`
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --all-targets`
+- [ ] `cargo fmt --all -- --check`
+- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- [ ] `cargo test --workspace --all-targets`
+- [ ] `cargo test --workspace --doc`
 - [ ] New behavior has focused tests, or the reason tests are unnecessary is explained.
 - [ ] Documentation and hotkey help are updated.
 - [ ] Git output remains terminal-sanitized and commands use argv rather than a shell string.

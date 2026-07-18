@@ -8,9 +8,9 @@ Pitui 是一个安全、克制、支持多仓库的 Git TUI，以分支、commit
 > [!NOTE]
 > 当前 binary 是已经验收的 0.1.0 Legacy 行为基线。下一代不在现有
 > `AppState/GitModel/Controller` 核心上继续重构，而是使用独立 `bevy_ecs` crate 按
-> Data Driven Development 重新开发；Dataset ECS、Command/Operation、Render Proxy、
-> 现有资产复用矩阵、阶段计划和验收门禁以
-> [`最终设计方案.md`](最终设计方案.md) 为权威文档。
+> Data Driven Development 重新开发。Next 的当前实现证据、已知缺口、资产边界和验收门禁见
+> [`docs/next-development-status.md`](docs/next-development-status.md) 与
+> [`docs/code-assets.md`](docs/code-assets.md)。
 
 ```text
 Repositories + Branches -> Commits -> Commit + Changed Files -> Files + Diff
@@ -204,10 +204,10 @@ rotate_on_start = false
 按键；确认弹窗、hard reset 二次确认和文本编辑按键属于安全保留交互，不能通过配置绕过。
 完整字段和示例见 [`docs/config.example.toml`](docs/config.example.toml)，全部稳定 operation id
 可通过 `--print-effective-config` 查看；设计与约束见
-[`docs/global-configuration-design.md`](docs/global-configuration-design.md)。`views.history`、
+[`docs/legacy/global-configuration-design.md`](docs/legacy/global-configuration-design.md)。`views.history`、
 `views.commit`、`views.file-diff`、`views.changes`、`views.reflog`、`views.remotes` 已支持独立
 栏宽、commit density/字段开关及 operation binding 覆盖；完整分层演进方案见
-[`docs/view-configuration-design.md`](docs/view-configuration-design.md)。
+[`docs/legacy/view-configuration-design.md`](docs/legacy/view-configuration-design.md)。
 
 ## 后台操作日志
 
@@ -418,8 +418,9 @@ Stage 使用 path-limited `git add --all -- <paths>`；unstage 使用 path-limit
 
 ## 架构
 
-> 本节描述当前 0.1.0 Legacy 实现，仅作为可复用资产与行为基线；下一代目标架构见
-> [`最终设计方案.md`](最终设计方案.md)。
+> 本节描述当前 0.1.0 Legacy 实现，仅作为可复用资产与行为基线；下一代当前状态与代码资产
+> 边界见 [`docs/next-development-status.md`](docs/next-development-status.md) 和
+> [`docs/code-assets.md`](docs/code-assets.md)。
 
 ```text
 Git Worker -> GitResponse -> Model reducer -> normalized GitModel
@@ -443,18 +444,23 @@ Focus/View change -> DataRequirement reconcile -> deduplicated GitRequest
 - `src/app/command.rs`：唯一 `OperationId -> OperationSpec` 可调用注册表；快捷键、提示、帮助和操作面板共用。
 - `src/app/requirement.rs`：由 view/focus 声明数据依赖，Controller 统一 reconcile。
 - `src/app/controller.rs`：operation executor、Git effect 调度、model reducer 和声明式数据需求 reconcile。
-- `src/domain`：仓库、分支、commit、reflog、文件和 diff 纯模型。
-- `src/git`：Git 协议、Worker、命令执行、后台操作日志和解析器。
+- `crates/pitui-core`：仓库、分支、commit、reflog、文件和 diff 的 canonical 纯数据；
+  `src/domain` 只是 Legacy 兼容 facade。
+- `crates/pitui-git`：两套运行时共享的 canonical parser 与 Next 同步 executor；`src/git` 保留
+  Legacy Worker、尚未迁移的写操作和兼容 facade。
 
-模型驱动架构不变量见 [`docs/model-driven-architecture.md`](docs/model-driven-architecture.md)，
-完整产品设计见 [`docs/git-tui-design.md`](docs/git-tui-design.md)。
+Legacy 模型驱动架构不变量见
+[`docs/legacy/model-driven-architecture.md`](docs/legacy/model-driven-architecture.md)，历史产品设计见
+[`docs/legacy/git-tui-design.md`](docs/legacy/git-tui-design.md)。当前代码资产索引见
+[`docs/code-assets.md`](docs/code-assets.md)，全部文档分类见 [`docs/README.md`](docs/README.md)。
 
 ## 开发验证
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets
+cargo test --workspace --doc
 ```
 
 ## 参与贡献与安全问题
