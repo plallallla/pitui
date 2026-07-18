@@ -36,9 +36,9 @@ pitui         composition root、binary 与端到端验收
 - 单一 `ActiveUiContext`、`ActiveRenderMode`、`ResolvedOperationSet`。
 - `pitui-tui` Input Listener 只解析终端事件；Operation Executor 从当前 Active Dataset 的
   `ResolvedOperationSet` 缓存查询绑定并构造调用上下文，未绑定输入直接忽略。
-- `OperationManager` 维护直接的 `OperationId -> Bevy SystemId` 函数表；Dataset Template 绑定
-  Operation，Command 仅保留命令名称/作用域元数据，System 通过 typed ECS 参数修改 Active、全局状态或
-  发出 Git/Context/Clipboard 等数据。
+- `OperationManager` 维护直接的 `OperationId -> Bevy SystemId` 编译期函数表；Dataset Template 绑定
+  Operation，并拥有独立的 `OperationHotkeyTable`。Operation 语义不再携带按键；Command 仅保留命令
+  名称/作用域元数据，System 通过 typed ECS 参数修改 Active、全局状态或发出 Git/Context/Clipboard 等数据。
 - Template/Proxy/Mode/Operation/Command/Availability 跨 Registry 启动校验。
 - History、Commit、File Diff、Changes、Reflog、Git Operation Log Render Mode。
 - Commit 下的 Files、Changes 的 staged/unstaged 边界和 WorkingTreeFiles 使用共享 `PathTree`
@@ -51,6 +51,8 @@ pitui         composition root、binary 与端到端验收
 - Changes staged/unstaged 树、边界分组/目录/文件的父子级联多选、分组或目录递归 stage/unstage 和
   commit creation。
 - Reflog 加载与 hash 复制。
+- Commits/Reflog 当前条目的 soft、mixed、hard reset；hard reset 先进入默认 `Cancel` 的 Confirmation
+  Context，确认层 Pop 后才释放内部写 Operation，随后刷新 Repository、Branches、Commits、Changes 和 Reflog。
 - commits 多选和安全 cherry-pick；本次冲突自动尝试 abort。
 - session Git operation log Dataset 与可轮转持久 JSONL sink。
 - `UiFrame` generation 驱动重绘，不进行定时 Git 自动刷新。
@@ -59,16 +61,15 @@ pitui         composition root、binary 与端到端验收
 
 - Remote 数据加载与管理。
 - fetch、pull、push、sync。
-- reset（包括 hard reset 确认）。
 - safe rebase。
 - stash 浏览和操作。
-- 外部 TOML 配置加载、严格覆盖和运行时 reload。
+- 外部 Hotkey 配置文件加载、严格覆盖和运行时 reload；当前每个 Dataset 的 Hotkey 表使用编译期默认值。
 - 异步/后台 Git executor；当前同步执行可能阻塞 terminal event loop。
 - 用户可操作的 unified/side-by-side 模式切换。
 - Table Collection Manager；扩展位置已经收敛到 `CollectionManagerSpec`，本次不实现 Table。
 
 `remotes/fetch/pull/push/sync` 已有稳定 Command/Operation ID，但当前系统明确返回 unimplemented；
-reset/rebase 尚未进入 `GitCommand` 数据协议。
+safe rebase 尚未进入 `GitCommand` 数据协议。
 
 ## 固定数据流
 
@@ -112,5 +113,6 @@ cargo test --workspace --doc
 2. 将 `git_runtime.rs` 按 lifecycle/log、snapshot planning 和 payload adapter 拆分。
 3. 将根 `src/tests.rs` 拆为共享 fixture 与按语义分类的集成测试模块。
 4. 设计保持 typed data 边界的异步 Git task/result 通道。
-5. 依次实现 Remote、网络操作、reset 确认和 safe rebase，并补齐真实临时仓库测试。
-6. 在 `pitui-config` 上增加严格外部配置解析，而不是在 Renderer/Input 中增加配置分支。
+5. 依次实现 Remote、网络操作和 safe rebase，并补齐真实临时仓库测试。
+6. 只为各 Dataset 的 `OperationHotkeyTable` 增加严格外部覆盖，不把语义功能、Renderer 或 Git argv
+   暴露为运行时配置。

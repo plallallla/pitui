@@ -1,9 +1,9 @@
-//! Strict configuration boundary for Dataset templates, Operations, Render
-//! Proxies and Render Modes.
+//! Compiled feature contracts plus the configurable Hotkey tables owned by
+//! each Dataset Operation Set.
 //!
-//! Parsing and effective-config resolution will migrate here after the ECS
-//! registries are stable. This crate must never permit shell or Git argv
-//! templates to be injected from configuration.
+//! Semantic Operations, Renderers and Git argv remain compiled Rust code. A
+//! future external configuration boundary may override Hotkey tables only; it
+//! must never inject executable commands or Git argv templates.
 
 #![forbid(unsafe_code)]
 
@@ -14,14 +14,15 @@ use pitui_data::{
     AvailabilityRule, AvailabilityRuleId, CollectionManagerSpec, CommandId, CommandScope,
     CommandSpec, DatasetBinding, DatasetIdentity, DatasetKind, DatasetTemplate, DatasetTemplateId,
     DatasetViewId, DatasetViewSpec, DateTimePrecision, FieldFormat, FieldId, FieldSpec,
-    InteractionContextType, KeyCode, KeySequence, KeyStroke, LayoutConstraint, ListManagerSpec,
-    ListSource, OperationId, OperationSpec, RenderBindingId, RenderLayout, RenderModeId,
-    RenderModeSpec, RenderProxyId, RenderProxySpec, RendererKind, StyleSpec, TargetSource,
-    TreeManagerSpec, TreeSelectionMode, TreeSiblingOrder,
+    GlobalOperationSet, InteractionContextType, KeyCode, KeySequence, KeyStroke, LayoutConstraint,
+    ListManagerSpec, ListSource, OperationHotkeyBinding, OperationHotkeyTable, OperationId,
+    OperationSpec, RenderBindingId, RenderLayout, RenderModeId, RenderModeSpec, RenderProxyId,
+    RenderProxySpec, RendererKind, StyleSpec, TargetSource, TreeManagerSpec, TreeSelectionMode,
+    TreeSiblingOrder,
 };
 
 /// Version of the Data Driven configuration schema.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoggingLevel {
@@ -98,6 +99,7 @@ pub fn default_git_log_path() -> PathBuf {
 pub fn builtin_dataset_templates() -> Vec<DatasetTemplate> {
     use DatasetKind as Kind;
 
+    let operation_definitions = builtin_operation_definitions();
     [
         (Kind::RepositoriesBranches, "repositories-branches"),
         (Kind::Repository, "repository"),
@@ -123,13 +125,17 @@ pub fn builtin_dataset_templates() -> Vec<DatasetTemplate> {
         (Kind::GitOperationLogEntry, "git-operation-log-entry"),
     ]
     .into_iter()
-    .map(|(kind, name)| DatasetTemplate {
-        id: DatasetTemplateId::from(name),
-        kind,
-        collection: collection_manager_for(kind),
-        views: dataset_views_for(kind),
-        operations: operations_for_dataset(kind),
-        render_proxies: builtin_proxies(kind),
+    .map(|(kind, name)| {
+        let operations = operations_for_dataset(kind);
+        DatasetTemplate {
+            id: DatasetTemplateId::from(name),
+            kind,
+            collection: collection_manager_for(kind),
+            views: dataset_views_for(kind),
+            hotkeys: hotkeys_for_operations(&operations, &operation_definitions),
+            operations,
+            render_proxies: builtin_proxies(kind),
+        }
     })
     .collect()
 }
@@ -671,6 +677,10 @@ pub fn builtin_availability_rules() -> Vec<(AvailabilityRuleId, AvailabilityRule
             AvailabilityRule::InteractionContextType(InteractionContextType::TextInput),
         ),
         (
+            AvailabilityRuleId::from("confirmation-context"),
+            AvailabilityRule::InteractionContextType(InteractionContextType::Confirmation),
+        ),
+        (
             AvailabilityRuleId::from("notice-context"),
             AvailabilityRule::InteractionContextType(InteractionContextType::Notice),
         ),
@@ -758,6 +768,10 @@ pub fn builtin_command_specs() -> Vec<CommandSpec> {
         ("copy.commit-field.values", "copy-commit-field-values"),
         ("copy.reflog.hash", "copy-reflog-hash"),
         ("commits.cherry-pick", "cherry-pick"),
+        ("reset.soft", "reset-soft"),
+        ("reset.mixed", "reset-mixed"),
+        ("reset.hard", "reset-hard"),
+        ("reset.hard.confirmed", "reset-hard-confirmed"),
         ("copy.file.name", "copy-file-name"),
         ("copy.file.absolute", "copy-file-absolute-path"),
         ("copy.file.relative", "copy-file-relative-path"),
@@ -770,6 +784,9 @@ pub fn builtin_command_specs() -> Vec<CommandSpec> {
         ("palette.up", "palette-up"),
         ("palette.down", "palette-down"),
         ("palette.submit", "palette-submit"),
+        ("confirmation.up", "confirmation-up"),
+        ("confirmation.down", "confirmation-down"),
+        ("confirmation.submit", "confirmation-submit"),
         ("changes.selection.toggle", "toggle-change-selection"),
         ("changes.stage", "stage"),
         ("changes.unstage", "unstage"),
@@ -791,12 +808,19 @@ fn command(id: &str, name: &str, scope: CommandScope) -> CommandSpec {
     }
 }
 
-pub fn builtin_operation_specs() -> Vec<OperationSpec> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BuiltinOperationDefinition {
+    spec: OperationSpec,
+    hotkeys: Vec<KeySequence>,
+}
+
+fn builtin_operation_definitions() -> Vec<BuiltinOperationDefinition> {
     let always = AvailabilityRuleId::from("always");
     let normal = AvailabilityRuleId::from("normal-context");
     let help_context = AvailabilityRuleId::from("help-context");
     let palette_context = AvailabilityRuleId::from("command-palette-context");
     let text_context = AvailabilityRuleId::from("text-input-context");
+    let confirmation_context = AvailabilityRuleId::from("confirmation-context");
     let commit_creation_context = AvailabilityRuleId::from("commit-creation-context");
     let notice_context = AvailabilityRuleId::from("notice-context");
     let changes_entry = AvailabilityRuleId::from("changes-entry-context");
@@ -911,6 +935,47 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
             vec![single(KeyStroke::plain(KeyCode::Enter))],
             TargetSource::ActiveDataset,
             palette_context,
+        ),
+        operation(
+            "interaction.confirmation.close",
+            "Cancel",
+            "interaction.close",
+            vec![
+                single(KeyStroke::plain(KeyCode::Escape)),
+                single(KeyStroke::character('q')),
+            ],
+            TargetSource::None,
+            confirmation_context.clone(),
+        ),
+        operation(
+            "interaction.confirmation.up",
+            "Up",
+            "confirmation.up",
+            vec![
+                single(KeyStroke::character('w')),
+                single(KeyStroke::plain(KeyCode::Up)),
+            ],
+            TargetSource::ActiveDataset,
+            confirmation_context.clone(),
+        ),
+        operation(
+            "interaction.confirmation.down",
+            "Down",
+            "confirmation.down",
+            vec![
+                single(KeyStroke::character('s')),
+                single(KeyStroke::plain(KeyCode::Down)),
+            ],
+            TargetSource::ActiveDataset,
+            confirmation_context.clone(),
+        ),
+        operation(
+            "interaction.confirmation.submit",
+            "Confirm",
+            "confirmation.submit",
+            vec![single(KeyStroke::plain(KeyCode::Enter))],
+            TargetSource::ActiveDataset,
+            confirmation_context,
         ),
         operation(
             "interaction.text.close",
@@ -1100,6 +1165,38 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
             AvailabilityRuleId::from("has-selection"),
         ),
         operation(
+            "reset.soft",
+            "Reset --soft",
+            "reset.soft",
+            vec![reset_chord('s')],
+            TargetSource::ActiveElement,
+            active_element.clone(),
+        ),
+        operation(
+            "reset.mixed",
+            "Reset --mixed",
+            "reset.mixed",
+            vec![reset_chord('m')],
+            TargetSource::ActiveElement,
+            active_element.clone(),
+        ),
+        operation(
+            "reset.hard",
+            "Reset --hard",
+            "reset.hard",
+            vec![reset_chord('h')],
+            TargetSource::ActiveElement,
+            active_element.clone(),
+        ),
+        operation(
+            "reset.hard.confirmed",
+            "Confirm reset --hard",
+            "reset.hard.confirmed",
+            Vec::new(),
+            TargetSource::ActiveElement,
+            active_element.clone(),
+        ),
+        operation(
             "copy.file.name",
             "Copy name",
             "copy.file.name",
@@ -1167,6 +1264,13 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
     operations
 }
 
+pub fn builtin_operation_specs() -> Vec<OperationSpec> {
+    builtin_operation_definitions()
+        .into_iter()
+        .map(|definition| definition.spec)
+        .collect()
+}
+
 fn operation(
     id: &str,
     label: &str,
@@ -1174,15 +1278,37 @@ fn operation(
     bindings: Vec<KeySequence>,
     target_source: TargetSource,
     availability: AvailabilityRuleId,
-) -> OperationSpec {
-    OperationSpec {
-        id: OperationId::from(id),
-        label: label.into(),
-        command: CommandId::from(command),
-        bindings,
-        target_source,
-        availability,
+) -> BuiltinOperationDefinition {
+    BuiltinOperationDefinition {
+        spec: OperationSpec {
+            id: OperationId::from(id),
+            label: label.into(),
+            command: CommandId::from(command),
+            target_source,
+            availability,
+        },
+        hotkeys: bindings,
     }
+}
+
+fn hotkeys_for_operations(
+    operations: &[OperationId],
+    definitions: &[BuiltinOperationDefinition],
+) -> OperationHotkeyTable {
+    OperationHotkeyTable(
+        operations
+            .iter()
+            .filter_map(|operation| {
+                let definition = definitions
+                    .iter()
+                    .find(|definition| &definition.spec.id == operation)?;
+                (!definition.hotkeys.is_empty()).then(|| OperationHotkeyBinding {
+                    operation: operation.clone(),
+                    bindings: definition.hotkeys.clone(),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn single(stroke: KeyStroke) -> KeySequence {
@@ -1191,6 +1317,10 @@ fn single(stroke: KeyStroke) -> KeySequence {
 
 fn copy_chord(suffix: char) -> KeySequence {
     KeySequence::chord([KeyStroke::control('c'), KeyStroke::character(suffix)])
+}
+
+fn reset_chord(suffix: char) -> KeySequence {
+    KeySequence::chord([KeyStroke::control('x'), KeyStroke::character(suffix)])
 }
 
 fn shifted(character: char) -> KeyStroke {
@@ -1218,6 +1348,14 @@ pub fn builtin_global_operations() -> Vec<OperationId> {
     .into_iter()
     .map(|name| OperationId::from(format!("global.{name}")))
     .collect()
+}
+
+pub fn builtin_global_operation_set() -> GlobalOperationSet {
+    let operations = builtin_global_operations();
+    GlobalOperationSet {
+        hotkeys: hotkeys_for_operations(&operations, &builtin_operation_definitions()),
+        operations,
+    }
 }
 
 fn proxy(
@@ -1288,6 +1426,9 @@ fn operations_for_dataset(kind: DatasetKind) -> Vec<OperationId> {
             "copy.commit.info",
             "copy.commit.message",
             "commits.cherry-pick",
+            "reset.soft",
+            "reset.mixed",
+            "reset.hard",
         ],
         Kind::Commit => &[
             "active.up",
@@ -1340,6 +1481,9 @@ fn operations_for_dataset(kind: DatasetKind) -> Vec<OperationId> {
             "active.left",
             "active.right",
             "copy.reflog.hash",
+            "reset.soft",
+            "reset.mixed",
+            "reset.hard",
         ],
         Kind::File | Kind::WorkingTreeFile => &[
             "active.left",
@@ -1376,6 +1520,10 @@ fn operations_for_dataset(kind: DatasetKind) -> Vec<OperationId> {
             "interaction.palette.up",
             "interaction.palette.down",
             "interaction.palette.submit",
+            "interaction.confirmation.close",
+            "interaction.confirmation.up",
+            "interaction.confirmation.down",
+            "interaction.confirmation.submit",
             "interaction.text.close",
             "interaction.text.submit",
             "interaction.notice.close",

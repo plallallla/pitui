@@ -12,7 +12,7 @@ use std::{
 };
 
 use pitui_core::{
-    BranchName, CommitDetail, CommitHash, FileDiff, GitPath, ReflogEntry, Repository,
+    BranchName, CommitDetail, CommitHash, FileDiff, GitPath, ReflogEntry, Repository, ResetMode,
     WorkingTreeChange, WorkingTreeDiff, WorkingTreeDiffKind, WorkingTreeDiffSection,
 };
 
@@ -85,6 +85,10 @@ pub enum GitCommand {
     CherryPick {
         commits: Vec<CommitHash>,
     },
+    Reset {
+        target: CommitHash,
+        mode: ResetMode,
+    },
 }
 
 impl GitCommand {
@@ -104,6 +108,11 @@ impl GitCommand {
             Self::UnstagePaths { .. } => "unstage_paths",
             Self::Commit { .. } => "commit",
             Self::CherryPick { .. } => "cherry_pick",
+            Self::Reset { mode, .. } => match mode {
+                ResetMode::Soft => "reset_soft",
+                ResetMode::Mixed => "reset_mixed",
+                ResetMode::Hard => "reset_hard",
+            },
         }
     }
 }
@@ -200,6 +209,7 @@ impl GitExecutor for CliGitExecutor {
             GitCommand::UnstagePaths { paths } => unstage_paths(cwd, paths.clone()),
             GitCommand::Commit { message } => create_commit(cwd, message.clone()),
             GitCommand::CherryPick { commits } => cherry_pick_safely(cwd, commits.clone()),
+            GitCommand::Reset { target, mode } => reset(cwd, target.clone(), *mode),
         }
     }
 }
@@ -570,6 +580,26 @@ fn create_commit(cwd: &Path, message: String) -> Result<ParsedGitPayload, GitFai
     )?;
     Ok(ParsedGitPayload::CommandSucceeded {
         message: "Commit created".into(),
+    })
+}
+
+fn reset(cwd: &Path, target: CommitHash, mode: ResetMode) -> Result<ParsedGitPayload, GitFailure> {
+    if target.0.trim().is_empty() {
+        return Err(GitFailure::new(
+            format!("git reset {} <commit>", mode.flag()),
+            "Reset target cannot be empty",
+        ));
+    }
+    run_git(
+        cwd,
+        [
+            OsString::from("reset"),
+            OsString::from(mode.flag()),
+            OsString::from(target.0),
+        ],
+    )?;
+    Ok(ParsedGitPayload::CommandSucceeded {
+        message: format!("Reset completed ({})", mode.flag()),
     })
 }
 

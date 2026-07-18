@@ -48,4 +48,5 @@ pitui-git.workspace = true
 pitui-tui.workspace = true
 
 [dev-dependencies]
+pitui-core.workspace = true
 tempfile.workspace = true

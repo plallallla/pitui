@@ -8,8 +8,8 @@ use pitui_data::{
     DatasetIdentity, DatasetKey, DatasetKind, DatasetSelection, DatasetType, DatasetViewId,
     DatasetViewState, FieldId, GitOperationLogEntryMetadata, GitOperationStatus,
     InteractionContextKind, InteractionContextMetadata, KeyCode, KeyModifiers, KeyStroke,
-    PendingChordState, ReflogEntryMetadata, RenderContentProjection, RepositoryMetadata,
-    ResolvedKeyAction, ResolvedOperationSet, UiFrame, UiLayoutProjection,
+    OperationId, PendingChordState, ReflogEntryMetadata, RenderContentProjection,
+    RepositoryMetadata, ResolvedKeyAction, ResolvedOperationSet, UiFrame, UiLayoutProjection,
 };
 use pitui_ecs::{
     ClipboardRequests, GitExecutionFailures, GitMutationSuccesses, OperationExecution,
@@ -1837,6 +1837,175 @@ fn changes_multiselects_groups_and_directories_then_mutates_all_descendant_files
 }
 
 #[test]
+fn hard_reset_requires_confirmation_before_mutating_head_and_the_worktree() {
+    let repository = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.name", "Pitui Test"]);
+    git(&["config", "user.email", "pitui@example.invalid"]);
+    fs::write(repository.path().join("file.txt"), "base\n").unwrap();
+    git(&["add", "file.txt"]);
+    git(&["commit", "-m", "base"]);
+    let base = pitui_core::CommitHash(git(&["rev-parse", "HEAD"]));
+    fs::write(repository.path().join("file.txt"), "second\n").unwrap();
+    git(&["commit", "-am", "second"]);
+    let second = git(&["rev-parse", "HEAD"]);
+    fs::write(repository.path().join("file.txt"), "dirty\n").unwrap();
+    fs::write(repository.path().join("untracked.txt"), "keep me\n").unwrap();
+
+    let mut app = App::open_from(repository.path(), Vec::new()).unwrap();
+    let repository_entity = app.repositories()[0];
+    let repository_key = match &app
+        .runtime()
+        .world()
+        .get::<DatasetKey>(repository_entity)
+        .unwrap()
+        .0
+    {
+        DatasetIdentity::Repository(repository) => repository.clone(),
+        identity => panic!("expected Repository identity, got {identity:?}"),
+    };
+    let (commits, target) = {
+        let index = app.runtime().world().resource::<DatasetIndex>();
+        (
+            index
+                .get(&DatasetIdentity::Commits {
+                    repository: repository_key.clone(),
+                    branch: pitui_core::BranchName("main".into()),
+                })
+                .unwrap(),
+            index
+                .get(&DatasetIdentity::Commit {
+                    repository: repository_key,
+                    hash: base.clone(),
+                })
+                .unwrap(),
+        )
+    };
+    app.runtime_mut()
+        .set_active_element(commits, Some(target))
+        .unwrap();
+    let bindings = app
+        .runtime()
+        .world()
+        .resource::<ActiveUiContext>()
+        .render_bindings
+        .clone();
+    app.runtime_mut()
+        .replace_context_from_mode(
+            commits,
+            RenderModeId::from("history"),
+            bindings,
+            ResolvedOperationSet::default(),
+        )
+        .unwrap();
+    app.runtime_mut().run_schedule();
+
+    let reset_prefix = KeyStroke::control('x');
+    assert!(matches!(
+        app.runtime()
+            .world()
+            .resource::<ResolvedOperationSet>()
+            .key_bindings
+            .get(&reset_prefix)
+            .map(|binding| &binding.action),
+        Some(ResolvedKeyAction::EnterChord(_))
+    ));
+    app.dispatch_input(InputIntent::Key(reset_prefix.clone()));
+    assert_eq!(
+        app.runtime()
+            .world()
+            .resource::<ResolvedOperationSet>()
+            .key_bindings
+            .keys()
+            .filter_map(|stroke| match stroke.code {
+                KeyCode::Character(character) => Some(character),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from(['s', 'm', 'h'])
+    );
+    app.dispatch_input(InputIntent::Key(KeyStroke::character('h')));
+    assert_eq!(git(&["rev-parse", "HEAD"]), second);
+    assert_eq!(
+        fs::read_to_string(repository.path().join("file.txt")).unwrap(),
+        "dirty\n"
+    );
+    let interaction = app
+        .runtime()
+        .world()
+        .resource::<DatasetIndex>()
+        .get(&DatasetIdentity::GlobalInteractionContext)
+        .unwrap();
+    let metadata = app
+        .runtime()
+        .world()
+        .get::<InteractionContextMetadata>(interaction)
+        .unwrap();
+    assert!(matches!(
+        &metadata.kind,
+        InteractionContextKind::Confirmation {
+            selected: 0,
+            pending,
+            ..
+        } if pending.operation == OperationId::from("reset.hard.confirmed")
+    ));
+
+    // Enter on the default safe option cancels without executing the pending
+    // destructive Operation.
+    app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Enter)));
+    app.runtime_mut().run_schedule();
+    assert_eq!(git(&["rev-parse", "HEAD"]), second);
+    assert_eq!(
+        fs::read_to_string(repository.path().join("file.txt")).unwrap(),
+        "dirty\n"
+    );
+
+    app.dispatch_input(InputIntent::Key(reset_prefix));
+    app.dispatch_input(InputIntent::Key(KeyStroke::character('h')));
+    app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Down)));
+    app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Enter)));
+    // Confirmation first pops the overlay; the pending Reset invocation is
+    // released only on the following Schedule.
+    assert_eq!(git(&["rev-parse", "HEAD"]), second);
+    app.runtime_mut().run_schedule();
+    assert_eq!(git(&["rev-parse", "HEAD"]), base.0);
+    assert_eq!(
+        fs::read_to_string(repository.path().join("file.txt")).unwrap(),
+        "base\n"
+    );
+    assert_eq!(git(&["status", "--porcelain=v1"]), "?? untracked.txt");
+    assert!(
+        app.runtime()
+            .world()
+            .resource::<GitMutationSuccesses>()
+            .0
+            .iter()
+            .any(|success| matches!(
+                success.command,
+                GitCommand::Reset {
+                    mode: pitui_core::ResetMode::Hard,
+                    ..
+                }
+            ))
+    );
+    assert!(app.runtime_mut().validate().is_empty());
+}
+
+#[test]
 fn failed_commit_restores_changes_then_opens_a_redacted_notice_context() {
     let repository = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
@@ -2228,6 +2397,7 @@ fn reflog_command_opens_a_data_backed_context_and_copies_the_current_hash() {
             .output()
             .unwrap();
         assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
     };
     git(&["init", "-b", "main"]);
     git(&["config", "user.name", "Pitui Test"]);
@@ -2316,6 +2486,25 @@ fn reflog_command_opens_a_data_backed_context_and_copies_the_current_hash() {
             .get(&RenderBindingId::CurrentReflogEntry),
         Some(first),
         "changing the active Reflog element must refresh detail without stealing Active ownership"
+    );
+    let reset_target = app
+        .runtime()
+        .world()
+        .get::<DatasetActiveElement>(reflog)
+        .unwrap()
+        .0
+        .and_then(|entry| app.runtime().world().get::<ReflogEntryMetadata>(entry))
+        .unwrap()
+        .0
+        .hash
+        .clone();
+    app.dispatch_input(InputIntent::Key(KeyStroke::control('x')));
+    app.dispatch_input(InputIntent::Key(KeyStroke::character('s')));
+    assert_eq!(git(&["rev-parse", "HEAD"]), reset_target.0);
+    assert_eq!(
+        git(&["diff", "--cached", "--name-only"]),
+        "file.txt",
+        "soft reset from Reflog must move HEAD while preserving the index"
     );
     app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Escape)));
     assert_eq!(

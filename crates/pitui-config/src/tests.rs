@@ -209,7 +209,44 @@ fn cherry_pick_is_a_selection_only_commits_operation_not_a_global_operation() {
         operation.availability,
         AvailabilityRuleId::from("has-selection")
     );
-    assert!(operation.bindings.is_empty());
+    let commits = builtin_dataset_templates()
+        .into_iter()
+        .find(|template| template.kind == DatasetKind::Commits)
+        .unwrap();
+    assert!(commits.hotkeys.bindings_for(&operation_id).is_empty());
+}
+
+#[test]
+fn reset_is_compiled_behavior_with_dataset_owned_hotkey_tables() {
+    let templates = builtin_dataset_templates()
+        .into_iter()
+        .map(|template| (template.kind, template))
+        .collect::<std::collections::HashMap<_, _>>();
+    let global = builtin_global_operation_set();
+
+    for (operation, suffix) in [
+        (OperationId::from("reset.soft"), 's'),
+        (OperationId::from("reset.mixed"), 'm'),
+        (OperationId::from("reset.hard"), 'h'),
+    ] {
+        assert!(!global.operations.contains(&operation));
+        let expected = [KeySequence::chord([
+            KeyStroke::control('x'),
+            KeyStroke::character(suffix),
+        ])];
+        for kind in [DatasetKind::Commits, DatasetKind::Reflog] {
+            let template = &templates[&kind];
+            assert!(template.operations.contains(&operation));
+            assert_eq!(template.hotkeys.bindings_for(&operation), expected);
+        }
+    }
+
+    let hard = builtin_operation_specs()
+        .into_iter()
+        .find(|operation| operation.id == OperationId::from("reset.hard"))
+        .unwrap();
+    assert_eq!(hard.command, CommandId::from("reset.hard"));
+    assert_eq!(hard.target_source, TargetSource::ActiveElement);
 }
 
 #[test]
@@ -246,6 +283,7 @@ fn every_effective_dataset_operation_set_is_resolvable_and_unambiguous() {
             vec![
                 Some(InteractionContextType::Help),
                 Some(InteractionContextType::CommandPalette),
+                Some(InteractionContextType::Confirmation),
                 Some(InteractionContextType::TextInput),
                 Some(InteractionContextType::Notice),
             ]
@@ -253,25 +291,31 @@ fn every_effective_dataset_operation_set_is_resolvable_and_unambiguous() {
             vec![None]
         };
         for context_type in context_types {
-            let ids = builtin_global_operations()
-                .into_iter()
-                .chain(template.operations.clone())
-                .collect::<Vec<_>>();
-            let sequences = ids
+            let global = builtin_global_operation_set();
+            let candidates = global
+                .operations
                 .iter()
-                .map(|id| {
-                    operations
-                        .get(id)
-                        .unwrap_or_else(|| panic!("missing built-in Operation {}", id.0))
-                })
-                .filter(|operation| {
+                .map(|id| (id, global.hotkeys.bindings_for(id)))
+                .chain(
+                    template
+                        .operations
+                        .iter()
+                        .map(|id| (id, template.hotkeys.bindings_for(id))),
+                )
+                .collect::<Vec<_>>();
+            let sequences = candidates
+                .iter()
+                .filter(|(id, _)| {
+                    let operation = operations
+                        .get(*id)
+                        .unwrap_or_else(|| panic!("missing built-in Operation {}", id.0));
                     availability_can_match(
                         rules.get(&operation.availability).unwrap(),
                         template.kind,
                         context_type,
                     )
                 })
-                .flat_map(|operation| operation.bindings.iter())
+                .flat_map(|(_, bindings)| bindings.iter())
                 .collect::<Vec<_>>();
             assert_eq!(
                 sequences.iter().copied().collect::<HashSet<_>>().len(),
@@ -326,10 +370,12 @@ fn availability_can_match(
 
 #[test]
 fn default_profile_has_wasd_arrows_and_keeps_control_space_unbound() {
-    let operations = builtin_operation_specs();
-    let all_strokes = operations
-        .iter()
-        .flat_map(|operation| &operation.bindings)
+    let global = builtin_global_operation_set();
+    let templates = builtin_dataset_templates();
+    let all_strokes = std::iter::once(&global.hotkeys)
+        .chain(templates.iter().map(|template| &template.hotkeys))
+        .flat_map(|table| &table.0)
+        .flat_map(|entry| &entry.bindings)
         .flat_map(|sequence| &sequence.0)
         .collect::<HashSet<_>>();
     for stroke in [

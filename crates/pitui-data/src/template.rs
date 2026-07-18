@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use bevy_ecs::prelude::Resource;
 
-use crate::DatasetKind;
+use crate::{DatasetKind, OperationHotkeyTable};
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -125,6 +125,10 @@ pub struct DatasetTemplate {
     /// collection plus the RenderMode-selected Proxy.
     pub views: Vec<DatasetViewSpec>,
     pub operations: Vec<OperationId>,
+    /// Dataset-local shortcut table for the Operation Set above. An Operation
+    /// without an entry remains available to the command palette but has no
+    /// keyboard binding in this Dataset.
+    pub hotkeys: OperationHotkeyTable,
     pub render_proxies: Vec<RenderProxyId>,
 }
 

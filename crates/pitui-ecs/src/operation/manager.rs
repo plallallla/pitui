@@ -101,6 +101,22 @@ pub fn register_builtin_operation_systems(
         "interaction.palette.submit",
         super::systems::submit_palette_command
     );
+    register!(
+        "interaction.confirmation.up",
+        super::systems::confirmation_up
+    );
+    register!(
+        "interaction.confirmation.down",
+        super::systems::confirmation_down
+    );
+    register!(
+        "interaction.confirmation.submit",
+        super::systems::submit_confirmation
+    );
+    register!(
+        "interaction.confirmation.close",
+        super::systems::close_interaction
+    );
     register!("interaction.text.close", super::systems::close_interaction);
     register!("interaction.text.submit", super::systems::submit_text_input);
     register!(
@@ -123,6 +139,10 @@ pub fn register_builtin_operation_systems(
         super::systems::cycle_collection_view
     );
     register!("commits.cherry-pick", super::systems::cherry_pick_selected);
+    register!("reset.soft", super::systems::reset_soft);
+    register!("reset.mixed", super::systems::reset_mixed);
+    register!("reset.hard", super::systems::request_hard_reset);
+    register!("reset.hard.confirmed", super::systems::reset_hard_confirmed);
     register!(
         "changes.selection.toggle",
         super::systems::toggle_changes_selection

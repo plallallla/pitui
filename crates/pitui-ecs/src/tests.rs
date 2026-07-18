@@ -35,6 +35,7 @@ fn register(runtime: &mut DatasetRuntime, id: &str, kind: DatasetKind) -> Datase
             collection,
             views: Vec::new(),
             operations: Vec::new(),
+            hotkeys: Default::default(),
             render_proxies: vec![RenderProxyId::from("test")],
         })
         .unwrap();
@@ -571,6 +572,7 @@ fn registration_contracts_reject_dangling_proxy_and_operation_system_references(
             collection: pitui_data::CollectionManagerSpec::default(),
             views: Vec::new(),
             operations: vec![operation_id.clone()],
+            hotkeys: Default::default(),
             render_proxies: vec![RenderProxyId::from("missing.proxy")],
         })
         .unwrap();
@@ -589,7 +591,6 @@ fn registration_contracts_reject_dangling_proxy_and_operation_system_references(
             id: operation_id.clone(),
             label: "missing-system".into(),
             command: CommandId::from("missing-system"),
-            bindings: Vec::new(),
             target_source: pitui_data::TargetSource::None,
             availability: AvailabilityRuleId::from("always"),
         })

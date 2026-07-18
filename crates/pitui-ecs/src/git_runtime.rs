@@ -632,7 +632,8 @@ fn apply_payload(
             GitCommand::StagePaths { .. }
             | GitCommand::UnstagePaths { .. }
             | GitCommand::Commit { .. }
-            | GitCommand::CherryPick { .. },
+            | GitCommand::CherryPick { .. }
+            | GitCommand::Reset { .. },
             ParsedGitPayload::CommandSucceeded { message },
         ) => {
             world

@@ -157,7 +157,8 @@ impl App {
                 .register_operation(operation)
                 .map_err(|error| AppError::BuiltinInteraction(format!("{error:?}")))?;
         }
-        runtime.set_global_operations(pitui_config::builtin_global_operations());
+        let global_operations = pitui_config::builtin_global_operation_set();
+        runtime.set_global_operation_set(global_operations.operations, global_operations.hotkeys);
         runtime.set_active_handoffs(pitui_config::builtin_active_handoffs());
         runtime
             .register_builtin_operation_systems()

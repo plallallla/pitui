@@ -2,9 +2,10 @@ use bevy_ecs::prelude::{In, Resource};
 use pitui_data::{
     AvailabilityRule, AvailabilityRuleId, CommandId, CommandScope, CommandSpec, DatasetIdentity,
     DatasetKind, DatasetTemplate, DatasetTemplateId, InputIntent, InvocationSource, KeyCode,
-    KeySequence, KeyStroke, LayoutConstraint, OperationId, OperationInvocation, OperationNotice,
-    OperationSpec, RenderContextBindings, RenderModeId, RenderProxyId, ResolvedKeyAction,
-    ResolvedOperationSet, ResolvedRenderLayout, TargetSource,
+    KeySequence, KeyStroke, LayoutConstraint, OperationHotkeyBinding, OperationHotkeyTable,
+    OperationId, OperationInvocation, OperationNotice, OperationSpec, RenderContextBindings,
+    RenderModeId, RenderProxyId, ResolvedKeyAction, ResolvedOperationSet, ResolvedRenderLayout,
+    TargetSource,
 };
 use pitui_ecs::{
     DatasetRuntime, OperationExecution, OperationExecutionLog, OperationNotices,
@@ -16,6 +17,7 @@ fn register_template(
     id: &str,
     kind: DatasetKind,
     operations: Vec<OperationId>,
+    hotkeys: OperationHotkeyTable,
 ) -> DatasetTemplateId {
     let id = DatasetTemplateId::from(id);
     runtime
@@ -25,6 +27,7 @@ fn register_template(
             collection: pitui_data::CollectionManagerSpec::default(),
             views: Vec::new(),
             operations,
+            hotkeys,
             render_proxies: vec![RenderProxyId::from("test")],
         })
         .unwrap();
@@ -39,15 +42,30 @@ fn command(id: &str, name: &str, scope: CommandScope) -> CommandSpec {
     }
 }
 
-fn operation(id: &str, command: &str, key: char, target_source: TargetSource) -> OperationSpec {
+fn operation(id: &str, command: &str, target_source: TargetSource) -> OperationSpec {
     OperationSpec {
         id: OperationId::from(id),
         label: id.into(),
         command: CommandId::from(command),
-        bindings: vec![KeySequence::single(KeyStroke::character(key))],
         target_source,
         availability: AvailabilityRuleId::from("always"),
     }
+}
+
+fn hotkeys(entries: impl IntoIterator<Item = (OperationId, KeySequence)>) -> OperationHotkeyTable {
+    OperationHotkeyTable(
+        entries
+            .into_iter()
+            .map(|(operation, binding)| OperationHotkeyBinding {
+                operation,
+                bindings: vec![binding],
+            })
+            .collect(),
+    )
+}
+
+fn key(character: char) -> KeySequence {
+    KeySequence::single(KeyStroke::character(character))
 }
 
 fn initialize_single_panel(runtime: &mut DatasetRuntime, dataset: bevy_ecs::prelude::Entity) {
@@ -76,6 +94,7 @@ fn global_command_name_wins_while_duplicate_keys_fail_resolution() {
         "repository",
         DatasetKind::Repository,
         vec![local_id.clone()],
+        hotkeys([(local_id.clone(), key('l'))]),
     );
     runtime
         .register_availability_rule(AvailabilityRuleId::from("always"), AvailabilityRule::Always)
@@ -86,11 +105,14 @@ fn global_command_name_wins_while_duplicate_keys_fail_resolution() {
     runtime
         .register_command(command("local.command", "same", CommandScope::Dataset))
         .unwrap();
-    let global = operation("global.same", "global.command", 'g', TargetSource::None);
-    let local = operation("local.same", "local.command", 'l', TargetSource::None);
+    let global = operation("global.same", "global.command", TargetSource::None);
+    let local = operation("local.same", "local.command", TargetSource::None);
     runtime.register_operation(global.clone()).unwrap();
     runtime.register_operation(local).unwrap();
-    runtime.set_global_operations(vec![global.id.clone()]);
+    runtime.set_global_operation_set(
+        vec![global.id.clone()],
+        hotkeys([(global.id.clone(), key('g'))]),
+    );
     let dataset = runtime
         .ensure_dataset(
             DatasetIdentity::Repository(pitui_data::RepositoryKey::new("/repo")),
@@ -125,7 +147,7 @@ fn global_command_name_wins_while_duplicate_keys_fail_resolution() {
             .is_none()
     );
 
-    let conflicting = operation("local.conflict", "local.command", 'g', TargetSource::None);
+    let conflicting = operation("local.conflict", "local.command", TargetSource::None);
     runtime.register_operation(conflicting.clone()).unwrap();
     let template_id = runtime
         .world()
@@ -133,13 +155,14 @@ fn global_command_name_wins_while_duplicate_keys_fail_resolution() {
         .unwrap()
         .0
         .clone();
-    runtime
-        .world_mut()
-        .resource_mut::<pitui_data::DatasetTemplateRegistry>()
-        .templates
-        .get_mut(&template_id)
-        .unwrap()
-        .operations = vec![conflicting.id];
+    {
+        let mut templates = runtime
+            .world_mut()
+            .resource_mut::<pitui_data::DatasetTemplateRegistry>();
+        let template = templates.templates.get_mut(&template_id).unwrap();
+        template.operations = vec![conflicting.id.clone()];
+        template.hotkeys = hotkeys([(conflicting.id, key('g'))]);
+    }
     // Give the conflicting local command a distinct name so global name
     // priority no longer removes it before key validation.
     runtime
@@ -209,12 +232,14 @@ fn active_dataset_operation_set_dispatches_only_its_directly_registered_system()
         "first",
         DatasetKind::Repository,
         vec![first_operation.clone()],
+        hotkeys([(first_operation.clone(), key('x'))]),
     );
     let second_template = register_template(
         &mut runtime,
         "second",
         DatasetKind::Commits,
         vec![second_operation.clone()],
+        hotkeys([(second_operation.clone(), key('x'))]),
     );
     runtime
         .register_availability_rule(AvailabilityRuleId::from("always"), AvailabilityRule::Always)
@@ -228,7 +253,6 @@ fn active_dataset_operation_set_dispatches_only_its_directly_registered_system()
                 id: operation_id.clone(),
                 label: operation_id.0.clone(),
                 command: CommandId::from("run"),
-                bindings: vec![KeySequence::single(KeyStroke::character('x'))],
                 target_source: TargetSource::ActiveDataset,
                 availability: AvailabilityRuleId::from("always"),
             })
@@ -335,9 +359,15 @@ fn command_palette_and_key_input_emit_the_same_ordered_invocation_data() {
         "commits",
         DatasetKind::Commits,
         vec![operation_id.clone()],
+        hotkeys([(operation_id.clone(), key('x'))]),
     );
-    let commit_template =
-        register_template(&mut runtime, "commit", DatasetKind::Commit, Vec::new());
+    let commit_template = register_template(
+        &mut runtime,
+        "commit",
+        DatasetKind::Commit,
+        Vec::new(),
+        OperationHotkeyTable::default(),
+    );
     runtime
         .register_availability_rule(AvailabilityRuleId::from("always"), AvailabilityRule::Always)
         .unwrap();
@@ -348,7 +378,6 @@ fn command_palette_and_key_input_emit_the_same_ordered_invocation_data() {
         .register_operation(operation(
             "capture.selection",
             "capture",
-            'x',
             TargetSource::Selection,
         ))
         .unwrap();
@@ -443,6 +472,16 @@ fn a_chord_prefix_replaces_the_single_active_key_map() {
         "commits",
         DatasetKind::Commits,
         operations.to_vec(),
+        hotkeys([
+            (
+                operations[0].clone(),
+                KeySequence::chord([KeyStroke::control('c'), KeyStroke::character('h')]),
+            ),
+            (
+                operations[1].clone(),
+                KeySequence::chord([KeyStroke::control('c'), KeyStroke::character('i')]),
+            ),
+        ]),
     );
     runtime
         .register_availability_rule(AvailabilityRuleId::from("always"), AvailabilityRule::Always)
@@ -452,16 +491,12 @@ fn a_chord_prefix_replaces_the_single_active_key_map() {
             .register_command(command(id, name, CommandScope::Dataset))
             .unwrap();
     }
-    for (id, command, suffix) in [("copy.hash", "hash", 'h'), ("copy.info", "info", 'i')] {
+    for (id, command) in [("copy.hash", "hash"), ("copy.info", "info")] {
         runtime
             .register_operation(OperationSpec {
                 id: OperationId::from(id),
                 label: id.into(),
                 command: CommandId::from(command),
-                bindings: vec![KeySequence::chord([
-                    KeyStroke::control('c'),
-                    KeyStroke::character(suffix),
-                ])],
                 target_source: TargetSource::None,
                 availability: AvailabilityRuleId::from("always"),
             })

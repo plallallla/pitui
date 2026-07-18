@@ -1,6 +1,6 @@
 use std::{fs, path::Path, process::Command};
 
-use pitui_core::{CommitHash, GitPath};
+use pitui_core::{CommitHash, GitPath, ResetMode};
 use pitui_git::{CliGitExecutor, GitCommand, GitExecutor, ParsedGitPayload};
 
 fn git(cwd: &Path, args: &[&str]) -> String {
@@ -126,6 +126,87 @@ fn commit_rejects_an_empty_message_without_mutating_the_repository() {
         git(repository.path(), &["status", "--porcelain=v1"])
             .lines()
             .any(|line| line == "A  file.txt")
+    );
+}
+
+#[test]
+fn reset_modes_preserve_the_expected_head_index_and_worktree_boundaries() {
+    let repository = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-b", "main"]);
+    git(repository.path(), &["config", "user.name", "Pitui Test"]);
+    git(
+        repository.path(),
+        &["config", "user.email", "pitui@example.invalid"],
+    );
+    fs::write(repository.path().join("file.txt"), "base\n").unwrap();
+    git(repository.path(), &["add", "file.txt"]);
+    git(repository.path(), &["commit", "-m", "base"]);
+    let base = CommitHash(git(repository.path(), &["rev-parse", "HEAD"]));
+    fs::write(repository.path().join("file.txt"), "second\n").unwrap();
+    fs::write(repository.path().join("second.txt"), "tracked by second\n").unwrap();
+    git(repository.path(), &["add", "."]);
+    git(repository.path(), &["commit", "-m", "second"]);
+    let second = CommitHash(git(repository.path(), &["rev-parse", "HEAD"]));
+    fs::write(repository.path().join("outside.txt"), "untracked\n").unwrap();
+
+    let executor = CliGitExecutor;
+    executor
+        .execute(
+            repository.path(),
+            &GitCommand::Reset {
+                target: base.clone(),
+                mode: ResetMode::Soft,
+            },
+        )
+        .unwrap();
+    assert_eq!(git(repository.path(), &["rev-parse", "HEAD"]), base.0);
+    assert_eq!(
+        git(repository.path(), &["diff", "--cached", "--name-only"]),
+        "file.txt\nsecond.txt"
+    );
+    assert!(git(repository.path(), &["diff", "--name-only"]).is_empty());
+
+    executor
+        .execute(
+            repository.path(),
+            &GitCommand::Reset {
+                target: second.clone(),
+                mode: ResetMode::Hard,
+            },
+        )
+        .unwrap();
+    executor
+        .execute(
+            repository.path(),
+            &GitCommand::Reset {
+                target: base.clone(),
+                mode: ResetMode::Mixed,
+            },
+        )
+        .unwrap();
+    assert_eq!(git(repository.path(), &["rev-parse", "HEAD"]), base.0);
+    assert!(git(repository.path(), &["diff", "--cached", "--name-only"]).is_empty());
+    let status = git(repository.path(), &["status", "--porcelain=v1"]);
+    assert!(status.lines().any(|line| line.trim_start() == "M file.txt"));
+    assert!(status.lines().any(|line| line == "?? second.txt"));
+
+    executor
+        .execute(
+            repository.path(),
+            &GitCommand::Reset {
+                target: second.clone(),
+                mode: ResetMode::Hard,
+            },
+        )
+        .unwrap();
+    assert_eq!(git(repository.path(), &["rev-parse", "HEAD"]), second.0);
+    assert_eq!(
+        fs::read_to_string(repository.path().join("file.txt")).unwrap(),
+        "second\n"
+    );
+    assert_eq!(
+        git(repository.path(), &["status", "--porcelain=v1"]),
+        "?? outside.txt"
     );
 }
 

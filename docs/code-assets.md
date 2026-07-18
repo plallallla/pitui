@@ -9,7 +9,7 @@
 | `src/` | 正式 `pitui` composition root、binary 与端到端测试 | 所有内部边界 crate |
 | `crates/pitui-core/` | 纯 Git 值类型与 Diff 算法 | 标准库 |
 | `crates/pitui-data/` | Dataset、Context、Operation、Render 的 ECS 数据协议 | `pitui-core`、`bevy_ecs` |
-| `crates/pitui-config/` | 内置 Template、Proxy、Mode、Command、Operation 和日志配置 | `pitui-data` |
+| `crates/pitui-config/` | 编译期 Template、Proxy、Mode、Command、Operation、Dataset Hotkey 表和日志默认值 | `pitui-data` |
 | `crates/pitui-git/` | Git parser、typed executor 与持久日志 | `pitui-core` |
 | `crates/pitui-ecs/` | Dataset runtime、Schedule、Systems、Reconcile、Projection | core/data/git、`bevy_ecs` |
 | `crates/pitui-tui/` | terminal/input/render adapter | core/data、crossterm、ratatui |
@@ -52,7 +52,7 @@ pitui-git -> pitui-core
 | `src/metadata.rs` | 每种语义 Dataset 的 typed metadata components，包括 CommitField 值和文件树目录路径 |
 | `src/template.rs` | Template、Dataset View、List/Tree Collection Manager 规格及稳定 ID/Registry；保留未来 Table 扩展边界 |
 | `src/context.rs` | Active Context、render bindings、context stack、overlay/text/help 数据 |
-| `src/operation.rs` | 快捷键、Operation、Command、可用性、Invocation 和 Clipboard 数据 |
+| `src/operation.rs` | Dataset/全局 Hotkey 表、Operation、Command、可用性、Invocation 和 Clipboard 数据 |
 | `src/render.rs` | Render Proxy/Mode/Layout、PathTree 行协议与不可变 `UiFrame` projection 数据 |
 | `src/lib.rs` | 公共导出 |
 
@@ -60,7 +60,7 @@ pitui-git -> pitui-core
 
 | 文件 | 职责 |
 |---|---|
-| `src/lib.rs` | 所有内置 Dataset Template、Proxy、Mode、Operation、Command 与日志默认值 |
+| `src/lib.rs` | 所有编译期 Dataset Template、Proxy、Mode、Operation、Command、每 Dataset Hotkey 表与日志默认值 |
 | `src/tests.rs` | 跨 Registry 严格契约、绑定冲突和语义归属测试 |
 
 ### `pitui-git`
@@ -71,7 +71,7 @@ pitui-git -> pitui-core
 | `src/parser.rs` | Git 字节输出到 `pitui-core` 数据的唯一 parser |
 | `src/logging.rs` | JSONL operation log、滚动、flush、截断和脱敏 |
 | `tests/read_executor.rs` | 真实临时仓库读取测试 |
-| `tests/write_executor.rs` | stage/unstage/commit/cherry-pick 与冲突 abort 测试 |
+| `tests/write_executor.rs` | stage/unstage/commit/reset/cherry-pick 与冲突 abort 测试 |
 
 ### `pitui-ecs`
 

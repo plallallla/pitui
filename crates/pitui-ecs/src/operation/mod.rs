@@ -20,6 +20,7 @@ use bevy_ecs::{
     },
     system::SystemId,
 };
+use pitui_core::{CommitHash, ResetMode};
 use pitui_data::{
     ActiveDirection, ActiveHandoffRegistry, ActiveHandoffTarget, ActiveRenderMode, ActiveUiContext,
     AvailabilityRule, AvailabilityRuleId, AvailabilityRuleRegistry, ChangeBoundary,

@@ -19,11 +19,12 @@ use pitui_data::{
     DatasetCollection, DatasetIdentity, DatasetIndex, DatasetKey, DatasetKind, DatasetRevision,
     DatasetRoots, DatasetSelection, DatasetTemplate, DatasetTemplateId, DatasetTemplateRef,
     DatasetTemplateRegistry, DatasetType, DatasetViewId, DatasetViewState, DefaultDatasetTemplates,
-    GlobalOperationSet, HasSnapshot, InputIntent, OperationId, OperationInvocation,
-    OperationRegistry, OperationRegistryError, OperationSpec, PendingChordState, QuitRequested,
-    RenderContextBindings, RenderLayout, RenderModeId, RenderModeRegistry, RenderModeSpec,
-    RenderProxyId, RenderProxyRegistry, RenderProxySpec, RenderRegistryError, ResolvedOperationSet,
-    ResolvedRenderLayout, UiContextSnapshot, UiFrame, ViewportMeasurement,
+    GlobalOperationSet, HasSnapshot, InputIntent, OperationHotkeyTable, OperationId,
+    OperationInvocation, OperationRegistry, OperationRegistryError, OperationSpec,
+    PendingChordState, QuitRequested, RenderContextBindings, RenderLayout, RenderModeId,
+    RenderModeRegistry, RenderModeSpec, RenderProxyId, RenderProxyRegistry, RenderProxySpec,
+    RenderRegistryError, ResolvedOperationSet, ResolvedRenderLayout, UiContextSnapshot, UiFrame,
+    ViewportMeasurement,
 };
 
 mod binding_reconcile;
@@ -144,6 +145,18 @@ pub enum RegistrationContractError {
         template: DatasetTemplateId,
         operation: OperationId,
     },
+    DuplicateTemplateHotkey {
+        template: DatasetTemplateId,
+        operation: OperationId,
+    },
+    TemplateHotkeyOperationNotDeclared {
+        template: DatasetTemplateId,
+        operation: OperationId,
+    },
+    EmptyTemplateHotkeySequence {
+        template: DatasetTemplateId,
+        operation: OperationId,
+    },
     DuplicateTemplateProxy {
         template: DatasetTemplateId,
         proxy: RenderProxyId,
@@ -185,6 +198,9 @@ pub enum RegistrationContractError {
     },
     MissingGlobalOperation(OperationId),
     DuplicateGlobalOperation(OperationId),
+    DuplicateGlobalHotkey(OperationId),
+    GlobalHotkeyOperationNotDeclared(OperationId),
+    EmptyGlobalHotkeySequence(OperationId),
     OperationMissingCommand {
         operation: OperationId,
         command: CommandId,
@@ -433,8 +449,15 @@ impl DatasetRuntime {
             .register(id, rule)
     }
 
-    pub fn set_global_operations(&mut self, operations: Vec<OperationId>) {
-        self.world.resource_mut::<GlobalOperationSet>().0 = operations;
+    pub fn set_global_operation_set(
+        &mut self,
+        operations: Vec<OperationId>,
+        hotkeys: OperationHotkeyTable,
+    ) {
+        *self.world.resource_mut::<GlobalOperationSet>() = GlobalOperationSet {
+            operations,
+            hotkeys,
+        };
     }
 
     pub fn set_active_handoffs(&mut self, modes: ActiveHandoffRegistry) {
@@ -518,6 +541,29 @@ impl DatasetRuntime {
                     });
                 }
             }
+            let mut seen_hotkeys = HashSet::new();
+            for entry in &template.hotkeys.0 {
+                if !seen_hotkeys.insert(&entry.operation) {
+                    errors.push(RegistrationContractError::DuplicateTemplateHotkey {
+                        template: template.id.clone(),
+                        operation: entry.operation.clone(),
+                    });
+                }
+                if !template.operations.contains(&entry.operation) {
+                    errors.push(
+                        RegistrationContractError::TemplateHotkeyOperationNotDeclared {
+                            template: template.id.clone(),
+                            operation: entry.operation.clone(),
+                        },
+                    );
+                }
+                if entry.bindings.iter().any(|binding| binding.0.is_empty()) {
+                    errors.push(RegistrationContractError::EmptyTemplateHotkeySequence {
+                        template: template.id.clone(),
+                        operation: entry.operation.clone(),
+                    });
+                }
+            }
             let mut seen_proxies = HashSet::new();
             for proxy_id in &template.render_proxies {
                 if !seen_proxies.insert(proxy_id) {
@@ -545,7 +591,7 @@ impl DatasetRuntime {
         }
 
         let mut seen_global = HashSet::new();
-        for operation_id in &global.0 {
+        for operation_id in &global.operations {
             if !seen_global.insert(operation_id) {
                 errors.push(RegistrationContractError::DuplicateGlobalOperation(
                     operation_id.clone(),
@@ -554,6 +600,24 @@ impl DatasetRuntime {
             if operations.get(operation_id).is_none() {
                 errors.push(RegistrationContractError::MissingGlobalOperation(
                     operation_id.clone(),
+                ));
+            }
+        }
+        let mut seen_global_hotkeys = HashSet::new();
+        for entry in &global.hotkeys.0 {
+            if !seen_global_hotkeys.insert(&entry.operation) {
+                errors.push(RegistrationContractError::DuplicateGlobalHotkey(
+                    entry.operation.clone(),
+                ));
+            }
+            if !global.operations.contains(&entry.operation) {
+                errors.push(RegistrationContractError::GlobalHotkeyOperationNotDeclared(
+                    entry.operation.clone(),
+                ));
+            }
+            if entry.bindings.iter().any(|binding| binding.0.is_empty()) {
+                errors.push(RegistrationContractError::EmptyGlobalHotkeySequence(
+                    entry.operation.clone(),
                 ));
             }
         }

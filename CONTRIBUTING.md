@@ -26,8 +26,9 @@ cargo test --workspace --doc
 - `pitui-tui` 只能把终端事件转换为 `InputIntent`，并渲染不可变 `UiFrame`。
 - Input Listener 不得查询 ECS World；快捷键必须由 Operation Executor 在当前 Active Dataset 的
   `ResolvedOperationSet` 缓存中解析。
-- Dataset Template 绑定 `OperationId`，可执行函数只能注册到 `OperationManager`，不得通过 Command 名称、
-  Renderer callback 或输入分支直接调用；Command 仅保存命令面板元数据。
+- Dataset Template 绑定 `OperationId` 及自己的 `OperationHotkeyTable`；可执行函数只能注册到
+  `OperationManager`，不得通过 Command 名称、Renderer callback 或输入分支直接调用；Command 仅保存
+  命令面板元数据，Operation 语义不得内嵌快捷键。
 - 根 `src/` 只负责组合各边界、初始化 World、运行终端循环和端到端验收。
 - 新增 `DatasetKind` 时必须同时补齐默认 Template、Render Proxy、Operation/Command、可用性规则
   和注册契约测试，禁止依靠字符串猜测或 renderer 特判补洞。

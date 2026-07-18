@@ -35,6 +35,7 @@ fn register_default(runtime: &mut DatasetRuntime, id: &str, kind: DatasetKind) {
             collection: pitui_data::CollectionManagerSpec::default(),
             views: Vec::new(),
             operations: Vec::new(),
+            hotkeys: Default::default(),
             render_proxies: Vec::new(),
         })
         .unwrap();

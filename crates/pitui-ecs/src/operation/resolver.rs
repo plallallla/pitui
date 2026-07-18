@@ -70,26 +70,39 @@ fn build_resolved_operation_set(
         ))?
         .0
         .clone();
-    let local = world
+    let template = world
         .resource::<DatasetTemplateRegistry>()
         .get(&template_id)
         .ok_or(OperationResolutionError::MissingDatasetTemplate(
             active_dataset,
-        ))?
+        ))?;
+    let global = world.resource::<GlobalOperationSet>();
+    let mut candidates = global
         .operations
-        .clone();
-    let global = world.resource::<GlobalOperationSet>().0.clone();
-    let global_ids = global.iter().cloned().collect::<HashSet<_>>();
-    let mut candidates = global;
-    candidates.extend(local);
+        .iter()
+        .map(|operation| {
+            (
+                operation.clone(),
+                global.hotkeys.bindings_for(operation).to_vec(),
+                true,
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.extend(template.operations.iter().map(|operation| {
+        (
+            operation.clone(),
+            template.hotkeys.bindings_for(operation).to_vec(),
+            false,
+        )
+    }));
 
     let operation_registry = world.resource::<OperationRegistry>();
     let command_registry = world.resource::<CommandRegistry>();
     let availability_registry = world.resource::<AvailabilityRuleRegistry>();
-    let mut available = Vec::<(OperationSpec, String, bool)>::new();
+    let mut available = Vec::<(OperationSpec, String, bool, Vec<KeySequence>)>::new();
     let mut names = HashMap::<String, (OperationId, bool)>::new();
     let mut seen_operations = HashSet::new();
-    for operation_id in candidates {
+    for (operation_id, bindings, is_global) in candidates {
         if !seen_operations.insert(operation_id.clone()) {
             continue;
         }
@@ -108,7 +121,6 @@ fn build_resolved_operation_set(
         if !availability_matches(world, active_dataset, rule) {
             continue;
         }
-        let is_global = global_ids.contains(&operation_id);
         let name = command.name.to_ascii_lowercase();
         if let Some((_, existing_is_global)) = names.get(&name) {
             if *existing_is_global && !is_global {
@@ -117,14 +129,14 @@ fn build_resolved_operation_set(
             return Err(OperationResolutionError::DuplicateCommandName(name));
         }
         names.insert(name.clone(), (operation_id, is_global));
-        available.push((operation, name, is_global));
+        available.push((operation, name, is_global, bindings));
     }
 
     validate_key_sequences(&available)?;
     let prefix = &world.resource::<PendingChordState>().prefix;
     let mut key_bindings = HashMap::<pitui_data::KeyStroke, ResolvedKeyBinding>::new();
-    for (operation, _, _) in &available {
-        for sequence in &operation.bindings {
+    for (operation, _, _, bindings) in &available {
+        for sequence in bindings {
             if !sequence.0.starts_with(prefix) || sequence.0.len() <= prefix.len() {
                 continue;
             }
@@ -158,14 +170,14 @@ fn build_resolved_operation_set(
     let commands = if prefix.is_empty() {
         available
             .iter()
-            .map(|(operation, name, _)| (name.clone(), operation.id.clone()))
+            .map(|(operation, name, _, _)| (name.clone(), operation.id.clone()))
             .collect()
     } else {
         HashMap::new()
     };
     let operations = available
         .into_iter()
-        .map(|(operation, _, _)| ResolvedOperation {
+        .map(|(operation, _, _, _)| ResolvedOperation {
             id: operation.id,
             label: operation.label,
             command: operation.command,
@@ -186,11 +198,11 @@ fn build_resolved_operation_set(
 }
 
 fn validate_key_sequences(
-    operations: &[(OperationSpec, String, bool)],
+    operations: &[(OperationSpec, String, bool, Vec<KeySequence>)],
 ) -> Result<(), OperationResolutionError> {
     let mut sequences = Vec::<(KeySequence, OperationId)>::new();
-    for (operation, _, _) in operations {
-        for sequence in &operation.bindings {
+    for (operation, _, _, bindings) in operations {
+        for sequence in bindings {
             if let Some((_, first)) = sequences.iter().find(|(existing, _)| existing == sequence) {
                 return Err(OperationResolutionError::DuplicateKeySequence {
                     sequence: sequence.clone(),

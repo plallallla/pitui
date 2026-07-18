@@ -17,14 +17,18 @@ Pitui 是一个使用 Rust、`bevy_ecs`、ratatui 和 Git CLI 实现的 Data Dri
   选中 `Staged`/`Unstaged` 分组或目录会级联全部后代；stage/unstage 会递归作用于所选范围内的全部
   文件，并可使用 staged 文件创建 commit。
 - 查看 reflog，并复制 reflog hash。
+- 在 Commits 或 Reflog 中对当前条目执行 soft/mixed/hard reset；hard reset 必须经过默认选择
+  `Cancel` 的二次确认，确认后才会产生 Git 写操作。
 - 多选 commits 后安全执行 cherry-pick；冲突时自动尝试 abort。
 - 复制 commit hash/info/message，以及文件名、绝对路径和仓库相对路径。
 - 查看会话 Git 操作日志，并可持久化为自动轮转的 JSONL 日志。
-- 快捷键、底部提示、Help 和 Command Palette 共用当前唯一有效 Operation Set。
+- 每个 Dataset Template 的 Operation Set 拥有独立 Hotkey 表；快捷键、底部提示、Help 和 Command
+  Palette 共用当前唯一有效的解析结果。
 - 只在数据发生变化或终端 resize 时重绘；Git 数据使用 `Ctrl+R` 手动刷新。
 
-当前尚未实现 remote 管理、fetch、pull、push、sync、reset 和 rebase。相关未实现命令会明确拒绝，
-不会静默执行。外部 TOML 配置也尚未接入，当前使用 `pitui-config` 提供的严格内置配置数据。
+当前尚未实现 remote 管理、fetch、pull、push、sync 和 rebase。相关未实现命令会明确拒绝，不会静默执行。
+语义功能使用编译期 Rust 实现；快捷键从 Operation 中分离，由 `pitui-config` 中每个 Dataset 的 Hotkey
+表独立绑定。外部快捷键文件加载尚未接入。
 
 ## 运行
 
@@ -61,6 +65,7 @@ cargo run -- /repo/one /repo/two
 | `Ctrl+C`, `h/i/m` | 复制 commit hash/info/message |
 | `Ctrl+C`, `v` | 在 Commit 详情中复制当前或已选择的字段值 |
 | `Ctrl+C`, `n/a/r` | 复制文件名/绝对路径/相对路径 |
+| `Ctrl+X`, `s/m/h` | 对当前 Commit/Reflog 条目执行 soft/mixed/hard reset |
 | `v` | Files Active 时切换 Tree/List View |
 | `Shift+S` | Stage 选中的 Unstaged 分组、文件或目录（分组/目录递归展开） |
 | `Shift+U` | Unstage 选中的 Staged 分组、文件或目录（分组/目录递归展开） |
@@ -95,8 +100,8 @@ Terminal Event
 - 同一时间只有一个 `ActiveRenderMode` 和一个 `ResolvedOperationSet`。
 - Input Listener 只把终端事件解析为 `InputIntent`；Operation Executor 使用当前 Active Dataset 对应的
   `ResolvedOperationSet` 缓存查询快捷键，未绑定的输入不会进入执行阶段。
-- Dataset Template 绑定 `OperationId`，`OperationManager` 将 `OperationId` 直接映射到 Bevy ECS System；
-  Command 只保留命令面板名称等数据，不参与函数寻址。
+- Dataset Template 绑定 `OperationId` 和独立 Hotkey 表，`OperationManager` 将 `OperationId` 直接映射到
+  编译期 Bevy ECS System；Command 只保留命令面板名称等数据，不参与函数寻址。
 - Dataset Template 同时声明 Collection Manager、可切换 Dataset View、Render Proxy 与 Operation；
   `DatasetViewState` 选择 View，View 决定当前 Manager 和 Proxy，但不修改 Dataset ownership DAG。
 - `TreeManager` 统一管理 Repositories/Branches、Files 和 Changes 的可见节点类型、有序 Element、
@@ -139,6 +144,7 @@ docs/                   当前实现状态和代码资产说明
 - Git 命令使用 argv 调用，不通过 shell 执行。
 - Git 错误和日志进入 UI/持久化前会截断并隐藏 URL 类敏感内容。
 - cherry-pick 前检查工作区状态；发生本次冲突时自动尝试 `git cherry-pick --abort`。
+- hard reset 的确认层默认选中 `Cancel`；只有显式选择 `Reset --hard` 并提交后才释放写操作。
 - stage/unstage 只作用于当前光标或显式选择的 Changes 分组、目录、文件及其后代文件。
 - 所有真实 Git 写操作测试只使用 `tempfile` 创建的临时仓库。
 

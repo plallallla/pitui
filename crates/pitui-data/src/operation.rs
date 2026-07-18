@@ -133,9 +133,29 @@ pub struct OperationSpec {
     pub id: OperationId,
     pub label: String,
     pub command: CommandId,
-    pub bindings: Vec<KeySequence>,
     pub target_source: TargetSource,
     pub availability: AvailabilityRuleId,
+}
+
+/// Configurable key sequences for one Operation inside a specific Operation
+/// Set. Operation functions and semantic metadata remain compiled; only this
+/// table decides which keys invoke them for the active Dataset Template.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationHotkeyBinding {
+    pub operation: OperationId,
+    pub bindings: Vec<KeySequence>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OperationHotkeyTable(pub Vec<OperationHotkeyBinding>);
+
+impl OperationHotkeyTable {
+    pub fn bindings_for(&self, operation: &OperationId) -> &[KeySequence] {
+        self.0
+            .iter()
+            .find(|entry| &entry.operation == operation)
+            .map_or(&[], |entry| entry.bindings.as_slice())
+    }
 }
 
 #[derive(Resource, Clone, Debug, Default)]
@@ -146,14 +166,10 @@ pub struct OperationRegistry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationRegistryError {
     DuplicateOperation(OperationId),
-    EmptyKeySequence(OperationId),
 }
 
 impl OperationRegistry {
     pub fn register(&mut self, spec: OperationSpec) -> Result<(), OperationRegistryError> {
-        if spec.bindings.iter().any(|binding| binding.0.is_empty()) {
-            return Err(OperationRegistryError::EmptyKeySequence(spec.id));
-        }
         if self.operations.contains_key(&spec.id) {
             return Err(OperationRegistryError::DuplicateOperation(spec.id));
         }
@@ -167,7 +183,10 @@ impl OperationRegistry {
 }
 
 #[derive(Resource, Clone, Debug, Default, Eq, PartialEq)]
-pub struct GlobalOperationSet(pub Vec<OperationId>);
+pub struct GlobalOperationSet {
+    pub operations: Vec<OperationId>,
+    pub hotkeys: OperationHotkeyTable,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TargetSource {

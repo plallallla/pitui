@@ -99,7 +99,6 @@ impl PaletteCommandEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TextInputPurpose {
-    HardResetHash,
     RemoteName,
     RemoteUrl,
     Custom(String),

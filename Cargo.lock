@@ -860,6 +860,7 @@ version = "0.1.0"
 dependencies = [
  "bevy_ecs",
  "pitui-config",
+ "pitui-core",
  "pitui-data",
  "pitui-ecs",
  "pitui-git",
