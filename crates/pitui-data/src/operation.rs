@@ -174,23 +174,23 @@ pub struct GlobalOperationSet(pub Vec<OperationId>);
 pub enum TargetSource {
     None,
     ActiveDataset,
-    Cursor,
+    ActiveElement,
     Selection,
-    SelectionOrCursor,
-    ContextCursor(RenderBindingId),
-    ContextSelectionOrCursor(RenderBindingId),
+    SelectionOrActiveElement,
+    ContextActiveElement(RenderBindingId),
+    ContextSelectionOrActiveElement(RenderBindingId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AvailabilityRule {
     Always,
     ActiveDatasetKind(DatasetKind),
-    HasCursor,
+    HasActiveElement,
     HasSelection,
-    HasSelectionOrCursor,
-    ContextHasCursor(RenderBindingId),
-    ContextHasSelectionOrCursor(RenderBindingId),
-    ContextCursorKind(RenderBindingId, DatasetKind),
+    HasSelectionOrActiveElement,
+    ContextHasActiveElement(RenderBindingId),
+    ContextHasSelectionOrActiveElement(RenderBindingId),
+    ContextActiveElementKind(RenderBindingId, DatasetKind),
     ContextTargetsBoundary(RenderBindingId, crate::ChangeBoundary),
     ChangesHasStagedFiles(RenderBindingId),
     InteractionContextType(crate::InteractionContextType),

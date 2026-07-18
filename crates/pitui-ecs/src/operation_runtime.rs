@@ -11,15 +11,16 @@ use bevy_ecs::{
     system::SystemId,
 };
 use pitui_data::{
-    ActiveRenderMode, ActiveUiContext, AvailabilityRule, AvailabilityRuleId,
-    AvailabilityRuleRegistry, ChangeBoundary, ClipboardContentKind, ClipboardRequest, CommandId,
-    CommandInvocation, CommandRegistry, CommandSystemId, CommitCreationMetadata, CommitMetadata,
-    ContextStack, ContextTransitionRequest, DatasetCursor, DatasetIdentity, DatasetIndex,
-    DatasetKey, DatasetNavigationOrder, DatasetRevision, DatasetSelection, DatasetTemplateRef,
-    DatasetTemplateRegistry, DatasetType, DatasetViewport, DefaultDatasetTemplates,
-    GlobalOperationSet, InputIntent, InteractionContextKind, InteractionContextMetadata,
-    InteractionNoticeRequest, InvocationSource, KeyCode, KeySequence, LayoutConstraint,
-    NavigationModeRegistry, OperationId, OperationNotice, OperationRegistry, OperationSpec,
+    ActiveDirection, ActiveHandoffRegistry, ActiveHandoffTarget, ActiveRenderMode, ActiveUiContext,
+    AvailabilityRule, AvailabilityRuleId, AvailabilityRuleRegistry, ChangeBoundary,
+    ClipboardContentKind, ClipboardRequest, CommandId, CommandInvocation, CommandRegistry,
+    CommandSystemId, CommitCreationMetadata, CommitMetadata, ContextStack,
+    ContextTransitionRequest, DatasetActiveElement, DatasetChildren, DatasetCollection,
+    DatasetIdentity, DatasetIndex, DatasetKey, DatasetRevision, DatasetSelection,
+    DatasetTemplateRef, DatasetTemplateRegistry, DatasetType, DatasetViewport,
+    DefaultDatasetTemplates, GlobalOperationSet, InputIntent, InteractionContextKind,
+    InteractionContextMetadata, InteractionNoticeRequest, InvocationSource, KeyCode, KeySequence,
+    LayoutConstraint, OperationId, OperationNotice, OperationRegistry, OperationSpec,
     PaletteCommandEntry, PendingChordState, QuitRequested, ReflogEntryMetadata, RenderBindingPatch,
     RenderModeId, RenderProxyId, RepositoryMetadata, ResolvedKeyAction, ResolvedKeyBinding,
     ResolvedOperation, ResolvedOperationSet, ResolvedOperationSetId, ShortcutHelpEntry,
@@ -90,20 +91,20 @@ pub(super) struct PendingCommandInvocations(Vec<CommandInvocation>);
 pub(super) struct DeferredCommandInvocations(Vec<CommandInvocation>);
 
 #[derive(Resource, Clone, Debug, Default)]
-pub(super) struct PendingChangesFocus(Option<ChangesFocusRequest>);
+pub(super) struct PendingChangesActiveRelay(Option<ChangesActiveRelayRequest>);
 
 #[derive(Clone, Debug)]
-struct ChangesFocusRequest {
+struct ChangesActiveRelayRequest {
     mutation: GitCommand,
     success_index: usize,
     changes_revision: u64,
-    target: ChangesFocusTarget,
-    context: ChangesFocusContext,
-    preserve_diff_focus: bool,
+    target: ChangesActiveTarget,
+    context: ChangesActiveContext,
+    preserve_diff_active: bool,
 }
 
 #[derive(Clone, Debug)]
-enum ChangesFocusTarget {
+enum ChangesActiveTarget {
     Exact {
         repository: pitui_data::RepositoryKey,
         path: pitui_core::GitPath,
@@ -113,7 +114,7 @@ enum ChangesFocusTarget {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum ChangesFocusContext {
+enum ChangesActiveContext {
     Active,
     Previous,
 }
@@ -131,7 +132,7 @@ pub(super) fn initialize_operation_runtime(world: &mut World) {
     world.init_resource::<PendingInteractionNotices>();
     world.init_resource::<PendingCommandInvocations>();
     world.init_resource::<DeferredCommandInvocations>();
-    world.init_resource::<PendingChangesFocus>();
+    world.init_resource::<PendingChangesActiveRelay>();
     world.init_resource::<QuitRequested>();
     world.init_resource::<Messages<InputIntent>>();
     world.init_resource::<Messages<CommandInvocation>>();
@@ -189,7 +190,7 @@ pub(super) fn resolve_input_intents(
     mut intents: MessageReader<InputIntent>,
     operations: Option<Res<ResolvedOperationSet>>,
     context: Option<Res<ActiveUiContext>>,
-    navigation: Query<(&DatasetCursor, &DatasetSelection)>,
+    dataset_states: Query<(&DatasetActiveElement, &DatasetSelection)>,
     interactions: Query<&InteractionContextMetadata>,
     commit_creations: Query<(), With<CommitCreationMetadata>>,
     mut chord: ResMut<PendingChordState>,
@@ -231,7 +232,7 @@ pub(super) fn resolve_input_intents(
                                 operation,
                                 InvocationSource::KeyBinding,
                                 &context,
-                                &navigation,
+                                &dataset_states,
                                 &mut invocations,
                                 &mut notices,
                             );
@@ -273,7 +274,7 @@ pub(super) fn resolve_input_intents(
                         operation,
                         InvocationSource::CommandPalette,
                         &context,
-                        &navigation,
+                        &dataset_states,
                         &mut invocations,
                         &mut notices,
                     );
@@ -333,11 +334,11 @@ fn emit_invocation(
     operation: &ResolvedOperation,
     source: InvocationSource,
     context: &ActiveUiContext,
-    navigation: &Query<(&DatasetCursor, &DatasetSelection)>,
+    dataset_states: &Query<(&DatasetActiveElement, &DatasetSelection)>,
     invocations: &mut MessageWriter<CommandInvocation>,
     notices: &mut MessageWriter<OperationNotice>,
 ) {
-    let Some(targets) = resolve_operation_targets(operation, context, navigation) else {
+    let Some(targets) = resolve_operation_targets(operation, context, dataset_states) else {
         notices.write(OperationNotice::TargetUnavailable(operation.id.clone()));
         return;
     };
@@ -352,10 +353,11 @@ fn emit_invocation(
 fn resolve_operation_targets(
     operation: &ResolvedOperation,
     context: &ActiveUiContext,
-    navigation: &Query<(&DatasetCursor, &DatasetSelection)>,
+    dataset_states: &Query<(&DatasetActiveElement, &DatasetSelection)>,
 ) -> Option<Vec<Entity>> {
     let target_dataset = match &operation.target_source {
-        TargetSource::ContextCursor(binding) | TargetSource::ContextSelectionOrCursor(binding) => {
+        TargetSource::ContextActiveElement(binding)
+        | TargetSource::ContextSelectionOrActiveElement(binding) => {
             context.render_bindings.get(binding)
         }
         _ => Some(context.active_dataset),
@@ -363,29 +365,32 @@ fn resolve_operation_targets(
     let targets = match (&operation.target_source, target_dataset) {
         (TargetSource::None, _) => Vec::new(),
         (TargetSource::ActiveDataset, _) => vec![context.active_dataset],
-        (TargetSource::Cursor | TargetSource::ContextCursor(_), Some(dataset)) => navigation
-            .get(dataset)
-            .ok()
-            .and_then(|(cursor, _)| cursor.0)
-            .into_iter()
-            .collect(),
-        (TargetSource::Selection, Some(dataset)) => navigation
+        (TargetSource::ActiveElement | TargetSource::ContextActiveElement(_), Some(dataset)) => {
+            dataset_states
+                .get(dataset)
+                .ok()
+                .and_then(|(active, _)| active.0)
+                .into_iter()
+                .collect()
+        }
+        (TargetSource::Selection, Some(dataset)) => dataset_states
             .get(dataset)
             .map(|(_, selection)| selection.0.clone())
             .unwrap_or_default(),
         (
-            TargetSource::SelectionOrCursor | TargetSource::ContextSelectionOrCursor(_),
+            TargetSource::SelectionOrActiveElement
+            | TargetSource::ContextSelectionOrActiveElement(_),
             Some(dataset),
-        ) => navigation
+        ) => dataset_states
             .get(dataset)
             .ok()
             .filter(|(_, selection)| !selection.0.is_empty())
             .map(|(_, selection)| selection.0.clone())
             .unwrap_or_else(|| {
-                navigation
+                dataset_states
                     .get(dataset)
                     .ok()
-                    .and_then(|(cursor, _)| cursor.0)
+                    .and_then(|(active, _)| active.0)
                     .into_iter()
                     .collect()
             }),
@@ -809,22 +814,22 @@ fn availability_matches(world: &World, active: Entity, rule: &AvailabilityRule) 
         AvailabilityRule::ActiveDatasetKind(expected) => world
             .get::<DatasetType>(active)
             .is_some_and(|kind| kind.0 == *expected),
-        AvailabilityRule::HasCursor => world
-            .get::<DatasetCursor>(active)
-            .is_some_and(|cursor| cursor.0.is_some()),
+        AvailabilityRule::HasActiveElement => world
+            .get::<DatasetActiveElement>(active)
+            .is_some_and(|element| element.0.is_some()),
         AvailabilityRule::HasSelection => world
             .get::<DatasetSelection>(active)
             .is_some_and(|selection| !selection.0.is_empty()),
-        AvailabilityRule::HasSelectionOrCursor => {
+        AvailabilityRule::HasSelectionOrActiveElement => {
             availability_matches(world, active, &AvailabilityRule::HasSelection)
-                || availability_matches(world, active, &AvailabilityRule::HasCursor)
+                || availability_matches(world, active, &AvailabilityRule::HasActiveElement)
         }
-        AvailabilityRule::ContextHasCursor(binding) => world
+        AvailabilityRule::ContextHasActiveElement(binding) => world
             .get_resource::<ActiveUiContext>()
             .and_then(|context| context.render_bindings.get(binding))
-            .and_then(|dataset| world.get::<DatasetCursor>(dataset))
-            .is_some_and(|cursor| cursor.0.is_some()),
-        AvailabilityRule::ContextHasSelectionOrCursor(binding) => world
+            .and_then(|dataset| world.get::<DatasetActiveElement>(dataset))
+            .is_some_and(|element| element.0.is_some()),
+        AvailabilityRule::ContextHasSelectionOrActiveElement(binding) => world
             .get_resource::<ActiveUiContext>()
             .and_then(|context| context.render_bindings.get(binding))
             .is_some_and(|dataset| {
@@ -832,24 +837,24 @@ fn availability_matches(world: &World, active: Entity, rule: &AvailabilityRule) 
                     .get::<DatasetSelection>(dataset)
                     .is_some_and(|selection| !selection.0.is_empty())
                     || world
-                        .get::<DatasetCursor>(dataset)
-                        .is_some_and(|cursor| cursor.0.is_some())
+                        .get::<DatasetActiveElement>(dataset)
+                        .is_some_and(|element| element.0.is_some())
             }),
-        AvailabilityRule::ContextCursorKind(binding, expected) => world
+        AvailabilityRule::ContextActiveElementKind(binding, expected) => world
             .get_resource::<ActiveUiContext>()
             .and_then(|context| context.render_bindings.get(binding))
-            .and_then(|dataset| world.get::<DatasetCursor>(dataset))
-            .and_then(|cursor| cursor.0)
-            .and_then(|cursor| world.get::<DatasetType>(cursor))
+            .and_then(|dataset| world.get::<DatasetActiveElement>(dataset))
+            .and_then(|active| active.0)
+            .and_then(|element| world.get::<DatasetType>(element))
             .is_some_and(|kind| kind.0 == *expected),
         AvailabilityRule::ContextTargetsBoundary(binding, expected) => world
             .get_resource::<ActiveUiContext>()
             .and_then(|context| context.render_bindings.get(binding))
             .and_then(|dataset| {
-                let cursor = world.get::<DatasetCursor>(dataset)?.0;
+                let active_element = world.get::<DatasetActiveElement>(dataset)?.0;
                 let selection = world.get::<DatasetSelection>(dataset)?;
                 let targets = if selection.0.is_empty() {
-                    cursor.into_iter().collect::<Vec<_>>()
+                    active_element.into_iter().collect::<Vec<_>>()
                 } else {
                     selection.0.clone()
                 };
@@ -859,7 +864,10 @@ fn availability_matches(world: &World, active: Entity, rule: &AvailabilityRule) 
                 targets.iter().all(|target| {
                     matches!(
                         world.get::<DatasetKey>(*target).map(|key| &key.0),
-                        Some(DatasetIdentity::WorkingTreeFile { boundary, .. })
+                        Some(
+                            DatasetIdentity::WorkingTreeFile { boundary, .. }
+                                | DatasetIdentity::WorkingTreeDirectory { boundary, .. }
+                        )
                             if boundary == expected
                     )
                 })
@@ -867,11 +875,11 @@ fn availability_matches(world: &World, active: Entity, rule: &AvailabilityRule) 
         AvailabilityRule::ChangesHasStagedFiles(binding) => world
             .get_resource::<ActiveUiContext>()
             .and_then(|context| context.render_bindings.get(binding))
-            .and_then(|dataset| world.get::<DatasetNavigationOrder>(dataset))
-            .is_some_and(|navigation| {
-                navigation.0.iter().any(|row| {
+            .and_then(|dataset| world.get::<DatasetCollection>(dataset))
+            .is_some_and(|collection| {
+                collection.entities().any(|row| {
                     matches!(
-                        world.get::<DatasetKey>(*row).map(|key| &key.0),
+                        world.get::<DatasetKey>(row).map(|key| &key.0),
                         Some(DatasetIdentity::WorkingTreeFile {
                             boundary: pitui_data::ChangeBoundary::Staged,
                             ..
@@ -892,11 +900,15 @@ fn availability_matches(world: &World, active: Entity, rule: &AvailabilityRule) 
     }
 }
 
-pub fn navigate_up(
+pub fn activate_previous_element(
     In(invocation): In<CommandInvocation>,
-    mut datasets: Query<(&DatasetNavigationOrder, &mut DatasetCursor)>,
+    mut datasets: Query<(&DatasetCollection, &mut DatasetActiveElement)>,
 ) -> CommandExecution {
-    navigate(invocation.source_dataset, -1, &mut datasets)
+    shift_active_element(
+        invocation.source_dataset,
+        ActiveDirection::Up,
+        &mut datasets,
+    )
 }
 
 pub fn request_quit(
@@ -948,7 +960,7 @@ pub fn open_command_palette(
     context: Res<ActiveUiContext>,
     operations: Res<ResolvedOperationSet>,
     index: Res<DatasetIndex>,
-    navigation: Query<(&DatasetCursor, &DatasetSelection)>,
+    dataset_states: Query<(&DatasetActiveElement, &DatasetSelection)>,
     mut contexts: Query<&mut InteractionContextMetadata>,
     mut transitions: MessageWriter<ContextTransitionRequest>,
 ) -> CommandExecution {
@@ -963,7 +975,7 @@ pub fn open_command_palette(
                 .operations
                 .iter()
                 .find(|operation| &operation.id == operation_id)?;
-            let targets = resolve_operation_targets(operation, &context, &navigation)?;
+            let targets = resolve_operation_targets(operation, &context, &dataset_states)?;
             Some(PaletteCommandEntry {
                 name: name.clone(),
                 label: operation.label.clone(),
@@ -1081,8 +1093,8 @@ pub fn open_reflog(In(_invocation): In<CommandInvocation>, world: &mut World) ->
     let mut bindings = context.render_bindings;
     bindings.bind(pitui_data::RenderBindingId::CurrentReflog, reflog);
     if let Some(entry) = world
-        .get::<DatasetCursor>(reflog)
-        .and_then(|cursor| cursor.0)
+        .get::<DatasetActiveElement>(reflog)
+        .and_then(|active| active.0)
     {
         bindings.bind(pitui_data::RenderBindingId::CurrentReflogEntry, entry);
     } else {
@@ -1109,7 +1121,7 @@ pub fn open_git_operation_log(
     In(_invocation): In<CommandInvocation>,
     context: Res<ActiveUiContext>,
     index: Res<DatasetIndex>,
-    cursors: Query<&DatasetCursor>,
+    active_elements: Query<&DatasetActiveElement>,
     mut transitions: MessageWriter<ContextTransitionRequest>,
 ) -> CommandExecution {
     let Some(log) = index.get(&DatasetIdentity::GlobalGitOperationLog) else {
@@ -1120,7 +1132,7 @@ pub fn open_git_operation_log(
     }
     let mut bindings = context.render_bindings.clone();
     bindings.bind(pitui_data::RenderBindingId::GitOperationLog, log);
-    if let Some(entry) = cursors.get(log).ok().and_then(|cursor| cursor.0) {
+    if let Some(entry) = active_elements.get(log).ok().and_then(|active| active.0) {
         bindings.bind(
             pitui_data::RenderBindingId::CurrentGitOperationLogEntry,
             entry,
@@ -1406,61 +1418,83 @@ fn move_palette_selection(
     CommandExecution::Completed
 }
 
-pub fn navigate_down(
+pub fn activate_next_element(
     In(invocation): In<CommandInvocation>,
-    mut datasets: Query<(&DatasetNavigationOrder, &mut DatasetCursor)>,
+    mut datasets: Query<(&DatasetCollection, &mut DatasetActiveElement)>,
 ) -> CommandExecution {
-    navigate(invocation.source_dataset, 1, &mut datasets)
+    shift_active_element(
+        invocation.source_dataset,
+        ActiveDirection::Down,
+        &mut datasets,
+    )
 }
 
-pub fn navigate_left(
+pub fn transfer_active_left(
     In(_invocation): In<CommandInvocation>,
     context: Res<ActiveUiContext>,
     mode: Res<ActiveRenderMode>,
     stack: Res<ContextStack>,
+    dataset_types: Query<&DatasetType>,
     mut transitions: MessageWriter<ContextTransitionRequest>,
 ) -> CommandExecution {
-    let mut focus_owners = Vec::new();
-    mode.layout.focus_owners(&mut focus_owners);
-    let Some(position) = focus_owners
+    let mut active_candidates = Vec::new();
+    mode.layout.active_candidates(&mut active_candidates);
+    let Some(position) = active_candidates
         .iter()
         .position(|dataset| *dataset == context.active_dataset)
     else {
-        return CommandExecution::Rejected("Active Dataset is not rendered as focusable".into());
+        return CommandExecution::Rejected("Active Dataset is not an Active candidate".into());
+    };
+    let Ok(kind) = dataset_types.get(context.active_dataset) else {
+        return CommandExecution::Rejected("Active Dataset no longer exists".into());
     };
     if position > 0 {
-        transitions.write(ContextTransitionRequest::KeepRenderMode {
-            active_dataset: focus_owners[position - 1],
+        transitions.write(ContextTransitionRequest::ActiveRelay {
+            previous_active_dataset: context.active_dataset,
+            previous_active_kind: kind.0,
+            direction: ActiveDirection::Left,
+            next_active_dataset: active_candidates[position - 1],
             binding_patch: RenderBindingPatch::default(),
         });
         CommandExecution::Completed
     } else if !stack.0.is_empty() {
-        transitions.write(ContextTransitionRequest::Pop);
+        transitions.write(ContextTransitionRequest::ActiveReturn {
+            previous_active_dataset: context.active_dataset,
+            previous_active_kind: kind.0,
+            direction: ActiveDirection::Left,
+        });
         CommandExecution::Completed
     } else {
         CommandExecution::Rejected("already at the outermost Dataset level".into())
     }
 }
 
-pub fn navigate_right(
+pub fn transfer_active_right(
     In(_invocation): In<CommandInvocation>,
     context: Res<ActiveUiContext>,
     mode: Res<ActiveRenderMode>,
     dataset_types: Query<&DatasetType>,
-    navigation_modes: Res<NavigationModeRegistry>,
+    active_elements: Query<&DatasetActiveElement>,
+    handoffs: Res<ActiveHandoffRegistry>,
     mut transitions: MessageWriter<ContextTransitionRequest>,
 ) -> CommandExecution {
-    let mut focus_owners = Vec::new();
-    mode.layout.focus_owners(&mut focus_owners);
-    let Some(position) = focus_owners
+    let mut active_candidates = Vec::new();
+    mode.layout.active_candidates(&mut active_candidates);
+    let Some(position) = active_candidates
         .iter()
         .position(|dataset| *dataset == context.active_dataset)
     else {
-        return CommandExecution::Rejected("Active Dataset is not rendered as focusable".into());
+        return CommandExecution::Rejected("Active Dataset is not an Active candidate".into());
     };
-    if let Some(next) = focus_owners.get(position + 1) {
-        transitions.write(ContextTransitionRequest::KeepRenderMode {
-            active_dataset: *next,
+    if let Some(next) = active_candidates.get(position + 1) {
+        let Ok(kind) = dataset_types.get(context.active_dataset) else {
+            return CommandExecution::Rejected("Active Dataset no longer exists".into());
+        };
+        transitions.write(ContextTransitionRequest::ActiveRelay {
+            previous_active_dataset: context.active_dataset,
+            previous_active_kind: kind.0,
+            direction: ActiveDirection::Right,
+            next_active_dataset: *next,
             binding_patch: RenderBindingPatch::default(),
         });
         return CommandExecution::Completed;
@@ -1469,12 +1503,26 @@ pub fn navigate_right(
     let Ok(kind) = dataset_types.get(context.active_dataset) else {
         return CommandExecution::Rejected("Active Dataset no longer exists".into());
     };
-    let Some(render_mode) = navigation_modes.drill_down.get(&kind.0) else {
+    let Some(handoff) = handoffs.rules.get(&(kind.0, ActiveDirection::Right)) else {
         return CommandExecution::Rejected("already at the deepest Dataset level".into());
     };
-    transitions.write(ContextTransitionRequest::Drill {
-        active_dataset: context.active_dataset,
-        render_mode: render_mode.clone(),
+    let next_active_dataset = match &handoff.target {
+        ActiveHandoffTarget::KeepActiveDataset => Some(context.active_dataset),
+        ActiveHandoffTarget::ActiveElement => active_elements
+            .get(context.active_dataset)
+            .ok()
+            .and_then(|active| active.0),
+        ActiveHandoffTarget::Binding(binding) => context.render_bindings.get(binding),
+    };
+    let Some(next_active_dataset) = next_active_dataset else {
+        return CommandExecution::Rejected("Active handoff target is unavailable".into());
+    };
+    transitions.write(ContextTransitionRequest::ActiveHandoff {
+        previous_active_dataset: context.active_dataset,
+        previous_active_kind: kind.0,
+        direction: ActiveDirection::Right,
+        next_active_dataset,
+        render_mode: handoff.render_mode.clone(),
         render_bindings: context.render_bindings.clone(),
     });
     CommandExecution::Completed
@@ -1482,23 +1530,21 @@ pub fn navigate_right(
 
 pub fn toggle_selection(
     In(invocation): In<CommandInvocation>,
-    mut datasets: Query<(&DatasetNavigationOrder, &mut DatasetSelection)>,
+    world: &mut World,
 ) -> CommandExecution {
-    let Ok((navigation, mut selection)) = datasets.get_mut(invocation.source_dataset) else {
-        return CommandExecution::Rejected("active Dataset does not own a selection".into());
-    };
-    toggle_targets_in_navigation(navigation, &mut selection, &invocation.targets)
+    crate::collection::toggle_selection(world, invocation.source_dataset, &invocation.targets)
+        .map_or_else(CommandExecution::Rejected, |()| CommandExecution::Completed)
 }
 
 /// Cherry-pick is owned by the Commits Dataset Operation Set. Its targets are
 /// the Dataset's ordered Selection (never a queue and never an implicit
-/// Cursor), normalized to oldest-to-newest replay order before Git argv data is
+/// active element), normalized to oldest-to-newest replay order before Git argv data is
 /// emitted.
 pub fn cherry_pick_selected(
     In(invocation): In<CommandInvocation>,
     context: Res<ActiveUiContext>,
     keys: Query<&DatasetKey>,
-    navigation: Query<&DatasetNavigationOrder>,
+    collections: Query<&DatasetCollection>,
     repositories: Query<&RepositoryMetadata>,
     mut git: MessageWriter<GitCommandData>,
 ) -> CommandExecution {
@@ -1514,17 +1560,15 @@ pub fn cherry_pick_selected(
     if invocation.targets.is_empty() {
         return CommandExecution::Rejected("select at least one commit to cherry-pick".into());
     }
-    let Ok(order) = navigation.get(invocation.source_dataset) else {
-        return CommandExecution::Rejected("Commits navigation order is unavailable".into());
+    let Ok(collection) = collections.get(invocation.source_dataset) else {
+        return CommandExecution::Rejected("Commits collection is unavailable".into());
     };
     let selected = invocation.targets.iter().copied().collect::<HashSet<_>>();
     if selected.len() != invocation.targets.len() {
         return CommandExecution::Rejected("Commit selection contains duplicate targets".into());
     }
-    let ordered = order
-        .0
-        .iter()
-        .copied()
+    let ordered = collection
+        .entities()
         .filter(|entity| selected.contains(entity))
         .collect::<Vec<_>>();
     if ordered.len() != selected.len() {
@@ -1614,50 +1658,30 @@ pub fn cherry_pick_selected(
 
 pub fn toggle_changes_selection(
     In(invocation): In<CommandInvocation>,
-    context: Res<ActiveUiContext>,
-    kinds: Query<&DatasetType>,
-    mut datasets: Query<(&DatasetNavigationOrder, &mut DatasetSelection)>,
+    world: &mut World,
 ) -> CommandExecution {
-    let Some(changes) = context
-        .render_bindings
-        .get(&pitui_data::RenderBindingId::Changes)
-    else {
+    let Some(changes) = world.get_resource::<ActiveUiContext>().and_then(|context| {
+        context
+            .render_bindings
+            .get(&pitui_data::RenderBindingId::Changes)
+    }) else {
         return CommandExecution::Rejected("Changes binding is unavailable".into());
     };
     if invocation.targets.iter().any(|target| {
-        !kinds
-            .get(*target)
-            .is_ok_and(|kind| kind.0 == pitui_data::DatasetKind::WorkingTreeFile)
+        !matches!(
+            world.get::<DatasetKey>(*target).map(|key| &key.0),
+            Some(
+                DatasetIdentity::WorkingTreeFile { .. }
+                    | DatasetIdentity::WorkingTreeDirectory { .. }
+            )
+        )
     }) {
-        return CommandExecution::Rejected("only working-tree files can be selected".into());
+        return CommandExecution::Rejected(
+            "only working-tree files and directories can be selected".into(),
+        );
     }
-    let Ok((navigation, mut selection)) = datasets.get_mut(changes) else {
-        return CommandExecution::Rejected("Changes Dataset does not own a selection".into());
-    };
-    toggle_targets_in_navigation(navigation, &mut selection, &invocation.targets)
-}
-
-fn toggle_targets_in_navigation(
-    navigation: &DatasetNavigationOrder,
-    selection: &mut DatasetSelection,
-    targets: &[Entity],
-) -> CommandExecution {
-    if targets.iter().any(|target| !navigation.0.contains(target)) {
-        return CommandExecution::Rejected("selection target is outside the Dataset".into());
-    }
-    let mut selected = selection.0.iter().copied().collect::<HashSet<_>>();
-    for target in targets {
-        if !selected.insert(*target) {
-            selected.remove(target);
-        }
-    }
-    selection.0 = navigation
-        .0
-        .iter()
-        .copied()
-        .filter(|entity| selected.contains(entity))
-        .collect();
-    CommandExecution::Completed
+    crate::collection::toggle_selection(world, changes, &invocation.targets)
+        .map_or_else(CommandExecution::Rejected, |()| CommandExecution::Completed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1665,10 +1689,11 @@ pub(super) fn stage_changes(
     In(invocation): In<CommandInvocation>,
     context: Res<ActiveUiContext>,
     keys: Query<&DatasetKey>,
+    children: Query<&DatasetChildren>,
     repositories: Query<&RepositoryMetadata>,
     revisions: Query<&DatasetRevision>,
     successes: Res<GitMutationSuccesses>,
-    mut pending_focus: ResMut<PendingChangesFocus>,
+    mut pending_relay: ResMut<PendingChangesActiveRelay>,
     mut git: MessageWriter<GitCommandData>,
 ) -> CommandExecution {
     mutate_working_tree_paths(
@@ -1677,10 +1702,11 @@ pub(super) fn stage_changes(
         |paths| GitCommand::StagePaths { paths },
         &context,
         &keys,
+        &children,
         &repositories,
         &revisions,
         &successes,
-        &mut pending_focus,
+        &mut pending_relay,
         &mut git,
     )
 }
@@ -1690,10 +1716,11 @@ pub(super) fn unstage_changes(
     In(invocation): In<CommandInvocation>,
     context: Res<ActiveUiContext>,
     keys: Query<&DatasetKey>,
+    children: Query<&DatasetChildren>,
     repositories: Query<&RepositoryMetadata>,
     revisions: Query<&DatasetRevision>,
     successes: Res<GitMutationSuccesses>,
-    mut pending_focus: ResMut<PendingChangesFocus>,
+    mut pending_relay: ResMut<PendingChangesActiveRelay>,
     mut git: MessageWriter<GitCommandData>,
 ) -> CommandExecution {
     mutate_working_tree_paths(
@@ -1702,10 +1729,11 @@ pub(super) fn unstage_changes(
         |paths| GitCommand::UnstagePaths { paths },
         &context,
         &keys,
+        &children,
         &repositories,
         &revisions,
         &successes,
-        &mut pending_focus,
+        &mut pending_relay,
         &mut git,
     )
 }
@@ -1717,10 +1745,11 @@ fn mutate_working_tree_paths(
     command: impl FnOnce(Vec<pitui_core::GitPath>) -> GitCommand,
     context: &ActiveUiContext,
     keys: &Query<&DatasetKey>,
+    children: &Query<&DatasetChildren>,
     repositories: &Query<&RepositoryMetadata>,
     revisions: &Query<&DatasetRevision>,
     successes: &GitMutationSuccesses,
-    pending_focus: &mut PendingChangesFocus,
+    pending_relay: &mut PendingChangesActiveRelay,
     git: &mut MessageWriter<GitCommandData>,
 ) -> CommandExecution {
     let Some(repository_entity) = context
@@ -1740,28 +1769,16 @@ fn mutate_working_tree_paths(
     let mut seen = HashSet::new();
     let mut paths = Vec::with_capacity(invocation.targets.len());
     for target in &invocation.targets {
-        let Ok(DatasetKey(DatasetIdentity::WorkingTreeFile {
-            repository,
-            boundary,
-            path,
-        })) = keys.get(*target)
-        else {
-            return CommandExecution::Rejected(
-                "stage target is not a working-tree file Dataset".into(),
-            );
-        };
-        if repository != repository_key {
-            return CommandExecution::Rejected(
-                "stage target belongs to a different Repository".into(),
-            );
-        }
-        if *boundary != expected_boundary {
-            return CommandExecution::Rejected(format!(
-                "stage target has the wrong change boundary: expected {expected_boundary:?}"
-            ));
-        }
-        if seen.insert(path.clone()) {
-            paths.push(path.clone());
+        if let Err(error) = collect_working_tree_paths(
+            *target,
+            repository_key,
+            expected_boundary,
+            keys,
+            children,
+            &mut seen,
+            &mut paths,
+        ) {
+            return CommandExecution::Rejected(error);
         }
     }
     if paths.is_empty() {
@@ -1778,22 +1795,22 @@ fn mutate_working_tree_paths(
         return CommandExecution::Rejected("Changes revision is unavailable".into());
     };
 
-    let focus_path = paths[0].clone();
+    let active_path = paths[0].clone();
     let mutation = command(paths);
-    pending_focus.0 = Some(ChangesFocusRequest {
+    pending_relay.0 = Some(ChangesActiveRelayRequest {
         mutation: mutation.clone(),
         success_index: successes.0.len(),
         changes_revision: changes_revision.0,
-        target: ChangesFocusTarget::Exact {
+        target: ChangesActiveTarget::Exact {
             repository: repository_key.clone(),
-            path: focus_path,
+            path: active_path,
             boundary: match expected_boundary {
                 ChangeBoundary::Staged => ChangeBoundary::Unstaged,
                 ChangeBoundary::Unstaged => ChangeBoundary::Staged,
             },
         },
-        context: ChangesFocusContext::Active,
-        preserve_diff_focus: context
+        context: ChangesActiveContext::Active,
+        preserve_diff_active: context
             .render_bindings
             .get(&pitui_data::RenderBindingId::CurrentChangesFileChanges)
             == Some(context.active_dataset),
@@ -1821,8 +1838,83 @@ fn mutate_working_tree_paths(
     CommandExecution::Completed
 }
 
-pub(super) fn reconcile_pending_changes_focus(world: &mut World) {
-    let request = world.resource_mut::<PendingChangesFocus>().0.take();
+#[allow(clippy::too_many_arguments)]
+fn collect_working_tree_paths(
+    target: Entity,
+    expected_repository: &pitui_data::RepositoryKey,
+    expected_boundary: ChangeBoundary,
+    keys: &Query<&DatasetKey>,
+    children: &Query<&DatasetChildren>,
+    seen: &mut HashSet<pitui_core::GitPath>,
+    paths: &mut Vec<pitui_core::GitPath>,
+) -> Result<(), String> {
+    match keys.get(target).map(|key| &key.0) {
+        Ok(DatasetIdentity::WorkingTreeFile {
+            repository,
+            boundary,
+            path,
+        }) => {
+            validate_working_tree_target(
+                repository,
+                *boundary,
+                expected_repository,
+                expected_boundary,
+            )?;
+            if seen.insert(path.clone()) {
+                paths.push(path.clone());
+            }
+            Ok(())
+        }
+        Ok(DatasetIdentity::WorkingTreeDirectory {
+            repository,
+            boundary,
+            ..
+        }) => {
+            validate_working_tree_target(
+                repository,
+                *boundary,
+                expected_repository,
+                expected_boundary,
+            )?;
+            let directory_children = children
+                .get(target)
+                .map_err(|_| "working-tree directory contents are unavailable".to_owned())?;
+            for child in &directory_children.0 {
+                collect_working_tree_paths(
+                    *child,
+                    expected_repository,
+                    expected_boundary,
+                    keys,
+                    children,
+                    seen,
+                    paths,
+                )?;
+            }
+            Ok(())
+        }
+        _ => Err("target is not a working-tree file or directory Dataset".into()),
+    }
+}
+
+fn validate_working_tree_target(
+    repository: &pitui_data::RepositoryKey,
+    boundary: ChangeBoundary,
+    expected_repository: &pitui_data::RepositoryKey,
+    expected_boundary: ChangeBoundary,
+) -> Result<(), String> {
+    if repository != expected_repository {
+        return Err("working-tree target belongs to a different Repository".into());
+    }
+    if boundary != expected_boundary {
+        return Err(format!(
+            "working-tree target has the wrong change boundary: expected {expected_boundary:?}"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn reconcile_pending_changes_active(world: &mut World) {
+    let request = world.resource_mut::<PendingChangesActiveRelay>().0.take();
     let Some(request) = request else {
         return;
     };
@@ -1847,12 +1939,12 @@ pub(super) fn reconcile_pending_changes_focus(world: &mut World) {
     {
         return;
     }
-    let Some(navigation) = world.get::<DatasetNavigationOrder>(changes) else {
+    let Some(collection) = world.get::<DatasetCollection>(changes) else {
         return;
     };
-    let may_be_empty = matches!(&request.target, ChangesFocusTarget::FirstRemainingFile);
+    let may_be_empty = matches!(&request.target, ChangesActiveTarget::FirstRemainingFile);
     let file = match request.target {
-        ChangesFocusTarget::Exact {
+        ChangesActiveTarget::Exact {
             repository,
             path,
             boundary,
@@ -1863,8 +1955,8 @@ pub(super) fn reconcile_pending_changes_focus(world: &mut World) {
                 boundary,
                 path,
             })
-            .filter(|file| navigation.0.contains(file)),
-        ChangesFocusTarget::FirstRemainingFile => navigation.0.iter().copied().find(|row| {
+            .filter(|file| collection.contains(*file)),
+        ChangesActiveTarget::FirstRemainingFile => collection.entities().find(|row| {
             matches!(
                 world.get::<DatasetKey>(*row).map(|key| &key.0),
                 Some(DatasetIdentity::WorkingTreeFile { .. })
@@ -1874,7 +1966,7 @@ pub(super) fn reconcile_pending_changes_focus(world: &mut World) {
     let Some(file) = file else {
         if may_be_empty {
             match request.context {
-                ChangesFocusContext::Active => {
+                ChangesActiveContext::Active => {
                     if let Some(mut context) = world.get_resource_mut::<ActiveUiContext>() {
                         context
                             .render_bindings
@@ -1883,7 +1975,7 @@ pub(super) fn reconcile_pending_changes_focus(world: &mut World) {
                         context.generation = context.generation.wrapping_add(1);
                     }
                 }
-                ChangesFocusContext::Previous => {
+                ChangesActiveContext::Previous => {
                     let mut stack = world.resource_mut::<ContextStack>();
                     if let Some(snapshot) = stack.0.last_mut() {
                         snapshot
@@ -1896,8 +1988,8 @@ pub(super) fn reconcile_pending_changes_focus(world: &mut World) {
         }
         return;
     };
-    if let Some(mut cursor) = world.get_mut::<DatasetCursor>(changes) {
-        cursor.0 = Some(file);
+    if let Some(mut active) = world.get_mut::<DatasetActiveElement>(changes) {
+        active.0 = Some(file);
     }
 
     let Some(diff) = world
@@ -1907,19 +1999,19 @@ pub(super) fn reconcile_pending_changes_focus(world: &mut World) {
         return;
     };
     match request.context {
-        ChangesFocusContext::Active => {
+        ChangesActiveContext::Active => {
             let Some(mut context) = world.get_resource_mut::<ActiveUiContext>() else {
                 return;
             };
             context
                 .render_bindings
                 .bind(pitui_data::RenderBindingId::CurrentChangesFileChanges, diff);
-            if request.preserve_diff_focus {
+            if request.preserve_diff_active {
                 context.active_dataset = diff;
             }
             context.generation = context.generation.wrapping_add(1);
         }
-        ChangesFocusContext::Previous => {
+        ChangesActiveContext::Previous => {
             let mut stack = world.resource_mut::<ContextStack>();
             let Some(snapshot) = stack.0.last_mut() else {
                 return;
@@ -1927,7 +2019,7 @@ pub(super) fn reconcile_pending_changes_focus(world: &mut World) {
             snapshot
                 .render_bindings
                 .bind(pitui_data::RenderBindingId::CurrentChangesFileChanges, diff);
-            if request.preserve_diff_focus {
+            if request.preserve_diff_active {
                 snapshot.active_dataset = diff;
             }
         }
@@ -1966,13 +2058,12 @@ pub fn open_commit_creation(
         return CommandExecution::Rejected("Changes revision is unavailable".into());
     };
     let staged_paths = world
-        .get::<DatasetNavigationOrder>(changes)
-        .map(|navigation| {
-            navigation
-                .0
-                .iter()
+        .get::<DatasetCollection>(changes)
+        .map(|collection| {
+            collection
+                .entities()
                 .filter_map(
-                    |entity| match world.get::<DatasetKey>(*entity).map(|key| &key.0) {
+                    |entity| match world.get::<DatasetKey>(entity).map(|key| &key.0) {
                         Some(DatasetIdentity::WorkingTreeFile {
                             repository: target_repository,
                             boundary: ChangeBoundary::Staged,
@@ -2051,7 +2142,7 @@ pub fn submit_commit_creation(
     repositories: Query<&RepositoryMetadata>,
     mut creations: Query<&mut CommitCreationMetadata>,
     successes: Res<GitMutationSuccesses>,
-    mut pending_focus: ResMut<PendingChangesFocus>,
+    mut pending_relay: ResMut<PendingChangesActiveRelay>,
     mut git: MessageWriter<GitCommandData>,
     mut transitions: MessageWriter<ContextTransitionRequest>,
 ) -> CommandExecution {
@@ -2110,13 +2201,13 @@ pub fn submit_commit_creation(
     let cwd = repository.0.root.clone();
     let current_branch = repository.0.current_branch.clone();
     let mutation = GitCommand::Commit { message };
-    pending_focus.0 = Some(ChangesFocusRequest {
+    pending_relay.0 = Some(ChangesActiveRelayRequest {
         mutation: mutation.clone(),
         success_index: successes.0.len(),
         changes_revision: changes_revision.0,
-        target: ChangesFocusTarget::FirstRemainingFile,
-        context: ChangesFocusContext::Previous,
-        preserve_diff_focus: previous
+        target: ChangesActiveTarget::FirstRemainingFile,
+        context: ChangesActiveContext::Previous,
+        preserve_diff_active: previous
             .render_bindings
             .get(&pitui_data::RenderBindingId::CurrentChangesFileChanges)
             == Some(previous.active_dataset),
@@ -2338,13 +2429,23 @@ fn copy_file_path(
         return CommandExecution::Rejected("File target no longer exists".into());
     };
     let (repository, path) = match &key.0 {
-        DatasetIdentity::File {
+        DatasetIdentity::FileDirectory {
+            repository, path, ..
+        }
+        | DatasetIdentity::File {
+            repository, path, ..
+        }
+        | DatasetIdentity::WorkingTreeDirectory {
             repository, path, ..
         }
         | DatasetIdentity::WorkingTreeFile {
             repository, path, ..
         } => (repository, path),
-        _ => return CommandExecution::Rejected("copy path target is not a File Dataset".into()),
+        _ => {
+            return CommandExecution::Rejected(
+                "copy path target is not a file or directory Dataset".into(),
+            );
+        }
     };
     let Some(text) = value(repository, path) else {
         return CommandExecution::Rejected("File path has no copyable name".into());
@@ -2424,25 +2525,34 @@ fn update_scroll(
     CommandExecution::Completed
 }
 
-fn navigate(
+fn shift_active_element(
     dataset: Entity,
-    delta: isize,
-    datasets: &mut Query<(&DatasetNavigationOrder, &mut DatasetCursor)>,
+    direction: ActiveDirection,
+    datasets: &mut Query<(&DatasetCollection, &mut DatasetActiveElement)>,
 ) -> CommandExecution {
-    let Ok((navigation, mut cursor)) = datasets.get_mut(dataset) else {
-        return CommandExecution::Rejected("active Dataset is not navigable".into());
+    let delta = match direction {
+        ActiveDirection::Up => -1,
+        ActiveDirection::Down => 1,
+        ActiveDirection::Left | ActiveDirection::Right => {
+            return CommandExecution::Rejected(
+                "horizontal direction cannot change a Dataset element".into(),
+            );
+        }
     };
-    if navigation.0.is_empty() {
-        cursor.0 = None;
+    let Ok((collection, mut active)) = datasets.get_mut(dataset) else {
+        return CommandExecution::Rejected("active Dataset has no Collection Manager state".into());
+    };
+    if collection.0.is_empty() {
+        active.0 = None;
         return CommandExecution::Completed;
     }
-    let current = cursor
+    let current = active
         .0
-        .and_then(|current| navigation.0.iter().position(|row| *row == current))
+        .and_then(|current| collection.position(current))
         .unwrap_or_default();
     let next = current
         .saturating_add_signed(delta)
-        .min(navigation.0.len() - 1);
-    cursor.0 = Some(navigation.0[next]);
+        .min(collection.0.len() - 1);
+    active.0 = Some(collection.0[next].entity);
     CommandExecution::Completed
 }

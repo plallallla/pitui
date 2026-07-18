@@ -4,7 +4,7 @@ use std::{fs, process::Command};
 
 use pitui_data::{
     ActiveRenderMode, ActiveUiContext, ClipboardContentKind, CommitCreationMetadata, ContextStack,
-    DatasetChildren, DatasetCursor, DatasetIdentity, DatasetKey, DatasetSelection, FieldId,
+    DatasetActiveElement, DatasetChildren, DatasetIdentity, DatasetKey, DatasetSelection, FieldId,
     GitOperationLogEntryMetadata, GitOperationStatus, InteractionContextKind,
     InteractionContextMetadata, KeyCode, KeyModifiers, KeyStroke, PendingChordState,
     ReflogEntryMetadata, RenderContentProjection, RepositoryMetadata, ResolvedKeyAction,
@@ -83,12 +83,12 @@ fn composition_bootstraps_history_from_dataset_ecs() {
             .world()
             .resource::<ActiveRenderMode>()
             .layout
-            .is_focus_owner(app.root_dataset())
+            .can_activate(app.root_dataset())
     );
     assert!(
         app.runtime()
             .world()
-            .get::<DatasetCursor>(app.root_dataset())
+            .get::<DatasetActiveElement>(app.root_dataset())
             .is_some()
     );
     assert!(
@@ -115,7 +115,6 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     assert_eq!(tree_rows.rows.len(), 2);
     assert_eq!(tree_rows.rows[0].depth, 0);
     assert_eq!(tree_rows.rows[1].depth, 1);
-
     let UiLayoutProjection::Dataset { panel: commits, .. } = &columns[1] else {
         panic!("history right column must be a Dataset panel");
     };
@@ -167,6 +166,33 @@ fn composition_bootstraps_history_from_dataset_ecs() {
         "an unchanged schedule must not create a new frame or cause flicker"
     );
 
+    let repository_tree_rows = app
+        .runtime()
+        .world()
+        .get::<pitui_data::DatasetCollection>(app.root_dataset())
+        .unwrap()
+        .entities()
+        .collect::<Vec<_>>();
+    app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Space)));
+    assert_eq!(
+        app.runtime()
+            .world()
+            .get::<DatasetSelection>(app.root_dataset())
+            .unwrap()
+            .0,
+        repository_tree_rows,
+        "selecting a Repository must cascade to its Branch through the shared Tree Manager"
+    );
+    app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Space)));
+    assert!(
+        app.runtime()
+            .world()
+            .get::<DatasetSelection>(app.root_dataset())
+            .unwrap()
+            .0
+            .is_empty()
+    );
+
     let operations = app.runtime().world().resource::<ResolvedOperationSet>();
     for stroke in [
         KeyStroke::character('q'),
@@ -178,6 +204,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
         KeyStroke::plain(KeyCode::Down),
         KeyStroke::plain(KeyCode::Left),
         KeyStroke::plain(KeyCode::Right),
+        KeyStroke::plain(KeyCode::Space),
         KeyStroke::character('h'),
     ] {
         assert!(operations.key_bindings.contains_key(&stroke));
@@ -195,7 +222,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     assert_ne!(
         app.runtime()
             .world()
-            .get::<DatasetCursor>(app.root_dataset())
+            .get::<DatasetActiveElement>(app.root_dataset())
             .unwrap()
             .0,
         Some(repository_row)
@@ -206,7 +233,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
             .resource::<ActiveUiContext>()
             .active_dataset,
         app.root_dataset(),
-        "row navigation must not steal focus or change Active Dataset"
+        "changing an active element must not change the Active Dataset"
     );
     assert!(matches!(
         app.runtime()
@@ -240,10 +267,14 @@ fn composition_bootstraps_history_from_dataset_ecs() {
                 branch: branch.clone(),
             })
             .unwrap();
-        let commit = world.get::<DatasetCursor>(commits).unwrap().0.unwrap();
+        let commit = world
+            .get::<DatasetActiveElement>(commits)
+            .unwrap()
+            .0
+            .unwrap();
         let DatasetIdentity::Commit { hash, .. } = &world.get::<DatasetKey>(commit).unwrap().0
         else {
-            panic!("commit cursor must reference a Commit Dataset");
+            panic!("active commit element must reference a Commit Dataset");
         };
         (commits, commit, hash.clone())
     };
@@ -312,14 +343,14 @@ fn composition_bootstraps_history_from_dataset_ecs() {
             .resource::<ActiveUiContext>()
             .active_dataset,
         commits_dataset,
-        "commit preview reconciliation must not move keyboard focus"
+        "commit preview reconciliation must not move Active ownership"
     );
     assert!(
         app.runtime()
             .world()
             .resource::<ActiveRenderMode>()
             .layout
-            .is_focus_owner(commits_dataset)
+            .can_activate(commits_dataset)
     );
     let previewed_files = app
         .runtime()
@@ -450,8 +481,8 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     app.runtime_mut().run_schedule();
 
     // Right/Left traverse logical Dataset depth without wrapping. Crossing
-    // a mode edge pushes/pops the complete context; within a mode only the
-    // Active Dataset changes.
+    // Commits -> Commit changes only the RenderMode: the Commits Dataset and
+    // its active Commit element remain unchanged.
     app.runtime_mut()
         .enqueue_input_intent(pitui_data::InputIntent::Key(KeyStroke::character('d')));
     app.runtime_mut().run_schedule();
@@ -467,7 +498,39 @@ fn composition_bootstraps_history_from_dataset_ecs() {
             .world()
             .resource::<ActiveUiContext>()
             .active_dataset,
-        commits_dataset
+        commits_dataset,
+        "opening Commits-Commit mode must retain the Commits list as Active"
+    );
+    assert_eq!(
+        app.runtime()
+            .world()
+            .get::<DatasetActiveElement>(commits_dataset)
+            .unwrap()
+            .0,
+        Some(commit_dataset),
+        "changing RenderMode must not change the active Commit element"
+    );
+    let UiLayoutProjection::Row(commit_mode_columns) =
+        &app.runtime().world().resource::<UiFrame>().layout
+    else {
+        panic!("Commit mode must be a row");
+    };
+    let UiLayoutProjection::Dataset {
+        panel: commits_panel,
+        ..
+    } = &commit_mode_columns[0]
+    else {
+        panic!("Commit mode must keep the Commits list on the left");
+    };
+    assert!(commits_panel.active);
+    let RenderContentProjection::Rows(rows) = &commits_panel.content else {
+        panic!("Commits panel must render rows");
+    };
+    assert!(
+        rows.rows
+            .iter()
+            .any(|row| row.entity == commit_dataset && row.active),
+        "the same Commit row must remain highlighted after the mode change"
     );
     assert_eq!(app.runtime().world().resource::<ContextStack>().0.len(), 1);
     app.runtime_mut()
@@ -483,7 +546,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     assert_eq!(
         app.runtime().world().resource::<ContextStack>().0.len(),
         1,
-        "moving between focusable leaves must not push another context"
+        "moving between activatable leaves must not push another context"
     );
 
     app.runtime_mut()
@@ -549,6 +612,13 @@ fn composition_bootstraps_history_from_dataset_ecs() {
         .render_bindings
         .get(&RenderBindingId::CurrentFileChanges)
         .unwrap();
+    let active_file = app
+        .runtime()
+        .world()
+        .get::<DatasetActiveElement>(files_dataset)
+        .unwrap()
+        .0
+        .unwrap();
     app.runtime_mut()
         .enqueue_input_intent(pitui_data::InputIntent::Key(KeyStroke::character('d')));
     app.runtime_mut().run_schedule();
@@ -564,7 +634,17 @@ fn composition_bootstraps_history_from_dataset_ecs() {
             .world()
             .resource::<ActiveUiContext>()
             .active_dataset,
-        files_dataset
+        files_dataset,
+        "opening FileDiff mode must retain Files as the Active Dataset"
+    );
+    assert_eq!(
+        app.runtime()
+            .world()
+            .get::<DatasetActiveElement>(files_dataset)
+            .unwrap()
+            .0,
+        Some(active_file),
+        "changing RenderMode must not change the active File element"
     );
     assert_eq!(app.runtime().world().resource::<ContextStack>().0.len(), 2);
     let UiLayoutProjection::Row(file_diff_columns) =
@@ -576,6 +656,25 @@ fn composition_bootstraps_history_from_dataset_ecs() {
         file_diff_columns.first(),
         Some(UiLayoutProjection::Column(_))
     ));
+    let UiLayoutProjection::Column(file_diff_left) = &file_diff_columns[0] else {
+        unreachable!();
+    };
+    let UiLayoutProjection::Dataset {
+        panel: files_panel, ..
+    } = &file_diff_left[1]
+    else {
+        panic!("FileDiff mode must keep Files in the left column");
+    };
+    assert!(files_panel.active);
+    let RenderContentProjection::Rows(rows) = &files_panel.content else {
+        panic!("Files panel must render rows");
+    };
+    assert!(
+        rows.rows
+            .iter()
+            .any(|row| row.entity == active_file && row.active),
+        "the same File row must remain highlighted after the mode change"
+    );
 
     app.runtime_mut()
         .enqueue_input_intent(pitui_data::InputIntent::Key(KeyStroke::character('d')));
@@ -585,15 +684,17 @@ fn composition_bootstraps_history_from_dataset_ecs() {
             .world()
             .resource::<ActiveUiContext>()
             .active_dataset,
-        diff_dataset
+        diff_dataset,
+        "a further Right transfers Active from Files to FileChanges"
     );
+
     assert!(
         app.runtime()
             .world()
             .resource::<ResolvedOperationSet>()
             .key_bindings
             .contains_key(&KeyStroke::control('c')),
-        "FileChanges focus must reuse the CurrentFiles copy operations"
+        "active FileChanges must reuse the CurrentFiles copy operations"
     );
     app.runtime_mut()
         .enqueue_input_intent(pitui_data::InputIntent::Key(KeyStroke::control('c')));
@@ -708,7 +809,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     assert_eq!(
         app.runtime()
             .world()
-            .get::<pitui_data::DatasetNavigationOrder>(changes)
+            .get::<pitui_data::DatasetCollection>(changes)
             .unwrap()
             .0
             .len(),
@@ -720,7 +821,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     let selected_change = app
         .runtime()
         .world()
-        .get::<DatasetCursor>(changes)
+        .get::<DatasetActiveElement>(changes)
         .unwrap()
         .0
         .unwrap();
@@ -743,7 +844,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
             .world()
             .get::<pitui_data::WorkingTreeFileChangesMetadata>(changes_diff)
             .is_some(),
-        "moving the Changes cursor synchronously refreshes the right diff"
+        "changing the active Changes element synchronously refreshes the right diff"
     );
     let UiLayoutProjection::Row(changes_columns) = &app.ui_frame().layout else {
         panic!("Changes must render as a reusable two-column mode");
@@ -762,7 +863,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
             .resource::<ActiveUiContext>()
             .active_dataset,
         changes,
-        "automatic diff refresh must not steal focus"
+        "automatic diff refresh must not steal Active ownership"
     );
     app.dispatch_input(pitui_data::InputIntent::Key(KeyStroke::character('d')));
     assert_eq!(
@@ -791,7 +892,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     );
 
     // Selection is owned by the global Changes Dataset even when the
-    // reusable diff panel is focused. Whole-file stage/unstage and commit
+    // reusable diff panel is active. Whole-file stage/unstage and commit
     // all travel through the same CommandInvocation -> GitCommand path.
     app.dispatch_input(pitui_data::InputIntent::Key(KeyStroke::character('d')));
     assert_eq!(
@@ -855,7 +956,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
             .resource::<ActiveUiContext>()
             .active_dataset,
         staged_diff,
-        "stage from the diff panel preserves the focused logical column"
+        "stage from the diff panel preserves the active logical column"
     );
     assert!(
         app.runtime()
@@ -871,7 +972,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
         if app
             .runtime()
             .world()
-            .get::<DatasetCursor>(changes)
+            .get::<DatasetActiveElement>(changes)
             .unwrap()
             .0
             == Some(staged_file)
@@ -883,7 +984,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     assert_eq!(
         app.runtime()
             .world()
-            .get::<DatasetCursor>(changes)
+            .get::<DatasetActiveElement>(changes)
             .unwrap()
             .0,
         Some(staged_file)
@@ -914,14 +1015,14 @@ fn composition_bootstraps_history_from_dataset_ecs() {
             .resource::<ActiveUiContext>()
             .active_dataset,
         unstaged_diff,
-        "unstage from the diff panel preserves the focused logical column"
+        "unstage from the diff panel preserves the active logical column"
     );
 
     for _ in 0..8 {
         if app
             .runtime()
             .world()
-            .get::<DatasetCursor>(changes)
+            .get::<DatasetActiveElement>(changes)
             .unwrap()
             .0
             == Some(unstaged_file)
@@ -933,7 +1034,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     assert_eq!(
         app.runtime()
             .world()
-            .get::<DatasetCursor>(changes)
+            .get::<DatasetActiveElement>(changes)
             .unwrap()
             .0,
         Some(unstaged_file)
@@ -1027,7 +1128,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
             .resource::<ActiveUiContext>()
             .active_dataset,
         remaining_diff,
-        "commit restores the same logical diff focus on the next remaining file"
+        "commit restores the same logical active diff on the next remaining file"
     );
     assert_eq!(app.runtime().world().resource::<ContextStack>().0.len(), 1);
 
@@ -1054,14 +1155,13 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     assert!(
         app.runtime()
             .world()
-            .get::<pitui_data::DatasetNavigationOrder>(changes)
+            .get::<pitui_data::DatasetCollection>(changes)
             .unwrap()
-            .0
-            .iter()
+            .entities()
             .all(|entity| !matches!(
                 app.runtime()
                     .world()
-                    .get::<DatasetKey>(*entity)
+                    .get::<DatasetKey>(entity)
                     .map(|key| &key.0),
                 Some(DatasetIdentity::WorkingTreeFile {
                     boundary: pitui_data::ChangeBoundary::Staged,
@@ -1265,7 +1365,7 @@ fn changes_supports_clean_repositories_and_committing_the_last_visible_file() {
     let file = app
         .runtime()
         .world()
-        .get::<DatasetCursor>(changes)
+        .get::<DatasetActiveElement>(changes)
         .unwrap()
         .0
         .unwrap();
@@ -1303,8 +1403,8 @@ fn changes_supports_clean_repositories_and_committing_the_last_visible_file() {
             .world()
             .resource::<ActiveRenderMode>()
             .layout
-            .is_focus_owner(changes),
-        "the removed diff entity must never remain as stale focus"
+            .can_activate(changes),
+        "the removed diff entity must never remain as stale Active ownership"
     );
     assert!(app.runtime_mut().validate().is_empty());
     let output = Command::new("git")
@@ -1314,6 +1414,186 @@ fn changes_supports_clean_repositories_and_committing_the_last_visible_file() {
         .unwrap();
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn changes_multiselects_directories_and_stages_or_unstages_all_descendant_files() {
+    let repository = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.name", "Pitui Test"]);
+    git(&["config", "user.email", "pitui@example.invalid"]);
+    fs::write(repository.path().join("README.md"), "base\n").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-m", "initial"]);
+    fs::create_dir_all(repository.path().join("docs")).unwrap();
+    fs::create_dir_all(repository.path().join("src/nested")).unwrap();
+    fs::write(repository.path().join("docs/guide.md"), "guide\n").unwrap();
+    fs::write(repository.path().join("src/lib.rs"), "pub mod nested;\n").unwrap();
+    fs::write(
+        repository.path().join("src/nested/mod.rs"),
+        "pub fn value() {}\n",
+    )
+    .unwrap();
+
+    let mut app = App::open_from(repository.path(), Vec::new()).unwrap();
+    app.dispatch_input(InputIntent::Key(KeyStroke::control('g')));
+    let changes = app
+        .runtime()
+        .world()
+        .resource::<DatasetIndex>()
+        .get(&DatasetIdentity::GlobalChanges)
+        .unwrap();
+    let repository_key = match &app
+        .runtime()
+        .world()
+        .get::<DatasetKey>(app.repositories()[0])
+        .unwrap()
+        .0
+    {
+        DatasetIdentity::Repository(repository) => repository.clone(),
+        identity => panic!("expected Repository identity, got {identity:?}"),
+    };
+    let directory = |app: &App, boundary, path: &str| {
+        app.runtime()
+            .world()
+            .resource::<DatasetIndex>()
+            .get(&DatasetIdentity::WorkingTreeDirectory {
+                repository: repository_key.clone(),
+                boundary,
+                path: path.into(),
+            })
+            .unwrap_or_else(|| panic!("missing {boundary:?} directory {path}"))
+    };
+    let file = |app: &App, boundary, path: &str| {
+        app.runtime()
+            .world()
+            .resource::<DatasetIndex>()
+            .get(&DatasetIdentity::WorkingTreeFile {
+                repository: repository_key.clone(),
+                boundary,
+                path: path.into(),
+            })
+            .unwrap_or_else(|| panic!("missing {boundary:?} file {path}"))
+    };
+    let shifted = |character| {
+        let mut stroke = KeyStroke::character(character);
+        stroke.modifiers.shift = true;
+        stroke
+    };
+
+    let docs = directory(&app, pitui_data::ChangeBoundary::Unstaged, "docs");
+    let src = directory(&app, pitui_data::ChangeBoundary::Unstaged, "src");
+    let nested = directory(&app, pitui_data::ChangeBoundary::Unstaged, "src/nested");
+    let guide = file(&app, pitui_data::ChangeBoundary::Unstaged, "docs/guide.md");
+    let lib = file(&app, pitui_data::ChangeBoundary::Unstaged, "src/lib.rs");
+    let module = file(
+        &app,
+        pitui_data::ChangeBoundary::Unstaged,
+        "src/nested/mod.rs",
+    );
+    for target in [src, docs] {
+        app.runtime_mut()
+            .set_active_element(changes, Some(target))
+            .unwrap();
+        app.runtime_mut().run_schedule();
+        app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Space)));
+    }
+    assert_eq!(
+        app.runtime()
+            .world()
+            .get::<DatasetSelection>(changes)
+            .unwrap()
+            .0
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([docs, guide, src, nested, lib, module]),
+        "selecting parent directories must select every descendant Dataset row"
+    );
+
+    app.runtime_mut()
+        .set_active_element(changes, Some(module))
+        .unwrap();
+    app.runtime_mut().run_schedule();
+    app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Space)));
+    let selected = &app
+        .runtime()
+        .world()
+        .get::<DatasetSelection>(changes)
+        .unwrap()
+        .0;
+    assert!(!selected.contains(&module));
+    assert!(!selected.contains(&nested));
+    assert!(!selected.contains(&src));
+    assert!(selected.contains(&lib));
+    app.runtime_mut()
+        .set_active_element(changes, Some(src))
+        .unwrap();
+    app.runtime_mut().run_schedule();
+    app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Space)));
+
+    app.dispatch_input(InputIntent::Key(shifted('s')));
+    assert_eq!(
+        git(&["diff", "--cached", "--name-only"])
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["docs/guide.md", "src/lib.rs", "src/nested/mod.rs"],
+        "staging selected directories must expand to every descendant file"
+    );
+
+    let staged_docs = directory(&app, pitui_data::ChangeBoundary::Staged, "docs");
+    let staged_src = directory(&app, pitui_data::ChangeBoundary::Staged, "src");
+    for target in [staged_src, staged_docs] {
+        app.runtime_mut()
+            .set_active_element(changes, Some(target))
+            .unwrap();
+        app.runtime_mut().run_schedule();
+        app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Space)));
+    }
+    assert_eq!(
+        app.runtime()
+            .world()
+            .get::<DatasetSelection>(changes)
+            .unwrap()
+            .0
+            .len(),
+        6,
+        "staged parent selection must include nested directories and files"
+    );
+    app.dispatch_input(InputIntent::Key(shifted('u')));
+    assert!(
+        git(&["diff", "--cached", "--name-only"]).is_empty(),
+        "unstaging selected directories must expand to every descendant file"
+    );
+    for path in ["docs/guide.md", "src/lib.rs", "src/nested/mod.rs"] {
+        assert!(
+            app.runtime()
+                .world()
+                .resource::<DatasetIndex>()
+                .get(&DatasetIdentity::WorkingTreeFile {
+                    repository: repository_key.clone(),
+                    boundary: pitui_data::ChangeBoundary::Unstaged,
+                    path: path.into(),
+                })
+                .is_some(),
+            "{path} must return to the unstaged tree"
+        );
+    }
+    assert!(app.runtime_mut().validate().is_empty());
 }
 
 #[test]
@@ -1508,7 +1788,7 @@ fn initial_non_repository_failure_keeps_a_blank_snapshot_and_presents_notice_lat
 }
 
 #[test]
-fn git_operation_log_is_a_navigable_data_backed_two_column_context() {
+fn git_operation_log_is_a_collection_backed_two_column_context() {
     let repository = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
         let output = Command::new("git")
@@ -1553,7 +1833,11 @@ fn git_operation_log_is_a_navigable_data_backed_two_column_context() {
     }));
     let newest = entries[0];
     assert_eq!(
-        app.runtime().world().get::<DatasetCursor>(log).unwrap().0,
+        app.runtime()
+            .world()
+            .get::<DatasetActiveElement>(log)
+            .unwrap()
+            .0,
         Some(newest)
     );
 
@@ -1562,7 +1846,7 @@ fn git_operation_log_is_a_navigable_data_backed_two_column_context() {
     let displayed_entry = app
         .runtime()
         .world()
-        .get::<DatasetCursor>(log)
+        .get::<DatasetActiveElement>(log)
         .unwrap()
         .0
         .unwrap();
@@ -1620,7 +1904,7 @@ fn git_operation_log_is_a_navigable_data_backed_two_column_context() {
                 .resource::<ActiveUiContext>()
                 .active_dataset,
             log,
-            "log detail preview must not steal list focus"
+            "log detail preview must not steal list Active ownership"
         );
     }
     app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Escape)));
@@ -1742,7 +2026,7 @@ fn reflog_command_opens_a_data_backed_context_and_copies_the_current_hash() {
     let first = app
         .runtime()
         .world()
-        .get::<DatasetCursor>(reflog)
+        .get::<DatasetActiveElement>(reflog)
         .unwrap()
         .0
         .unwrap();
@@ -1791,7 +2075,7 @@ fn reflog_command_opens_a_data_backed_context_and_copies_the_current_hash() {
             .render_bindings
             .get(&RenderBindingId::CurrentReflogEntry),
         Some(first),
-        "moving the Reflog cursor must refresh detail without stealing focus"
+        "changing the active Reflog element must refresh detail without stealing Active ownership"
     );
     app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Escape)));
     assert_eq!(
@@ -1886,7 +2170,9 @@ fn commits_selection_is_the_only_cherry_pick_source_and_replays_oldest_first() {
         .unwrap();
     app.runtime_mut().run_schedule();
     let root = app.root_dataset();
-    app.runtime_mut().set_cursor(root, Some(feature)).unwrap();
+    app.runtime_mut()
+        .set_active_element(root, Some(feature))
+        .unwrap();
     app.runtime_mut().run_schedule();
     app.dispatch_input(InputIntent::Key(KeyStroke::character('d')));
     assert_eq!(
@@ -2047,7 +2333,9 @@ fn cherry_pick_conflict_is_aborted_noticed_and_logged_as_typed_data() {
         .unwrap();
     app.runtime_mut().run_schedule();
     let root = app.root_dataset();
-    app.runtime_mut().set_cursor(root, Some(feature)).unwrap();
+    app.runtime_mut()
+        .set_active_element(root, Some(feature))
+        .unwrap();
     app.runtime_mut().run_schedule();
     app.dispatch_input(InputIntent::Key(KeyStroke::character('d')));
     assert_eq!(

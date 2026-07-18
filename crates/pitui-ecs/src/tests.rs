@@ -5,10 +5,34 @@ use pitui_data::{RenderBindingId, RenderProxyId, ResolvedOperationSetId};
 
 fn register(runtime: &mut DatasetRuntime, id: &str, kind: DatasetKind) -> DatasetTemplateId {
     let id = DatasetTemplateId::from(id);
+    let tree = |visible_kinds, selectable_kinds| {
+        pitui_data::CollectionManagerSpec::Tree(pitui_data::TreeManagerSpec {
+            visible_kinds,
+            selectable_kinds,
+            sibling_order: pitui_data::TreeSiblingOrder::Source,
+            selection: pitui_data::TreeSelectionMode::Cascade,
+        })
+    };
+    let collection = match kind {
+        DatasetKind::RepositoriesBranches => tree(
+            vec![DatasetKind::Repository, DatasetKind::Branch],
+            vec![DatasetKind::Repository, DatasetKind::Branch],
+        ),
+        DatasetKind::Changes => tree(
+            vec![
+                DatasetKind::WorkingTreeFiles,
+                DatasetKind::FileTreeDirectory,
+                DatasetKind::WorkingTreeFile,
+            ],
+            vec![DatasetKind::FileTreeDirectory, DatasetKind::WorkingTreeFile],
+        ),
+        _ => pitui_data::CollectionManagerSpec::List,
+    };
     runtime
         .register_template(DatasetTemplate {
             id: id.clone(),
             kind,
+            collection,
             operations: Vec::new(),
             render_proxies: vec![RenderProxyId::from("test")],
         })
@@ -120,7 +144,7 @@ fn rejects_cycles_before_mutating_children() {
 }
 
 #[test]
-fn cursor_repair_does_not_move_active_dataset() {
+fn active_element_repair_does_not_move_active_dataset() {
     let mut runtime = DatasetRuntime::new();
     let commits_template = register(&mut runtime, "commits", DatasetKind::Commits);
     let commit_template = register(&mut runtime, "commit", DatasetKind::Commit);
@@ -159,7 +183,7 @@ fn cursor_repair_does_not_move_active_dataset() {
         .replace_children(commits, vec![first, second], true)
         .unwrap();
     runtime.add_root(commits).unwrap();
-    runtime.set_cursor(commits, Some(first)).unwrap();
+    runtime.set_active_element(commits, Some(first)).unwrap();
     runtime.set_selection(commits, vec![first, second]).unwrap();
     runtime
         .initialize_ui(
@@ -170,7 +194,7 @@ fn cursor_repair_does_not_move_active_dataset() {
                 dataset: commits,
                 proxy: RenderProxyId::from("commits.detailed"),
                 constraint: pitui_data::LayoutConstraint::Fill(1),
-                focusable: true,
+                activatable: true,
             },
             operations(),
         )
@@ -182,7 +206,11 @@ fn cursor_repair_does_not_move_active_dataset() {
     runtime.run_schedule();
 
     assert_eq!(
-        runtime.world().get::<DatasetCursor>(commits).unwrap().0,
+        runtime
+            .world()
+            .get::<DatasetActiveElement>(commits)
+            .unwrap()
+            .0,
         Some(second)
     );
     assert_eq!(
@@ -197,7 +225,7 @@ fn cursor_repair_does_not_move_active_dataset() {
 }
 
 #[test]
-fn repository_tree_navigation_exposes_repositories_and_branches_only() {
+fn repository_tree_collection_exposes_repositories_and_branches_only() {
     let mut runtime = DatasetRuntime::new();
     let root_template = register(
         &mut runtime,
@@ -258,15 +286,35 @@ fn repository_tree_navigation_exposes_repositories_and_branches_only() {
     assert_eq!(
         runtime
             .world()
-            .get::<DatasetNavigationOrder>(root)
+            .get::<DatasetCollection>(root)
             .unwrap()
-            .0,
+            .entities()
+            .collect::<Vec<_>>(),
         vec![repository, branch]
     );
-    runtime.set_cursor(root, Some(branch)).unwrap();
+    let collection = runtime.world().get::<DatasetCollection>(root).unwrap();
+    assert_eq!(collection.depth(repository), 0);
+    assert_eq!(collection.depth(branch), 1);
+    collection::toggle_selection(runtime.world_mut(), root, &[repository]).unwrap();
+    assert_eq!(
+        runtime.world().get::<DatasetSelection>(root).unwrap().0,
+        vec![repository, branch],
+        "the shared Tree Manager must cascade Repository selection to Branch rows"
+    );
+    collection::toggle_selection(runtime.world_mut(), root, &[branch]).unwrap();
+    assert!(
+        runtime
+            .world()
+            .get::<DatasetSelection>(root)
+            .unwrap()
+            .0
+            .is_empty(),
+        "deselecting a child must clear its no-longer-complete parent"
+    );
+    runtime.set_active_element(root, Some(branch)).unwrap();
     assert!(matches!(
-        runtime.set_cursor(root, Some(commits)),
-        Err(KernelError::CursorOutsideDataset { .. })
+        runtime.set_active_element(root, Some(commits)),
+        Err(KernelError::ActiveElementOutsideDataset { .. })
     ));
 
     runtime
@@ -276,20 +324,21 @@ fn repository_tree_navigation_exposes_repositories_and_branches_only() {
     assert_eq!(
         runtime
             .world()
-            .get::<DatasetNavigationOrder>(root)
+            .get::<DatasetCollection>(root)
             .unwrap()
-            .0,
+            .entities()
+            .collect::<Vec<_>>(),
         vec![repository]
     );
     assert_eq!(
-        runtime.world().get::<DatasetCursor>(root).unwrap().0,
+        runtime.world().get::<DatasetActiveElement>(root).unwrap().0,
         Some(repository)
     );
     assert!(runtime.validate().is_empty());
 }
 
 #[test]
-fn changes_tree_navigation_reaches_third_level_files_without_exposing_diffs() {
+fn changes_tree_collection_reaches_third_level_files_without_exposing_diffs() {
     let mut runtime = DatasetRuntime::new();
     let changes_template = register(&mut runtime, "changes", DatasetKind::Changes);
     let group_template = register(
@@ -357,16 +406,17 @@ fn changes_tree_navigation_reaches_third_level_files_without_exposing_diffs() {
     assert_eq!(
         runtime
             .world()
-            .get::<DatasetNavigationOrder>(root)
+            .get::<DatasetCollection>(root)
             .unwrap()
-            .0,
+            .entities()
+            .collect::<Vec<_>>(),
         vec![group, file]
     );
-    runtime.set_cursor(root, Some(file)).unwrap();
+    runtime.set_active_element(root, Some(file)).unwrap();
     runtime.set_selection(root, vec![file]).unwrap();
     assert!(matches!(
-        runtime.set_cursor(root, Some(diff)),
-        Err(KernelError::CursorOutsideDataset { .. })
+        runtime.set_active_element(root, Some(diff)),
+        Err(KernelError::ActiveElementOutsideDataset { .. })
     ));
     assert_eq!(
         runtime.world().get::<DatasetSelection>(root).unwrap().0,
@@ -436,13 +486,13 @@ fn context_push_and_pop_restore_active_mode_and_bindings_atomically() {
         dataset: history,
         proxy: RenderProxyId::from("history"),
         constraint: pitui_data::LayoutConstraint::Fill(1),
-        focusable: true,
+        activatable: true,
     };
     let detail_layout = ResolvedRenderLayout::Dataset {
         dataset: detail,
         proxy: RenderProxyId::from("detail"),
         constraint: pitui_data::LayoutConstraint::Fill(1),
-        focusable: true,
+        activatable: true,
     };
     let mut history_bindings = RenderContextBindings::default();
     history_bindings.bind(RenderBindingId::CurrentRepository, history);
@@ -516,6 +566,7 @@ fn registration_contracts_reject_dangling_proxy_and_command_system_references() 
         .register_default_template(DatasetTemplate {
             id: DatasetTemplateId::from("changes"),
             kind: DatasetKind::Changes,
+            collection: pitui_data::CollectionManagerSpec::List,
             operations: Vec::new(),
             render_proxies: vec![RenderProxyId::from("missing.proxy")],
         })

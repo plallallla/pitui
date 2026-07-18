@@ -7,7 +7,7 @@ use super::*;
 #[test]
 fn builtins_cover_every_dataset_kind_once() {
     let templates = builtin_dataset_templates();
-    assert_eq!(templates.len(), 20);
+    assert_eq!(templates.len(), 21);
     let kinds = templates
         .iter()
         .map(|template| template.kind)
@@ -27,7 +27,7 @@ fn every_template_proxy_resolves_to_the_same_dataset_kind() {
         .into_iter()
         .map(|proxy| (proxy.id.clone(), proxy))
         .collect::<std::collections::HashMap<_, _>>();
-    assert_eq!(proxies.len(), 23);
+    assert_eq!(proxies.len(), 24);
 
     for template in builtin_dataset_templates() {
         for proxy_id in template.render_proxies {
@@ -36,6 +36,63 @@ fn every_template_proxy_resolves_to_the_same_dataset_kind() {
                 .unwrap_or_else(|| panic!("missing built-in proxy {}", proxy_id.0));
             assert_eq!(proxy.dataset_kind, template.kind);
         }
+    }
+}
+
+#[test]
+fn file_collection_proxies_are_path_trees() {
+    let proxies = builtin_render_proxies()
+        .into_iter()
+        .map(|proxy| (proxy.id.clone(), proxy))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    for id in ["files.tree", "changes.tree", "working-tree-files.tree"] {
+        assert_eq!(
+            proxies[&RenderProxyId::from(id)].renderer,
+            RendererKind::PathTree,
+            "{id} must preserve directory structure instead of flattening Git paths"
+        );
+    }
+    assert!(!proxies.contains_key(&RenderProxyId::from("files.list")));
+    assert!(!proxies.contains_key(&RenderProxyId::from("working-tree-files.list")));
+}
+
+#[test]
+fn collection_managers_are_declared_by_dataset_templates() {
+    let templates = builtin_dataset_templates()
+        .into_iter()
+        .map(|template| (template.kind, template))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    for kind in [
+        DatasetKind::RepositoriesBranches,
+        DatasetKind::Files,
+        DatasetKind::Changes,
+        DatasetKind::WorkingTreeFiles,
+        DatasetKind::FileTreeDirectory,
+    ] {
+        let CollectionManagerSpec::Tree(tree) = &templates[&kind].collection else {
+            panic!("{kind:?} must use the shared Tree Manager");
+        };
+        assert_eq!(tree.selection, TreeSelectionMode::Cascade);
+        assert!(!tree.visible_kinds.is_empty());
+        assert!(
+            tree.selectable_kinds
+                .iter()
+                .all(|kind| tree.visible_kinds.contains(kind))
+        );
+    }
+    for kind in [
+        DatasetKind::Commits,
+        DatasetKind::Reflog,
+        DatasetKind::Remotes,
+        DatasetKind::GitOperationLog,
+    ] {
+        assert_eq!(
+            templates[&kind].collection,
+            CollectionManagerSpec::List,
+            "{kind:?} must keep independent List Manager semantics"
+        );
     }
 }
 
@@ -54,10 +111,11 @@ fn core_semantic_datasets_have_explicit_proxy_and_operation_contracts() {
     assert_eq!(
         repositories_branches.operations,
         [
-            "navigation.up",
-            "navigation.down",
-            "navigation.left",
-            "navigation.right",
+            "active.up",
+            "active.down",
+            "active.left",
+            "active.right",
+            "selection.toggle",
         ]
         .into_iter()
         .map(OperationId::from)
@@ -213,12 +271,12 @@ fn availability_can_match(
 ) -> bool {
     match rule {
         AvailabilityRule::Always
-        | AvailabilityRule::HasCursor
+        | AvailabilityRule::HasActiveElement
         | AvailabilityRule::HasSelection
-        | AvailabilityRule::HasSelectionOrCursor
-        | AvailabilityRule::ContextHasCursor(_)
-        | AvailabilityRule::ContextHasSelectionOrCursor(_)
-        | AvailabilityRule::ContextCursorKind(_, _)
+        | AvailabilityRule::HasSelectionOrActiveElement
+        | AvailabilityRule::ContextHasActiveElement(_)
+        | AvailabilityRule::ContextHasSelectionOrActiveElement(_)
+        | AvailabilityRule::ContextActiveElementKind(_, _)
         | AvailabilityRule::ContextTargetsBoundary(_, _)
         | AvailabilityRule::ChangesHasStagedFiles(_) => true,
         AvailabilityRule::ActiveDatasetKind(expected) => *expected == kind,
@@ -258,6 +316,18 @@ fn default_profile_has_wasd_arrows_and_keeps_control_space_unbound() {
         modifiers: pitui_data::KeyModifiers::control(),
     };
     assert!(!all_strokes.contains(&control_space));
+}
+
+#[test]
+fn detail_mode_handoffs_keep_the_source_list_active() {
+    let handoffs = builtin_active_handoffs();
+    for kind in [DatasetKind::Commits, DatasetKind::Files] {
+        let spec = handoffs
+            .rules
+            .get(&(kind, ActiveDirection::Right))
+            .unwrap_or_else(|| panic!("missing Right handoff for {kind:?}"));
+        assert_eq!(spec.target, ActiveHandoffTarget::KeepActiveDataset);
+    }
 }
 
 #[test]

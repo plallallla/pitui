@@ -8,26 +8,26 @@
 use std::{collections::HashSet, error::Error, fmt, sync::Arc};
 
 use bevy_ecs::{
-    prelude::{
-        Entity, In, IntoScheduleConfigs, IntoSystem, Query, Resource, Schedule, SystemSet, World,
-    },
+    prelude::{Entity, In, IntoScheduleConfigs, IntoSystem, Resource, Schedule, SystemSet, World},
     schedule::ScheduleLabel,
 };
 use pitui_data::{
-    ActiveRenderMode, ActiveUiContext, AvailabilityRegistryError, AvailabilityRule,
-    AvailabilityRuleId, AvailabilityRuleRegistry, CommandId, CommandInvocation, CommandRegistry,
-    CommandRegistryError, CommandSpec, CommandSystemId, ContextStack, Dataset, DatasetBinding,
-    DatasetBundle, DatasetChildren, DatasetCursor, DatasetIdentity, DatasetIndex, DatasetKey,
-    DatasetKind, DatasetNavigationOrder, DatasetRevision, DatasetRoots, DatasetSelection,
-    DatasetTemplate, DatasetTemplateId, DatasetTemplateRef, DatasetTemplateRegistry, DatasetType,
-    DefaultDatasetTemplates, GlobalOperationSet, HasSnapshot, InputIntent, NavigationModeRegistry,
-    OperationId, OperationRegistry, OperationRegistryError, OperationSpec, PendingChordState,
-    QuitRequested, RenderContextBindings, RenderLayout, RenderModeId, RenderModeRegistry,
-    RenderModeSpec, RenderProxyId, RenderProxyRegistry, RenderProxySpec, RenderRegistryError,
-    ResolvedOperationSet, ResolvedRenderLayout, UiContextSnapshot, UiFrame, ViewportMeasurement,
+    ActiveHandoffRegistry, ActiveRenderMode, ActiveUiContext, AvailabilityRegistryError,
+    AvailabilityRule, AvailabilityRuleId, AvailabilityRuleRegistry, CollectionElement,
+    CollectionManagerSpec, CommandId, CommandInvocation, CommandRegistry, CommandRegistryError,
+    CommandSpec, CommandSystemId, ContextStack, Dataset, DatasetActiveElement, DatasetBinding,
+    DatasetBundle, DatasetChildren, DatasetCollection, DatasetIdentity, DatasetIndex, DatasetKey,
+    DatasetKind, DatasetRevision, DatasetRoots, DatasetSelection, DatasetTemplate,
+    DatasetTemplateId, DatasetTemplateRef, DatasetTemplateRegistry, DatasetType,
+    DefaultDatasetTemplates, GlobalOperationSet, HasSnapshot, InputIntent, OperationId,
+    OperationRegistry, OperationRegistryError, OperationSpec, PendingChordState, QuitRequested,
+    RenderContextBindings, RenderLayout, RenderModeId, RenderModeRegistry, RenderModeSpec,
+    RenderProxyId, RenderProxyRegistry, RenderProxySpec, RenderRegistryError, ResolvedOperationSet,
+    ResolvedRenderLayout, UiContextSnapshot, UiFrame, ViewportMeasurement,
 };
 
 mod binding_reconcile;
+mod collection;
 mod git_runtime;
 mod operation_runtime;
 mod projection;
@@ -86,16 +86,24 @@ pub enum KernelError {
         parent: Entity,
         child: Entity,
     },
-    CursorOutsideDataset {
+    ActiveElementOutsideDataset {
         dataset: Entity,
-        cursor: Entity,
+        element: Entity,
     },
     SelectionOutsideDataset {
         dataset: Entity,
         selected: Entity,
     },
-    ActiveDatasetNotFocusable(Entity),
-    NoDeeperFocusableDataset(Entity),
+    ActiveRelaySourceChanged {
+        expected: Entity,
+        actual: Entity,
+    },
+    ActiveRelayKindMismatch {
+        dataset: Entity,
+        expected: DatasetKind,
+        actual: DatasetKind,
+    },
+    ActiveDatasetNotActivatable(Entity),
     ContextAlreadyInitialized,
     ContextUnavailable,
     MissingRenderMode(RenderModeId),
@@ -139,6 +147,18 @@ pub enum RegistrationContractError {
     DuplicateTemplateProxy {
         template: DatasetTemplateId,
         proxy: RenderProxyId,
+    },
+    DuplicateTreeVisibleKind {
+        template: DatasetTemplateId,
+        kind: DatasetKind,
+    },
+    DuplicateTreeSelectableKind {
+        template: DatasetTemplateId,
+        kind: DatasetKind,
+    },
+    TreeSelectableKindNotVisible {
+        template: DatasetTemplateId,
+        kind: DatasetKind,
     },
     MissingTemplateOperation {
         template: DatasetTemplateId,
@@ -194,17 +214,25 @@ pub enum InvariantViolation {
         parent: Entity,
         child: Entity,
     },
-    DanglingNavigationTarget {
+    DanglingCollectionElement {
         dataset: Entity,
         target: Entity,
     },
-    InvalidNavigationOrder(Entity),
+    ActiveElementOutsideCollection {
+        dataset: Entity,
+        element: Entity,
+    },
+    SelectionOutsideCollection {
+        dataset: Entity,
+        selected: Entity,
+    },
+    InvalidCollection(Entity),
     DatasetCycle(Entity),
     DanglingRoot(Entity),
     DanglingActiveDataset(Entity),
     DanglingRenderBinding(Entity),
     DanglingContextEntity(Entity),
-    ActiveDatasetNotFocusable(Entity),
+    ActiveDatasetNotActivatable(Entity),
 }
 
 /// Runtime owner for the Data Driven ECS world.
@@ -242,7 +270,7 @@ impl DatasetRuntime {
         world.init_resource::<DefaultDatasetTemplates>();
         world.init_resource::<RenderProxyRegistry>();
         world.init_resource::<RenderModeRegistry>();
-        world.init_resource::<NavigationModeRegistry>();
+        world.init_resource::<ActiveHandoffRegistry>();
         world.init_resource::<UiFrame>();
         world.init_resource::<ProjectionDiagnostics>();
         world.init_resource::<bevy_ecs::prelude::Messages<ViewportMeasurement>>();
@@ -295,9 +323,9 @@ impl DatasetRuntime {
         schedule.add_systems(projection::build_ui_frame.in_set(RuntimeSet::Projection));
         schedule.add_systems(
             (
-                rebuild_dataset_navigation_orders,
-                repair_dataset_navigation,
-                operation_runtime::reconcile_pending_changes_focus,
+                collection::rebuild_collections,
+                collection::repair_active_elements,
+                operation_runtime::reconcile_pending_changes_active,
                 binding_reconcile::collect_context_transitions,
                 binding_reconcile::apply_context_transitions,
                 binding_reconcile::update_dependent_render_bindings,
@@ -324,7 +352,10 @@ impl DatasetRuntime {
         &mut self.world
     }
 
-    pub fn register_template(&mut self, template: DatasetTemplate) -> Result<(), DatasetTemplate> {
+    pub fn register_template(
+        &mut self,
+        template: DatasetTemplate,
+    ) -> Result<(), Box<DatasetTemplate>> {
         self.world
             .resource_mut::<DatasetTemplateRegistry>()
             .register(template)
@@ -333,7 +364,7 @@ impl DatasetRuntime {
     pub fn register_default_template(
         &mut self,
         template: DatasetTemplate,
-    ) -> Result<(), DatasetTemplate> {
+    ) -> Result<(), Box<DatasetTemplate>> {
         let id = template.id.clone();
         let kind = template.kind;
         if self
@@ -342,7 +373,7 @@ impl DatasetRuntime {
             .get(kind)
             .is_some()
         {
-            return Err(template);
+            return Err(Box::new(template));
         }
         self.register_template(template)?;
         self.world
@@ -396,7 +427,7 @@ impl DatasetRuntime {
         self.world.resource_mut::<GlobalOperationSet>().0 = operations;
     }
 
-    pub fn set_navigation_modes(&mut self, modes: NavigationModeRegistry) {
+    pub fn set_active_handoffs(&mut self, modes: ActiveHandoffRegistry) {
         self.world.insert_resource(modes);
     }
 
@@ -443,6 +474,32 @@ impl DatasetRuntime {
                 errors.push(RegistrationContractError::DatasetTemplateHasNoRenderProxy(
                     template.id.clone(),
                 ));
+            }
+            if let CollectionManagerSpec::Tree(tree) = &template.collection {
+                let mut visible = HashSet::new();
+                for kind in &tree.visible_kinds {
+                    if !visible.insert(*kind) {
+                        errors.push(RegistrationContractError::DuplicateTreeVisibleKind {
+                            template: template.id.clone(),
+                            kind: *kind,
+                        });
+                    }
+                }
+                let mut selectable = HashSet::new();
+                for kind in &tree.selectable_kinds {
+                    if !selectable.insert(*kind) {
+                        errors.push(RegistrationContractError::DuplicateTreeSelectableKind {
+                            template: template.id.clone(),
+                            kind: *kind,
+                        });
+                    }
+                    if !visible.contains(kind) {
+                        errors.push(RegistrationContractError::TreeSelectableKindNotVisible {
+                            template: template.id.clone(),
+                            kind: *kind,
+                        });
+                    }
+                }
             }
             let mut seen_operations = HashSet::new();
             for operation_id in &template.operations {
@@ -590,20 +647,20 @@ impl DatasetRuntime {
             operation_runtime::submit_palette_command,
         )?;
         self.register_command_system(
-            CommandSystemId::from("navigation.up"),
-            operation_runtime::navigate_up,
+            CommandSystemId::from("active.up"),
+            operation_runtime::activate_previous_element,
         )?;
         self.register_command_system(
-            CommandSystemId::from("navigation.down"),
-            operation_runtime::navigate_down,
+            CommandSystemId::from("active.down"),
+            operation_runtime::activate_next_element,
         )?;
         self.register_command_system(
-            CommandSystemId::from("navigation.left"),
-            operation_runtime::navigate_left,
+            CommandSystemId::from("active.left"),
+            operation_runtime::transfer_active_left,
         )?;
         self.register_command_system(
-            CommandSystemId::from("navigation.right"),
-            operation_runtime::navigate_right,
+            CommandSystemId::from("active.right"),
+            operation_runtime::transfer_active_right,
         )?;
         self.register_command_system(
             CommandSystemId::from("selection.toggle"),
@@ -781,21 +838,23 @@ impl DatasetRuntime {
         replace_children_in_world(&mut self.world, parent, children, has_snapshot)
     }
 
-    pub fn set_cursor(
+    pub fn set_active_element(
         &mut self,
         dataset: Entity,
-        cursor: Option<Entity>,
+        element: Option<Entity>,
     ) -> Result<(), KernelError> {
         self.require_dataset(dataset)?;
-        if let Some(cursor) = cursor
+        if let Some(element) = element
             && !self
                 .world
-                .get::<DatasetNavigationOrder>(dataset)
-                .is_some_and(|navigation| navigation.0.contains(&cursor))
+                .get::<DatasetCollection>(dataset)
+                .is_some_and(|collection| collection.contains(element))
         {
-            return Err(KernelError::CursorOutsideDataset { dataset, cursor });
+            return Err(KernelError::ActiveElementOutsideDataset { dataset, element });
         }
-        self.world.entity_mut(dataset).insert(DatasetCursor(cursor));
+        self.world
+            .entity_mut(dataset)
+            .insert(DatasetActiveElement(element));
         Ok(())
     }
 
@@ -805,14 +864,13 @@ impl DatasetRuntime {
         selection: Vec<Entity>,
     ) -> Result<(), KernelError> {
         self.require_dataset(dataset)?;
-        let navigation = &self
+        let collection = self
             .world
-            .get::<DatasetNavigationOrder>(dataset)
-            .expect("validated Dataset must have a navigation order")
-            .0;
+            .get::<DatasetCollection>(dataset)
+            .expect("validated Dataset must have a collection");
         if let Some(selected) = selection
             .iter()
-            .find(|selected| !navigation.contains(selected))
+            .find(|selected| !collection.contains(**selected))
         {
             return Err(KernelError::SelectionOutsideDataset {
                 dataset,
@@ -973,7 +1031,7 @@ impl DatasetRuntime {
         Ok(())
     }
 
-    /// Pops the navigation context. The caller supplies projections resolved
+    /// Pops the active context. The caller supplies projections resolved
     /// from the restored Mode/Active Dataset; only validated data is committed.
     pub fn pop_context(
         &mut self,
@@ -1037,8 +1095,8 @@ impl DatasetRuntime {
         layout: &ResolvedRenderLayout,
     ) -> Result<(), KernelError> {
         self.require_dataset(active_dataset)?;
-        if !layout.is_focus_owner(active_dataset) {
-            return Err(KernelError::ActiveDatasetNotFocusable(active_dataset));
+        if !layout.can_activate(active_dataset) {
+            return Err(KernelError::ActiveDatasetNotActivatable(active_dataset));
         }
         for entity in render_bindings.entities() {
             self.require_dataset(entity)?;
@@ -1213,7 +1271,7 @@ fn resolve_render_layout(
                 dataset,
                 proxy,
                 constraint,
-                focusable,
+                activatable,
             } => {
                 let entity = match dataset {
                     DatasetBinding::Stable(identity) => world
@@ -1253,7 +1311,7 @@ fn resolve_render_layout(
                     dataset: entity,
                     proxy: proxy.clone(),
                     constraint: *constraint,
-                    focusable: *focusable,
+                    activatable: *activatable,
                 }))
             }
         }
@@ -1286,7 +1344,12 @@ fn replace_children_in_world(
 
     world.entity_mut(parent).insert((
         DatasetChildren(children.clone()),
-        DatasetNavigationOrder(children),
+        DatasetCollection(
+            children
+                .into_iter()
+                .map(|entity| CollectionElement { entity, depth: 0 })
+                .collect(),
+        ),
         HasSnapshot(has_snapshot),
     ));
     world
@@ -1301,92 +1364,6 @@ fn require_dataset(world: &World, entity: Entity) -> Result<(), KernelError> {
         .get::<Dataset>(entity)
         .map(|_| ())
         .ok_or(KernelError::MissingDataset(entity))
-}
-
-fn rebuild_dataset_navigation_orders(world: &mut World) {
-    let datasets = {
-        let mut query = world.query::<(Entity, &DatasetType, &DatasetChildren)>();
-        query
-            .iter(world)
-            .map(|(entity, kind, children)| (entity, kind.0, children.0.clone()))
-            .collect::<Vec<_>>()
-    };
-
-    for (entity, kind, children) in datasets {
-        let expected = expected_navigation_order(world, kind, &children);
-        let should_update = world
-            .get::<DatasetNavigationOrder>(entity)
-            .is_none_or(|navigation| navigation.0 != expected);
-        if should_update {
-            world
-                .entity_mut(entity)
-                .insert(DatasetNavigationOrder(expected));
-        }
-    }
-}
-
-fn expected_navigation_order(world: &World, kind: DatasetKind, children: &[Entity]) -> Vec<Entity> {
-    match kind {
-        DatasetKind::RepositoriesBranches => flatten_one_level(
-            world,
-            children,
-            DatasetKind::Repository,
-            DatasetKind::Branch,
-        ),
-        DatasetKind::Changes => flatten_one_level(
-            world,
-            children,
-            DatasetKind::WorkingTreeFiles,
-            DatasetKind::WorkingTreeFile,
-        ),
-        _ => children.to_vec(),
-    }
-}
-
-fn flatten_one_level(
-    world: &World,
-    parents: &[Entity],
-    parent_kind: DatasetKind,
-    child_kind: DatasetKind,
-) -> Vec<Entity> {
-    let mut rows = Vec::new();
-    for parent in parents {
-        if world.get::<DatasetType>(*parent).map(|kind| kind.0) != Some(parent_kind) {
-            continue;
-        }
-        rows.push(*parent);
-        if let Some(children) = world.get::<DatasetChildren>(*parent) {
-            rows.extend(children.0.iter().copied().filter(|child| {
-                world.get::<DatasetType>(*child).map(|kind| kind.0) == Some(child_kind)
-            }));
-        }
-    }
-    rows
-}
-
-fn repair_dataset_navigation(
-    mut datasets: Query<(
-        &DatasetNavigationOrder,
-        &mut DatasetCursor,
-        &mut DatasetSelection,
-    )>,
-) {
-    for (navigation, mut cursor, mut selection) in &mut datasets {
-        if cursor
-            .0
-            .is_none_or(|entity| !navigation.0.contains(&entity))
-        {
-            cursor.0 = navigation.0.first().copied();
-        }
-
-        let selected = selection.0.iter().copied().collect::<HashSet<_>>();
-        selection.0 = navigation
-            .0
-            .iter()
-            .copied()
-            .filter(|row| selected.contains(row))
-            .collect();
-    }
 }
 
 fn collect_unreachable_datasets(world: &mut World) {
@@ -1468,22 +1445,30 @@ fn validate_invariants(world: &mut World) -> Vec<InvariantViolation> {
             &DatasetKey,
             &DatasetType,
             &DatasetChildren,
-            &DatasetNavigationOrder,
+            &DatasetCollection,
+            &DatasetActiveElement,
+            &DatasetSelection,
+            &DatasetTemplateRef,
         )>();
         query
             .iter(world)
-            .map(|(entity, key, kind, children, navigation)| {
-                (
-                    entity,
-                    key.0.clone(),
-                    kind.0,
-                    children.0.clone(),
-                    navigation.0.clone(),
-                )
-            })
+            .map(
+                |(entity, key, kind, children, collection, active, selection, template)| {
+                    (
+                        entity,
+                        key.0.clone(),
+                        kind.0,
+                        children.0.clone(),
+                        collection.0.clone(),
+                        active.0,
+                        selection.0.clone(),
+                        template.0.clone(),
+                    )
+                },
+            )
             .collect::<Vec<_>>()
     };
-    for (entity, identity, kind, children, navigation) in &datasets {
+    for (entity, identity, kind, children, elements, active, selection, template) in &datasets {
         if index.get(identity) != Some(*entity) {
             violations.push(InvariantViolation::DatasetMissingFromIndex(
                 identity.clone(),
@@ -1503,16 +1488,33 @@ fn validate_invariants(world: &mut World) -> Vec<InvariantViolation> {
                 });
             }
         }
-        for target in navigation {
-            if world.get::<Dataset>(*target).is_none() {
-                violations.push(InvariantViolation::DanglingNavigationTarget {
+        for element in elements {
+            if world.get::<Dataset>(element.entity).is_none() {
+                violations.push(InvariantViolation::DanglingCollectionElement {
                     dataset: *entity,
-                    target: *target,
+                    target: element.entity,
                 });
             }
         }
-        if navigation != &expected_navigation_order(world, *kind, children) {
-            violations.push(InvariantViolation::InvalidNavigationOrder(*entity));
+        if let Some(active) = active
+            && !elements.iter().any(|element| element.entity == *active)
+        {
+            violations.push(InvariantViolation::ActiveElementOutsideCollection {
+                dataset: *entity,
+                element: *active,
+            });
+        }
+        for selected in selection {
+            if !elements.iter().any(|element| element.entity == *selected) {
+                violations.push(InvariantViolation::SelectionOutsideCollection {
+                    dataset: *entity,
+                    selected: *selected,
+                });
+            }
+        }
+        let expected = collection::expected_collection(world, template, children);
+        if elements != &expected.elements {
+            violations.push(InvariantViolation::InvalidCollection(*entity));
         }
         if is_reachable_without_origin(world, *entity, *entity) {
             violations.push(InvariantViolation::DatasetCycle(*entity));
@@ -1536,9 +1538,9 @@ fn validate_invariants(world: &mut World) -> Vec<InvariantViolation> {
             }
         }
         if let Some(mode) = world.get_resource::<ActiveRenderMode>()
-            && !mode.layout.is_focus_owner(context.active_dataset)
+            && !mode.layout.can_activate(context.active_dataset)
         {
-            violations.push(InvariantViolation::ActiveDatasetNotFocusable(
+            violations.push(InvariantViolation::ActiveDatasetNotActivatable(
                 context.active_dataset,
             ));
         }

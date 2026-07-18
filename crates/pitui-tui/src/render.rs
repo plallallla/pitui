@@ -1,8 +1,8 @@
 use pitui_core::{DiffCellKind, DiffLineKind};
 use pitui_data::{
     CellProjection, KeyCode, KeyStroke, LayoutConstraint, RenderContentProjection,
-    RenderProxyProjection, ResolvedKeyAction, RowProjection, UiFrame, UiLayoutProjection,
-    ViewportMeasurement, ViewportProjection,
+    RenderProxyProjection, ResolvedKeyAction, RowProjection, RowProjectionKind, UiFrame,
+    UiLayoutProjection, ViewportMeasurement, ViewportProjection,
 };
 use ratatui::{
     Frame,
@@ -319,19 +319,38 @@ fn visible_rows(
 
 fn render_row(row: &RowProjection) -> ListItem<'static> {
     let mut spans = vec![Span::styled(
-        if row.cursor { "› " } else { "  " },
+        if row.active { "› " } else { "  " },
         Style::default().fg(Color::Yellow),
     )];
     spans.push(Span::raw(if row.selected { "[x] " } else { "[ ] " }));
     spans.push(Span::raw("  ".repeat(row.depth)));
-    spans.push(Span::raw(
-        row.cells
-            .iter()
-            .map(|cell| terminal_safe(&cell.text))
-            .collect::<Vec<_>>()
-            .join("  "),
-    ));
-    let style = if row.cursor {
+    if row.kind == RowProjectionKind::Directory {
+        spans.push(Span::styled(
+            "▾ ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            row.cells
+                .iter()
+                .map(|cell| terminal_safe(&cell.text))
+                .collect::<Vec<_>>()
+                .join("  "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        spans.push(Span::raw(
+            row.cells
+                .iter()
+                .map(|cell| terminal_safe(&cell.text))
+                .collect::<Vec<_>>()
+                .join("  "),
+        ));
+    }
+    let style = if row.active {
         Style::default().add_modifier(Modifier::REVERSED)
     } else if row.selected {
         Style::default().fg(Color::Green)
@@ -474,7 +493,7 @@ mod tests {
             generation: 1,
             layout: UiLayoutProjection::Dataset {
                 constraint: LayoutConstraint::Fill(1),
-                focusable: true,
+                activatable: true,
                 panel: Box::new(RenderProxyProjection {
                     dataset,
                     proxy: RenderProxyId::from("test"),
@@ -485,13 +504,14 @@ mod tests {
                     content: RenderContentProjection::Rows(RowsProjection {
                         rows: vec![RowProjection {
                             entity: dataset,
+                            kind: RowProjectionKind::Item,
                             depth: 0,
                             cells: vec![CellProjection {
                                 field: FieldId::CommitSubject,
                                 label: None,
                                 text: "safe\u{1b}[31m subject".into(),
                             }],
-                            cursor: true,
+                            active: true,
                             selected: false,
                         }],
                         viewport: ViewportProjection::default(),
@@ -527,6 +547,81 @@ mod tests {
     }
 
     #[test]
+    fn path_tree_directories_render_active_and_selection_markers() {
+        let mut world = bevy_ecs::world::World::new();
+        let files = world.spawn_empty().id();
+        let directory = world.spawn_empty().id();
+        let file = world.spawn_empty().id();
+        let ui = UiFrame {
+            generation: 1,
+            layout: UiLayoutProjection::Dataset {
+                constraint: LayoutConstraint::Fill(1),
+                activatable: true,
+                panel: Box::new(RenderProxyProjection {
+                    dataset: files,
+                    proxy: RenderProxyId::from("files.tree"),
+                    renderer: RendererKind::PathTree,
+                    active: true,
+                    title: "Files".into(),
+                    style: StyleSpec::default(),
+                    content: RenderContentProjection::Rows(RowsProjection {
+                        rows: vec![
+                            RowProjection {
+                                entity: directory,
+                                kind: RowProjectionKind::Directory,
+                                depth: 0,
+                                cells: vec![CellProjection {
+                                    field: FieldId::FilePath,
+                                    label: None,
+                                    text: "src/".into(),
+                                }],
+                                active: true,
+                                selected: true,
+                            },
+                            RowProjection {
+                                entity: file,
+                                kind: RowProjectionKind::Item,
+                                depth: 1,
+                                cells: vec![CellProjection {
+                                    field: FieldId::FilePath,
+                                    label: None,
+                                    text: "main.rs".into(),
+                                }],
+                                active: false,
+                                selected: false,
+                            },
+                        ],
+                        viewport: ViewportProjection {
+                            offset: 0,
+                            page_size: 4,
+                            content_length: 2,
+                        },
+                    }),
+                }),
+            },
+            footer: FooterProjection::default(),
+            status: StatusProjection::default(),
+        };
+        let width = 40;
+        let backend = TestBackend::new(width, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| _ = render(frame, &ui)).unwrap();
+        let lines = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|line| line.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let directory = lines.iter().find(|line| line.contains("src/")).unwrap();
+        assert!(directory.contains("▾ src/"));
+        assert!(directory.contains("› [x]"));
+        let file = lines.iter().find(|line| line.contains("main.rs")).unwrap();
+        assert!(file.contains("[ ]"));
+        assert!(file.contains("main.rs"));
+    }
+
+    #[test]
     fn diff_cells_are_truncated_on_unicode_display_boundaries() {
         assert_eq!(truncate_to_width("ab界cd", 4), "ab界");
         assert_eq!(truncate_to_width("ab界cd", 3), "ab");
@@ -542,7 +637,7 @@ mod tests {
             layout: UiLayoutProjection::Overlay(vec![
                 UiLayoutProjection::Dataset {
                     constraint: LayoutConstraint::Fill(1),
-                    focusable: true,
+                    activatable: true,
                     panel: Box::new(RenderProxyProjection {
                         dataset: underlay,
                         proxy: RenderProxyId::from("underlay"),
@@ -555,7 +650,7 @@ mod tests {
                 },
                 UiLayoutProjection::Dataset {
                     constraint: LayoutConstraint::Percentage(60),
-                    focusable: true,
+                    activatable: true,
                     panel: Box::new(RenderProxyProjection {
                         dataset: interaction,
                         proxy: RenderProxyId::from("interaction"),

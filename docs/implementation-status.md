@@ -22,15 +22,23 @@ pitui         composition root、binary 与端到端验收
 
 ## 已实现
 
-- Repository、Branch、Commits、Commit、Files、FileChanges Dataset 纵向链路。
+- Repository、Branch、Commits、Commit、Files、FileTreeDirectory、FileChanges Dataset 纵向链路。
 - 稳定 `DatasetIdentity -> Entity` canonical index。
-- Dataset DAG、显式 roots、navigation order、cursor、selection、viewport 和 reachability GC。
+- Dataset DAG、显式 roots、Manager 生成的 Collection Element/depth、Active Element、selection、viewport 和
+  reachability GC。
+- Dataset Template 配置驱动的 Collection Manager：Repositories/Branches、Files、Changes 和
+  WorkingTreeFiles 共用 `TreeManager`；其他 Dataset 默认使用 `ListManager`。Tree 的可见/可选类型、
+  sibling order 和 selection mode 都是数据，结构行不会误入操作目标。
 - 单一 `ActiveUiContext`、`ActiveRenderMode`、`ResolvedOperationSet`。
 - Template/Proxy/Mode/Operation/Command/Availability 跨 Registry 启动校验。
 - History、Commit、File Diff、Changes、Reflog、Git Operation Log Render Mode。
-- unified 与 side-by-side diff projection；默认文件导航进入 unified 模式。
-- 当前-focus 操作解析、WASD/方向导航、二级 copy chord、动态 footer/help/palette。
-- Changes staged/unstaged 树、选择、stage、unstage 和 commit creation。
+- Commit 下的 Files、Changes 的 staged/unstaged 边界和 WorkingTreeFiles 使用共享 `PathTree`
+  Proxy：Snapshot 按 Git 原始路径构建真实目录 Dataset DAG，`TreeManager` 再稳定展平并生成深度；
+  文件与目录均保留 Dataset Active Element/selection/copy 语义，目录的 diff 绑定到首个后代文件。
+- unified 与 side-by-side diff projection；Files 向右先切换到 unified 模式并保持当前 File，
+  再次向右才把 Active Dataset 接力给 FileChanges。
+- 当前 Active Dataset 操作解析、WASD/方向接力、二级 copy chord、动态 footer/help/palette。
+- Changes staged/unstaged 树、父子级联的文件/目录多选、目录递归 stage/unstage 和 commit creation。
 - Reflog 加载与 hash 复制。
 - commits 多选和安全 cherry-pick；本次冲突自动尝试 abort。
 - session Git operation log Dataset 与可轮转持久 JSONL sink。
@@ -46,6 +54,7 @@ pitui         composition root、binary 与端到端验收
 - 外部 TOML 配置加载、严格覆盖和运行时 reload。
 - 异步/后台 Git executor；当前同步执行可能阻塞 terminal event loop。
 - 用户可操作的 unified/side-by-side 模式切换。
+- Table Collection Manager；扩展位置已经收敛到 `CollectionManagerSpec`，本次不实现 Table。
 
 `remotes/fetch/pull/push/sync` 已有稳定 Command/Operation ID，但当前系统明确返回 unimplemented；
 reset/rebase 尚未进入 `GitCommand` 数据协议。
@@ -86,7 +95,7 @@ cargo test --workspace --doc
 
 ## 后续优先级
 
-1. 将 `operation_runtime.rs` 按 interaction、navigation、changes、copy/scroll 拆分。
+1. 将 `operation_runtime.rs` 按 interaction、active handoff、changes、copy/scroll 拆分。
 2. 将 `git_runtime.rs` 按 lifecycle/log、snapshot planning 和 payload adapter 拆分。
 3. 将根 `src/tests.rs` 拆为共享 fixture 与按语义分类的集成测试模块。
 4. 设计保持 typed data 边界的异步 Git task/result 通道。

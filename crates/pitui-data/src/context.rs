@@ -203,8 +203,12 @@ impl RenderBindingPatch {
 
 #[derive(Message, Clone, Debug, Eq, PartialEq)]
 pub enum ContextTransitionRequest {
-    KeepRenderMode {
-        active_dataset: Entity,
+    /// Relays Active ownership between Dataset slots in the same RenderMode.
+    ActiveRelay {
+        previous_active_dataset: Entity,
+        previous_active_kind: DatasetKind,
+        direction: ActiveDirection,
+        next_active_dataset: Entity,
         binding_patch: RenderBindingPatch,
     },
     Replace {
@@ -217,12 +221,22 @@ pub enum ContextTransitionRequest {
         render_mode: RenderModeId,
         render_bindings: RenderContextBindings,
     },
-    /// Hierarchy navigation variant of Push. The destination must keep the
-    /// current focus owner and expose at least one deeper focusable Dataset.
-    Drill {
-        active_dataset: Entity,
+    /// Transfers Active ownership across a RenderMode boundary. The source
+    /// type and direction are explicit data so mode changes are driven by the
+    /// Active handoff rather than hidden UI controller state.
+    ActiveHandoff {
+        previous_active_dataset: Entity,
+        previous_active_kind: DatasetKind,
+        direction: ActiveDirection,
+        next_active_dataset: Entity,
         render_mode: RenderModeId,
         render_bindings: RenderContextBindings,
+    },
+    /// Relays Active ownership back across the previous RenderMode boundary.
+    ActiveReturn {
+        previous_active_dataset: Entity,
+        previous_active_kind: DatasetKind,
+        direction: ActiveDirection,
     },
     /// Dynamically wraps the current resolved layout with a Dataset overlay.
     /// This keeps the previous view visible without giving the renderer World
@@ -236,9 +250,33 @@ pub enum ContextTransitionRequest {
     Pop,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ActiveDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActiveHandoffTarget {
+    /// Change RenderMode while retaining the current Active Dataset and its
+    /// Active Element. This is used when a list becomes the left side of the
+    /// next detail mode without transferring ownership to the selected row.
+    KeepActiveDataset,
+    ActiveElement,
+    Binding(RenderBindingId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveHandoffSpec {
+    pub render_mode: RenderModeId,
+    pub target: ActiveHandoffTarget,
+}
+
 #[derive(Resource, Clone, Debug, Default, Eq, PartialEq)]
-pub struct NavigationModeRegistry {
-    pub drill_down: HashMap<DatasetKind, RenderModeId>,
+pub struct ActiveHandoffRegistry {
+    pub rules: HashMap<(DatasetKind, ActiveDirection), ActiveHandoffSpec>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,7 +295,7 @@ pub enum ResolvedRenderLayout {
         dataset: Entity,
         proxy: RenderProxyId,
         constraint: LayoutConstraint,
-        focusable: bool,
+        activatable: bool,
     },
 }
 
@@ -273,28 +311,32 @@ impl ResolvedRenderLayout {
         }
     }
 
-    pub fn is_focus_owner(&self, entity: Entity) -> bool {
+    pub fn can_activate(&self, entity: Entity) -> bool {
         match self {
             Self::Row(children) | Self::Column(children) | Self::Overlay(children) => {
-                children.iter().any(|child| child.is_focus_owner(entity))
+                children.iter().any(|child| child.can_activate(entity))
             }
             Self::Dataset {
-                dataset, focusable, ..
-            } => *focusable && *dataset == entity,
+                dataset,
+                activatable,
+                ..
+            } => *activatable && *dataset == entity,
         }
     }
 
-    pub fn focus_owners(&self, output: &mut Vec<Entity>) {
+    pub fn active_candidates(&self, output: &mut Vec<Entity>) {
         match self {
             Self::Row(children) | Self::Column(children) | Self::Overlay(children) => {
                 for child in children {
-                    child.focus_owners(output);
+                    child.active_candidates(output);
                 }
             }
             Self::Dataset {
-                dataset, focusable, ..
+                dataset,
+                activatable,
+                ..
             } => {
-                if *focusable {
+                if *activatable {
                     output.push(*dataset);
                 }
             }

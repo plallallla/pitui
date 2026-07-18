@@ -6,17 +6,18 @@ use pitui_core::{
 };
 use pitui_data::{
     ActiveRenderMode, ActiveUiContext, BranchMetadata, CellProjection, ChangeBoundary,
-    CommitCreationMetadata, CommitMetadata, DatasetCursor, DatasetIdentity, DatasetKey,
-    DatasetKind, DatasetNavigationOrder, DatasetSelection, DatasetType, DatasetViewport,
+    CommitCreationMetadata, CommitMetadata, DatasetActiveElement, DatasetCollection,
+    DatasetIdentity, DatasetKey, DatasetKind, DatasetSelection, DatasetType, DatasetViewport,
     DateTimePrecision, DetailProjection, FieldFormat, FieldId, FieldSpec, FileChangesMetadata,
-    FileMetadata, FooterProjection, GitOperationLogEntryMetadata, InteractionContextKind,
-    InteractionContextMetadata, InteractionLineProjection, InteractionProjection,
-    ReflogEntryMetadata, RemoteMetadata, RenderBindingId, RenderContentProjection, RenderProxyId,
-    RenderProxyProjection, RenderProxyRegistry, RenderProxySpec, RendererKind, RepositoryMetadata,
-    ResolvedOperationSet, ResolvedRenderLayout, RowProjection, RowsProjection,
-    SideBySideDiffProjection, SideBySideHunkProjection, StatusProjection, UiFrame,
-    UiLayoutProjection, UnifiedDiffHunkProjection, UnifiedDiffProjection, ViewportMeasurement,
-    ViewportProjection, WorkingTreeFileChangesMetadata, WorkingTreeFileMetadata,
+    FileMetadata, FileTreeDirectoryMetadata, FooterProjection, GitOperationLogEntryMetadata,
+    InteractionContextKind, InteractionContextMetadata, InteractionLineProjection,
+    InteractionProjection, ReflogEntryMetadata, RemoteMetadata, RenderBindingId,
+    RenderContentProjection, RenderProxyId, RenderProxyProjection, RenderProxyRegistry,
+    RenderProxySpec, RendererKind, RepositoryMetadata, ResolvedOperationSet, ResolvedRenderLayout,
+    RowProjection, RowProjectionKind, RowsProjection, SideBySideDiffProjection,
+    SideBySideHunkProjection, StatusProjection, UiFrame, UiLayoutProjection,
+    UnifiedDiffHunkProjection, UnifiedDiffProjection, ViewportMeasurement, ViewportProjection,
+    WorkingTreeFileChangesMetadata, WorkingTreeFileMetadata,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,10 +58,29 @@ pub(super) fn update_dataset_viewports(world: &mut World) {
     };
     for entity in entities {
         let content_length = dataset_content_length(world, entity);
+        let active_element = world
+            .get::<DatasetActiveElement>(entity)
+            .and_then(|active| active.0);
+        let active_position = active_element.and_then(|active| {
+            world
+                .get::<DatasetCollection>(entity)
+                .and_then(|collection| collection.position(active))
+        });
         if let Some(mut viewport) = world.get_mut::<DatasetViewport>(entity) {
             viewport.content_length = content_length;
-            let max_offset = content_length.saturating_sub(viewport.page_size.max(1));
+            let page_size = viewport.page_size.max(1);
+            let max_offset = content_length.saturating_sub(page_size);
             viewport.offset = viewport.offset.min(max_offset);
+            if let Some(active_position) = active_position {
+                if active_position < viewport.offset {
+                    viewport.offset = active_position;
+                } else if active_position >= viewport.offset.saturating_add(page_size) {
+                    viewport.offset = active_position
+                        .saturating_add(1)
+                        .saturating_sub(page_size)
+                        .min(max_offset);
+                }
+            }
         }
     }
 }
@@ -111,12 +131,15 @@ fn dataset_content_length(world: &World, entity: Entity) -> usize {
     {
         return 6;
     }
+    if world.get::<FileTreeDirectoryMetadata>(entity).is_some() {
+        return 1;
+    }
     if world.get::<GitOperationLogEntryMetadata>(entity).is_some() {
         return 7;
     }
     world
-        .get::<DatasetNavigationOrder>(entity)
-        .map_or(0, |navigation| navigation.0.len())
+        .get::<DatasetCollection>(entity)
+        .map_or(0, |collection| collection.0.len())
 }
 
 pub(super) fn build_ui_frame(world: &mut World) {
@@ -198,12 +221,12 @@ fn project_layout(
             dataset,
             proxy,
             constraint,
-            focusable,
+            activatable,
         } => {
             let panel = project_dataset(world, *dataset, proxy, active, diagnostics);
             UiLayoutProjection::Dataset {
                 constraint: *constraint,
-                focusable: *focusable,
+                activatable: *activatable,
                 panel: Box::new(panel),
             }
         }
@@ -241,8 +264,19 @@ fn project_dataset(
 
     let content = match spec.renderer {
         RendererKind::Tree | RendererKind::List | RendererKind::LogList => {
-            RenderContentProjection::Rows(project_rows(world, dataset, kind, &spec))
+            RenderContentProjection::Rows(project_rows(
+                world,
+                dataset,
+                &spec,
+                active == Some(dataset),
+            ))
         }
+        RendererKind::PathTree => RenderContentProjection::Rows(project_path_tree(
+            world,
+            dataset,
+            &spec,
+            active == Some(dataset),
+        )),
         RendererKind::Detail | RendererKind::CommitDetail => {
             RenderContentProjection::Detail(project_detail(world, dataset, &spec))
         }
@@ -435,35 +469,150 @@ fn empty_panel(dataset: Entity, proxy: RenderProxyId, active: bool) -> RenderPro
 fn project_rows(
     world: &World,
     dataset: Entity,
-    owner_kind: DatasetKind,
     spec: &RenderProxySpec,
+    dataset_is_active: bool,
 ) -> RowsProjection {
-    let navigation = world
-        .get::<DatasetNavigationOrder>(dataset)
-        .map(|navigation| navigation.0.as_slice())
+    let elements = world
+        .get::<DatasetCollection>(dataset)
+        .map(|collection| collection.0.as_slice())
         .unwrap_or_default();
-    let cursor = world
-        .get::<DatasetCursor>(dataset)
-        .and_then(|cursor| cursor.0);
+    let active_element = world
+        .get::<DatasetActiveElement>(dataset)
+        .and_then(|active| active.0);
     let selected = world
         .get::<DatasetSelection>(dataset)
         .map(|selection| selection.0.iter().copied().collect::<HashSet<_>>())
         .unwrap_or_default();
-
     RowsProjection {
-        rows: navigation
+        rows: elements
             .iter()
             .copied()
-            .map(|row| RowProjection {
-                entity: row,
-                depth: navigation_depth(world, owner_kind, row),
-                cells: project_fields(world, row, &spec.fields),
-                cursor: cursor == Some(row),
-                selected: selected.contains(&row),
+            .map(|element| RowProjection {
+                entity: element.entity,
+                kind: RowProjectionKind::Item,
+                depth: element.depth,
+                cells: project_fields(world, element.entity, &spec.fields),
+                active: dataset_is_active && active_element == Some(element.entity),
+                selected: selected.contains(&element.entity),
             })
             .collect(),
         viewport: viewport_projection(world, dataset),
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PathTreeEntry {
+    entity: Entity,
+    depth: usize,
+    directory: bool,
+    file_leaf: bool,
+}
+
+fn project_path_tree(
+    world: &World,
+    dataset: Entity,
+    spec: &RenderProxySpec,
+    dataset_is_active: bool,
+) -> RowsProjection {
+    let active_element = world
+        .get::<DatasetActiveElement>(dataset)
+        .and_then(|active| active.0);
+    let selected = world
+        .get::<DatasetSelection>(dataset)
+        .map(|selection| selection.0.iter().copied().collect::<HashSet<_>>())
+        .unwrap_or_default();
+    let entries = path_tree_entries(world, dataset);
+    let directory_field = spec
+        .fields
+        .iter()
+        .map(|field| field.field)
+        .find(|field| matches!(field, FieldId::FilePath | FieldId::DatasetLabel))
+        .unwrap_or(FieldId::FilePath);
+
+    RowsProjection {
+        rows: entries
+            .into_iter()
+            .map(|entry| {
+                let mut cells = project_fields(world, entry.entity, &spec.fields);
+                if (entry.file_leaf || entry.directory)
+                    && let Some(mut name) = file_path(world, entry.entity).map(file_name)
+                {
+                    if entry.directory {
+                        name.push('/');
+                    }
+                    let mut replaced = false;
+                    for cell in &mut cells {
+                        if matches!(cell.field, FieldId::FilePath | FieldId::DatasetLabel) {
+                            cell.text.clone_from(&name);
+                            replaced = true;
+                        }
+                    }
+                    if !replaced {
+                        cells.push(CellProjection {
+                            field: directory_field,
+                            label: None,
+                            text: name,
+                        });
+                    }
+                }
+                RowProjection {
+                    entity: entry.entity,
+                    kind: if entry.directory {
+                        RowProjectionKind::Directory
+                    } else {
+                        RowProjectionKind::Item
+                    },
+                    depth: entry.depth,
+                    cells,
+                    active: dataset_is_active && active_element == Some(entry.entity),
+                    selected: selected.contains(&entry.entity),
+                }
+            })
+            .collect(),
+        viewport: viewport_projection(world, dataset),
+    }
+}
+
+fn path_tree_entries(world: &World, dataset: Entity) -> Vec<PathTreeEntry> {
+    let elements = world
+        .get::<DatasetCollection>(dataset)
+        .map(|collection| collection.0.as_slice())
+        .unwrap_or_default();
+    elements
+        .iter()
+        .copied()
+        .map(|element| {
+            let kind = world.get::<DatasetType>(element.entity).map(|kind| kind.0);
+            PathTreeEntry {
+                entity: element.entity,
+                depth: element.depth,
+                directory: kind == Some(DatasetKind::FileTreeDirectory),
+                file_leaf: matches!(kind, Some(DatasetKind::File | DatasetKind::WorkingTreeFile)),
+            }
+        })
+        .collect()
+}
+
+fn file_path(world: &World, entity: Entity) -> Option<&pitui_core::GitPath> {
+    if let Some(metadata) = world.get::<FileTreeDirectoryMetadata>(entity) {
+        return Some(&metadata.0);
+    }
+    if let Some(metadata) = world.get::<FileMetadata>(entity) {
+        return Some(&metadata.0.path);
+    }
+    world
+        .get::<WorkingTreeFileMetadata>(entity)
+        .map(|metadata| &metadata.0.path)
+}
+
+fn file_name(path: &pitui_core::GitPath) -> String {
+    path.as_bytes()
+        .rsplit(|byte| *byte == b'/')
+        .find(|component| !component.is_empty())
+        .map_or_else(
+            || path.as_str().to_owned(),
+            |component| String::from_utf8_lossy(component).into_owned(),
+        )
 }
 
 fn project_detail(world: &World, dataset: Entity, spec: &RenderProxySpec) -> DetailProjection {
@@ -573,6 +722,8 @@ fn field_value(world: &World, entity: Entity, field: FieldId) -> Option<RawField
         Field::FilePath => {
             if let Some(metadata) = world.get::<FileMetadata>(entity) {
                 text(metadata.0.path.as_str().into())
+            } else if let Some(metadata) = world.get::<FileTreeDirectoryMetadata>(entity) {
+                text(metadata.0.as_str().into())
             } else {
                 world
                     .get::<WorkingTreeFileMetadata>(entity)
@@ -739,6 +890,9 @@ fn dataset_label(world: &World, entity: Entity) -> Option<String> {
     if let Some(metadata) = world.get::<BranchMetadata>(entity) {
         return Some(metadata.0.name.0.clone());
     }
+    if let Some(metadata) = world.get::<FileTreeDirectoryMetadata>(entity) {
+        return Some(metadata.0.as_str().into());
+    }
     if let Some(metadata) = world.get::<WorkingTreeFileMetadata>(entity) {
         return Some(metadata.0.path.as_str().into());
     }
@@ -757,22 +911,15 @@ fn dataset_label(world: &World, entity: Entity) -> Option<String> {
             }
             .into(),
         ),
-        DatasetIdentity::WorkingTreeFile { path, .. }
+        DatasetIdentity::FileDirectory { path, .. }
+        | DatasetIdentity::WorkingTreeDirectory { path, .. }
+        | DatasetIdentity::WorkingTreeFile { path, .. }
         | DatasetIdentity::WorkingTreeFileChanges { path, .. }
         | DatasetIdentity::File { path, .. }
         | DatasetIdentity::FileChanges { path, .. } => Some(path.as_str().into()),
         DatasetIdentity::Branch { name, .. } => Some(name.0.clone()),
         DatasetIdentity::Commit { hash, .. } => Some(hash.short().into()),
         _ => None,
-    }
-}
-
-fn navigation_depth(world: &World, owner_kind: DatasetKind, row: Entity) -> usize {
-    let row_kind = world.get::<DatasetType>(row).map(|kind| kind.0);
-    match (owner_kind, row_kind) {
-        (DatasetKind::RepositoriesBranches, Some(DatasetKind::Branch))
-        | (DatasetKind::Changes, Some(DatasetKind::WorkingTreeFile)) => 1,
-        _ => 0,
     }
 }
 
@@ -912,6 +1059,9 @@ fn dataset_title(world: &World, dataset: Entity, kind: DatasetKind) -> String {
             _ => "Commit".into(),
         },
         DatasetKind::Files => "Files".into(),
+        DatasetKind::FileTreeDirectory => {
+            dataset_label(world, dataset).unwrap_or_else(|| "Directory".into())
+        }
         DatasetKind::File => dataset_label(world, dataset).unwrap_or_else(|| "File".into()),
         DatasetKind::FileChanges | DatasetKind::WorkingTreeFileChanges => {
             dataset_label(world, dataset).unwrap_or_else(|| "Diff".into())

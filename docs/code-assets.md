@@ -48,12 +48,12 @@ pitui-git -> pitui-core
 | 文件 | 职责 |
 |---|---|
 | `src/identity.rs` | 稳定 `DatasetIdentity`、`DatasetKind` 和 RepositoryKey |
-| `src/dataset.rs` | Dataset Bundle、DAG、cursor、selection、viewport 和 index components |
-| `src/metadata.rs` | 每种语义 Dataset 的 typed metadata components |
-| `src/template.rs` | Template/Operation/Command/Proxy/Mode 稳定 ID 和 Template Registry |
+| `src/dataset.rs` | Dataset Bundle、DAG、Collection Element/depth、Active Element、selection、viewport 和 index components |
+| `src/metadata.rs` | 每种语义 Dataset 的 typed metadata components，包括文件树目录路径 |
+| `src/template.rs` | Template、List/Tree Collection Manager 规格及稳定 ID/Registry；保留未来 Table 扩展边界 |
 | `src/context.rs` | Active Context、render bindings、context stack、overlay/text/help 数据 |
 | `src/operation.rs` | 快捷键、Operation、Command、可用性、Invocation 和 Clipboard 数据 |
-| `src/render.rs` | Render Proxy/Mode/Layout 与不可变 `UiFrame` projection 数据 |
+| `src/render.rs` | Render Proxy/Mode/Layout、PathTree 行协议与不可变 `UiFrame` projection 数据 |
 | `src/lib.rs` | 公共导出 |
 
 ### `pitui-config`
@@ -78,10 +78,11 @@ pitui-git -> pitui-core
 | 文件 | 职责 |
 |---|---|
 | `src/lib.rs` | World/Schedule、注册契约、Dataset 生命周期、DAG、GC 和不变量 |
+| `src/collection.rs` | 通用 List/Tree Manager：可见节点过滤、排序、展平、深度和父子级联选择 |
 | `src/operation_runtime.rs` | 输入解析、唯一 Operation Set、Command System 和 Context 操作 |
 | `src/git_runtime.rs` | Git messages、执行结果、事务 Snapshot plan 和 session log Dataset |
-| `src/binding_reconcile.rs` | Context transition、render bindings、layout 和 focus reconcile |
-| `src/projection.rs` | ECS World 到不可变 `UiFrame` 的单向投影 |
+| `src/binding_reconcile.rs` | Active handoff、Context transition、render bindings 与 layout reconcile |
+| `src/projection.rs` | ECS World 到不可变 `UiFrame` 的单向投影，消费 Manager 生成的 Collection Element 数据 |
 | `src/tests.rs` | crate 私有内核测试 |
 | `tests/read_vertical.rs` | Repository→Branch→Commit→File 读取纵向测试 |
 | `tests/operations.rs` | Operation resolution、target 和 command tests |

@@ -2,8 +2,8 @@ use std::{fs, path::Path, process::Command};
 
 use pitui_core::{BranchName, CommitHash, GitPath};
 use pitui_data::{
-    ChangeBoundary, CommitMetadata, DatasetChildren, DatasetIdentity, DatasetIndex, DatasetKind,
-    DatasetNavigationOrder, DatasetRevision, DatasetTemplate, DatasetTemplateId,
+    ChangeBoundary, CommitMetadata, DatasetChildren, DatasetCollection, DatasetIdentity,
+    DatasetIndex, DatasetKind, DatasetRevision, DatasetTemplate, DatasetTemplateId,
     FileChangesMetadata, HasSnapshot, RepositoryKey, RepositoryMetadata,
     WorkingTreeFileChangesMetadata,
 };
@@ -32,6 +32,7 @@ fn register_default(runtime: &mut DatasetRuntime, id: &str, kind: DatasetKind) {
         .register_default_template(DatasetTemplate {
             id: DatasetTemplateId::from(id),
             kind,
+            collection: pitui_data::CollectionManagerSpec::List,
             operations: Vec::new(),
             render_proxies: Vec::new(),
         })
@@ -78,6 +79,7 @@ fn git_messages_build_the_canonical_dataset_chain_and_keep_cache_on_failure() {
         ("commits", DatasetKind::Commits),
         ("commit", DatasetKind::Commit),
         ("files", DatasetKind::Files),
+        ("file-tree-directory", DatasetKind::FileTreeDirectory),
         ("file", DatasetKind::File),
         ("file-changes", DatasetKind::FileChanges),
     ] {
@@ -382,12 +384,8 @@ fn working_tree_snapshot_builds_three_level_changes_and_invalidates_cached_diff(
 
     let children = &runtime.world().get::<DatasetChildren>(changes).unwrap().0;
     assert_eq!(children.len(), 2);
-    let navigation = &runtime
-        .world()
-        .get::<DatasetNavigationOrder>(changes)
-        .unwrap()
-        .0;
-    assert_eq!(navigation.len(), 5, "two groups + MM twice + untracked");
+    let collection = &runtime.world().get::<DatasetCollection>(changes).unwrap().0;
+    assert_eq!(collection.len(), 5, "two groups + MM twice + untracked");
     let staged_diff_identity = DatasetIdentity::WorkingTreeFileChanges {
         repository: repository_key.clone(),
         boundary: ChangeBoundary::Staged,

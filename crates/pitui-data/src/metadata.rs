@@ -22,6 +22,12 @@ pub struct CommitMetadata {
 #[derive(Component, Clone, Debug, Eq, PartialEq)]
 pub struct FileMetadata(pub ChangedFile);
 
+/// A stable directory node in a commit or working-tree file hierarchy.
+/// Scope and boundary remain part of `DatasetIdentity`; metadata only carries
+/// the repository-relative directory path used by projection and copy.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+pub struct FileTreeDirectoryMetadata(pub GitPath);
+
 #[derive(Component, Clone, Debug, Eq, PartialEq)]
 pub struct FileChangesMetadata(pub FileDiff);
 

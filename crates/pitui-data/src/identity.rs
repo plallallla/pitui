@@ -45,6 +45,11 @@ pub enum DatasetIdentity {
         repository: RepositoryKey,
         commit: CommitHash,
     },
+    FileDirectory {
+        repository: RepositoryKey,
+        commit: CommitHash,
+        path: GitPath,
+    },
     File {
         repository: RepositoryKey,
         commit: CommitHash,
@@ -70,6 +75,11 @@ pub enum DatasetIdentity {
         repository: RepositoryKey,
         boundary: ChangeBoundary,
     },
+    WorkingTreeDirectory {
+        repository: RepositoryKey,
+        boundary: ChangeBoundary,
+        path: GitPath,
+    },
     WorkingTreeFile {
         repository: RepositoryKey,
         boundary: ChangeBoundary,
@@ -94,6 +104,7 @@ pub enum DatasetKind {
     Commits,
     Commit,
     Files,
+    FileTreeDirectory,
     File,
     FileChanges,
     Changes,
@@ -115,13 +126,14 @@ impl DatasetKind {
     /// default-template validation. Adding a new Dataset meaning requires
     /// extending this list, which makes missing Proxy/Operation contracts fail
     /// before the terminal starts.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::RepositoriesBranches,
         Self::Repository,
         Self::Branch,
         Self::Commits,
         Self::Commit,
         Self::Files,
+        Self::FileTreeDirectory,
         Self::File,
         Self::FileChanges,
         Self::Changes,
@@ -150,6 +162,9 @@ impl DatasetIdentity {
             Self::Commits { .. } => DatasetKind::Commits,
             Self::Commit { .. } => DatasetKind::Commit,
             Self::Files { .. } => DatasetKind::Files,
+            Self::FileDirectory { .. } | Self::WorkingTreeDirectory { .. } => {
+                DatasetKind::FileTreeDirectory
+            }
             Self::File { .. } => DatasetKind::File,
             Self::FileChanges { .. } => DatasetKind::FileChanges,
             Self::GlobalChanges => DatasetKind::Changes,

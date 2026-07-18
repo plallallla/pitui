@@ -20,7 +20,13 @@ pub struct RenderProxySpec {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RendererKind {
+    /// Generic tree presentation. Hierarchy and selection are already managed
+    /// by the Dataset Template's Collection Manager.
     Tree,
+    /// File-specific presentation of Tree Manager rows, adding directory and
+    /// path styling without owning hierarchy or selection behavior.
+    PathTree,
+    /// Presentation for direct rows produced by a List Manager.
     List,
     Detail,
     CommitDetail,
@@ -136,7 +142,7 @@ pub enum DateTimePrecision {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StyleSpec {
     pub normal: String,
-    pub cursor: String,
+    pub active_element: String,
     pub selected: String,
     pub active_border: String,
 }
@@ -145,7 +151,7 @@ impl Default for StyleSpec {
     fn default() -> Self {
         Self {
             normal: "default".into(),
-            cursor: "cursor".into(),
+            active_element: "active-element".into(),
             selected: "selected".into(),
             active_border: "active-border".into(),
         }
@@ -188,7 +194,7 @@ pub enum RenderLayout {
         dataset: DatasetBinding,
         proxy: RenderProxyId,
         constraint: LayoutConstraint,
-        focusable: bool,
+        activatable: bool,
     },
 }
 
@@ -252,7 +258,7 @@ pub enum UiLayoutProjection {
     Overlay(Vec<UiLayoutProjection>),
     Dataset {
         constraint: LayoutConstraint,
-        focusable: bool,
+        activatable: bool,
         panel: Box<RenderProxyProjection>,
     },
 }
@@ -303,11 +309,21 @@ pub struct RowsProjection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RowProjection {
+    /// Source Dataset for this actionable row. This stays renderer-independent
+    /// so files and directories share the same active/selection protocol.
     pub entity: Entity,
+    pub kind: RowProjectionKind,
     pub depth: usize,
     pub cells: Vec<CellProjection>,
-    pub cursor: bool,
+    /// True only for the active element of the active Dataset.
+    pub active: bool,
     pub selected: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RowProjectionKind {
+    Item,
+    Directory,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -375,7 +391,7 @@ pub struct FooterProjection {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StatusProjection {
-    /// Product-facing text only; internal names such as view/focus are never
+    /// Product-facing text only; internal runtime names are never
     /// synthesized here.
     pub items: Vec<String>,
 }

@@ -38,10 +38,46 @@ string_id!(RenderProxyId);
 string_id!(RenderModeId);
 string_id!(ResolvedOperationSetId);
 
+/// Data-selected manager for one Dataset's row collection.
+///
+/// `List` exposes direct children with independent selection. `Tree` walks the
+/// Dataset DAG through configured visible kinds and owns hierarchical depth and
+/// selection semantics. A future `Table` manager can be added here without
+/// changing Dataset identity, command targeting or renderer ownership.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CollectionManagerSpec {
+    #[default]
+    List,
+    Tree(TreeManagerSpec),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreeManagerSpec {
+    pub visible_kinds: Vec<DatasetKind>,
+    /// Kinds that may enter the owner's `DatasetSelection`. Structural tree
+    /// rows can remain visible without accidentally becoming operation targets.
+    pub selectable_kinds: Vec<DatasetKind>,
+    pub sibling_order: TreeSiblingOrder,
+    pub selection: TreeSelectionMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TreeSiblingOrder {
+    Source,
+    Path,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TreeSelectionMode {
+    Independent,
+    Cascade,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatasetTemplate {
     pub id: DatasetTemplateId,
     pub kind: DatasetKind,
+    pub collection: CollectionManagerSpec,
     pub operations: Vec<OperationId>,
     pub render_proxies: Vec<RenderProxyId>,
 }
@@ -52,9 +88,9 @@ pub struct DatasetTemplateRegistry {
 }
 
 impl DatasetTemplateRegistry {
-    pub fn register(&mut self, template: DatasetTemplate) -> Result<(), DatasetTemplate> {
+    pub fn register(&mut self, template: DatasetTemplate) -> Result<(), Box<DatasetTemplate>> {
         if self.templates.contains_key(&template.id) {
-            return Err(template);
+            return Err(Box::new(template));
         }
         self.templates.insert(template.id.clone(), template);
         Ok(())

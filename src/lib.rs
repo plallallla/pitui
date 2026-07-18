@@ -158,7 +158,7 @@ impl App {
                 .map_err(|error| AppError::BuiltinInteraction(format!("{error:?}")))?;
         }
         runtime.set_global_operations(pitui_config::builtin_global_operations());
-        runtime.set_navigation_modes(pitui_config::builtin_navigation_modes());
+        runtime.set_active_handoffs(pitui_config::builtin_active_handoffs());
         runtime
             .register_builtin_interaction_systems()
             .map_err(|error| AppError::BuiltinInteraction(format!("{error:?}")))?;

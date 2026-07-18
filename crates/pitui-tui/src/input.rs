@@ -65,7 +65,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_navigation_chords_and_ignores_key_release() {
+    fn maps_direction_keys_and_ignores_key_release() {
         assert_eq!(
             key_event_to_stroke(KeyEvent::new(
                 CrosstermKeyCode::Char('w'),

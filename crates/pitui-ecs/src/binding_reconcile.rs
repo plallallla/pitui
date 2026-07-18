@@ -1,9 +1,9 @@
 use bevy_ecs::prelude::{Entity, MessageReader, Messages, ResMut, Resource, World};
 use pitui_data::{
     ActiveRenderMode, ActiveUiContext, ContextStack, ContextTransitionRequest, Dataset,
-    DatasetBinding, DatasetChildren, DatasetCursor, DatasetIdentity, DatasetIndex, DatasetKey,
-    OperationNotice, RenderBindingId, RenderLayout, RenderModeRegistry, RepositoryMetadata,
-    ResolvedOperationSet, ResolvedRenderLayout,
+    DatasetActiveElement, DatasetBinding, DatasetChildren, DatasetIdentity, DatasetIndex,
+    DatasetKey, DatasetType, OperationNotice, RenderBindingId, RenderLayout, RenderModeRegistry,
+    RepositoryMetadata, ResolvedOperationSet, ResolvedRenderLayout,
 };
 
 use crate::{KernelError, resolve_render_layout};
@@ -64,14 +64,23 @@ fn apply_context_transition(
         .cloned()
         .ok_or(KernelError::ContextUnavailable)?;
     let (active_dataset, render_mode, render_bindings, stack_action) = match transition {
-        ContextTransitionRequest::KeepRenderMode {
-            active_dataset,
+        ContextTransitionRequest::ActiveRelay {
+            previous_active_dataset,
+            previous_active_kind,
+            direction: _,
+            next_active_dataset,
             binding_patch,
         } => {
+            validate_active_origin(
+                world,
+                &current,
+                previous_active_dataset,
+                previous_active_kind,
+            )?;
             let mut bindings = current.render_bindings.clone();
             binding_patch.apply_to(&mut bindings);
             (
-                active_dataset,
+                next_active_dataset,
                 current.render_mode.clone(),
                 bindings,
                 StackAction::Keep,
@@ -97,16 +106,51 @@ fn apply_context_transition(
             render_bindings,
             StackAction::Push,
         ),
-        ContextTransitionRequest::Drill {
-            active_dataset,
+        ContextTransitionRequest::ActiveHandoff {
+            previous_active_dataset,
+            previous_active_kind,
+            direction: _,
+            next_active_dataset,
             render_mode,
             render_bindings,
-        } => (
-            active_dataset,
-            render_mode,
-            render_bindings,
-            StackAction::Drill,
-        ),
+        } => {
+            validate_active_origin(
+                world,
+                &current,
+                previous_active_dataset,
+                previous_active_kind,
+            )?;
+            (
+                next_active_dataset,
+                render_mode,
+                render_bindings,
+                StackAction::ActiveHandoff,
+            )
+        }
+        ContextTransitionRequest::ActiveReturn {
+            previous_active_dataset,
+            previous_active_kind,
+            direction: _,
+        } => {
+            validate_active_origin(
+                world,
+                &current,
+                previous_active_dataset,
+                previous_active_kind,
+            )?;
+            let snapshot = world
+                .resource::<ContextStack>()
+                .0
+                .last()
+                .cloned()
+                .ok_or(KernelError::ContextUnavailable)?;
+            (
+                snapshot.active_dataset,
+                snapshot.render_mode,
+                snapshot.render_bindings,
+                StackAction::Pop,
+            )
+        }
         ContextTransitionRequest::PushOverlay { .. } => {
             unreachable!("overlay transitions return before ordinary resolution")
         }
@@ -133,30 +177,17 @@ fn apply_context_transition(
         .ok_or_else(|| KernelError::MissingRenderMode(render_mode.clone()))?;
     let layout = resolve_render_layout(world, &mode.layout, &render_bindings)?;
     validate_context_state(world, active_dataset, &render_bindings, &layout)?;
-    if stack_action == StackAction::Drill {
-        let mut focus_owners = Vec::new();
-        layout.focus_owners(&mut focus_owners);
-        let has_deeper = focus_owners
-            .iter()
-            .position(|entity| *entity == active_dataset)
-            .is_some_and(|position| position + 1 < focus_owners.len());
-        if !has_deeper {
-            return Err(KernelError::NoDeeperFocusableDataset(active_dataset));
-        }
-    }
 
     match stack_action {
         StackAction::Keep => {}
-        StackAction::Push | StackAction::Drill => {
-            world
-                .resource_mut::<ContextStack>()
-                .0
-                .push(pitui_data::UiContextSnapshot {
-                    active_dataset: current.active_dataset,
-                    render_mode: current.render_mode,
-                    render_bindings: current.render_bindings,
-                })
-        }
+        StackAction::Push | StackAction::ActiveHandoff => world
+            .resource_mut::<ContextStack>()
+            .0
+            .push(pitui_data::UiContextSnapshot {
+                active_dataset: current.active_dataset,
+                render_mode: current.render_mode,
+                render_bindings: current.render_bindings,
+            }),
         StackAction::Pop => {
             world.resource_mut::<ContextStack>().0.pop();
         }
@@ -183,11 +214,37 @@ fn apply_context_transition(
     Ok(())
 }
 
+fn validate_active_origin(
+    world: &World,
+    current: &ActiveUiContext,
+    previous_active_dataset: Entity,
+    previous_active_kind: pitui_data::DatasetKind,
+) -> Result<(), KernelError> {
+    if current.active_dataset != previous_active_dataset {
+        return Err(KernelError::ActiveRelaySourceChanged {
+            expected: previous_active_dataset,
+            actual: current.active_dataset,
+        });
+    }
+    let actual = world
+        .get::<DatasetType>(previous_active_dataset)
+        .map(|kind| kind.0)
+        .ok_or(KernelError::MissingDataset(previous_active_dataset))?;
+    if actual != previous_active_kind {
+        return Err(KernelError::ActiveRelayKindMismatch {
+            dataset: previous_active_dataset,
+            expected: previous_active_kind,
+            actual,
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StackAction {
     Keep,
     Push,
-    Drill,
+    ActiveHandoff,
     Pop,
 }
 
@@ -214,7 +271,7 @@ pub(super) fn push_overlay_context(
             dataset: DatasetBinding::Context(RenderBindingId::Overlay),
             proxy,
             constraint,
-            focusable: true,
+            activatable: true,
         },
         &bindings,
     )?;
@@ -255,8 +312,8 @@ fn validate_context_state(
     if world.get::<Dataset>(active_dataset).is_none() {
         return Err(KernelError::MissingDataset(active_dataset));
     }
-    if !layout.is_focus_owner(active_dataset) {
-        return Err(KernelError::ActiveDatasetNotFocusable(active_dataset));
+    if !layout.can_activate(active_dataset) {
+        return Err(KernelError::ActiveDatasetNotActivatable(active_dataset));
     }
     for entity in render_bindings.entities() {
         if world.get::<Dataset>(entity).is_none() {
@@ -287,8 +344,27 @@ pub(super) fn update_dependent_render_bindings(world: &mut World) {
     reconcile_git_operation_log(world, &mut bindings);
 
     if bindings != context.render_bindings {
+        // Active ownership belongs to a logical Render binding, not to a stale
+        // entity instance. If the binding currently owning Active changes
+        // because an upstream active element changed, relay Active to the new
+        // bound Dataset in the same reconciliation step.
+        let mut relays = context
+            .render_bindings
+            .0
+            .iter()
+            .filter(|(binding, previous)| {
+                **previous == context.active_dataset && bindings.get(binding) != Some(**previous)
+            })
+            .map(|(binding, _)| (binding.clone(), bindings.get(binding)))
+            .collect::<Vec<_>>();
+        relays.sort_by(|left, right| left.0.cmp(&right.0));
+        let relayed_active = relays
+            .into_iter()
+            .find_map(|(_, next)| next)
+            .unwrap_or(context.active_dataset);
         let mut context = world.resource_mut::<ActiveUiContext>();
         context.render_bindings = bindings;
+        context.active_dataset = relayed_active;
         context.generation = context.generation.wrapping_add(1);
     }
 }
@@ -302,8 +378,8 @@ fn reconcile_repository_branch(world: &World, bindings: &mut pitui_data::RenderC
                 .get(&DatasetIdentity::GlobalRepositoriesBranches)
         });
     let Some(row) = root
-        .and_then(|root| world.get::<DatasetCursor>(root))
-        .and_then(|cursor| cursor.0)
+        .and_then(|root| world.get::<DatasetActiveElement>(root))
+        .and_then(|active| active.0)
     else {
         return;
     };
@@ -351,8 +427,8 @@ fn reconcile_commit_files(world: &World, bindings: &mut pitui_data::RenderContex
         return;
     };
     let commit = world
-        .get::<DatasetCursor>(commits)
-        .and_then(|cursor| cursor.0);
+        .get::<DatasetActiveElement>(commits)
+        .and_then(|active| active.0);
     set_or_clear(bindings, RenderBindingId::CurrentCommit, commit);
 
     let files = commit.and_then(|commit| {
@@ -371,8 +447,9 @@ fn reconcile_file_changes(world: &World, bindings: &mut pitui_data::RenderContex
         return;
     };
     let file_changes = world
-        .get::<DatasetCursor>(files)
-        .and_then(|cursor| cursor.0)
+        .get::<DatasetActiveElement>(files)
+        .and_then(|active| active.0)
+        .and_then(|target| first_descendant_file(world, target, pitui_data::DatasetKind::File))
         .and_then(|file| {
             world
                 .get::<DatasetChildren>(file)
@@ -388,13 +465,10 @@ fn reconcile_changes_file(world: &World, bindings: &mut pitui_data::RenderContex
             .get(&DatasetIdentity::GlobalChanges)
     });
     let file_changes = changes
-        .and_then(|changes| world.get::<DatasetCursor>(changes))
-        .and_then(|cursor| cursor.0)
-        .filter(|row| {
-            matches!(
-                world.get::<DatasetKey>(*row).map(|key| &key.0),
-                Some(DatasetIdentity::WorkingTreeFile { .. })
-            )
+        .and_then(|changes| world.get::<DatasetActiveElement>(changes))
+        .and_then(|active| active.0)
+        .and_then(|target| {
+            first_descendant_file(world, target, pitui_data::DatasetKind::WorkingTreeFile)
         })
         .and_then(|file| {
             world
@@ -408,11 +482,36 @@ fn reconcile_changes_file(world: &World, bindings: &mut pitui_data::RenderContex
     );
 }
 
+fn first_descendant_file(
+    world: &World,
+    target: Entity,
+    expected: pitui_data::DatasetKind,
+) -> Option<Entity> {
+    if world
+        .get::<pitui_data::DatasetType>(target)
+        .map(|kind| kind.0)
+        == Some(expected)
+    {
+        return Some(target);
+    }
+    world
+        .get::<pitui_data::DatasetCollection>(target)
+        .and_then(|collection| {
+            collection.entities().find(|entity| {
+                world
+                    .get::<pitui_data::DatasetType>(*entity)
+                    .is_some_and(|kind| kind.0 == expected)
+            })
+        })
+}
+
 fn reconcile_git_operation_log(world: &World, bindings: &mut pitui_data::RenderContextBindings) {
     let Some(log) = bindings.get(&RenderBindingId::GitOperationLog) else {
         return;
     };
-    let entry = world.get::<DatasetCursor>(log).and_then(|cursor| cursor.0);
+    let entry = world
+        .get::<DatasetActiveElement>(log)
+        .and_then(|active| active.0);
     set_or_clear(
         bindings,
         RenderBindingId::CurrentGitOperationLogEntry,
@@ -425,8 +524,8 @@ fn reconcile_reflog(world: &World, bindings: &mut pitui_data::RenderContextBindi
         return;
     };
     let entry = world
-        .get::<DatasetCursor>(reflog)
-        .and_then(|cursor| cursor.0);
+        .get::<DatasetActiveElement>(reflog)
+        .and_then(|active| active.0);
     set_or_clear(bindings, RenderBindingId::CurrentReflogEntry, entry);
 }
 
@@ -462,15 +561,15 @@ pub(super) fn resolve_active_render_mode(world: &mut World) {
         .get(&context.render_mode)
         .cloned();
     let Some(mode) = mode else {
-        // Manual/bootstrap layouts remain supported for focused kernel tests.
+        // Manual/bootstrap layouts remain supported for isolated kernel tests.
         return;
     };
     let result =
         resolve_render_layout(world, &mode.layout, &context.render_bindings).and_then(|layout| {
-            if layout.is_focus_owner(context.active_dataset) {
+            if layout.can_activate(context.active_dataset) {
                 Ok(layout)
             } else {
-                Err(KernelError::ActiveDatasetNotFocusable(
+                Err(KernelError::ActiveDatasetNotActivatable(
                     context.active_dataset,
                 ))
             }

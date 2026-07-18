@@ -19,19 +19,56 @@ pub struct DatasetRevision(pub u64);
 #[derive(Component, Clone, Debug, Default, Eq, PartialEq)]
 pub struct DatasetChildren(pub Vec<Entity>);
 
-/// Ordered logical rows owned by a navigable Dataset.
+/// One renderer-independent element exposed by a Dataset's Collection Manager.
 ///
-/// For ordinary list Datasets this is identical to [`DatasetChildren`]. Tree
-/// Datasets may expose selected descendants without changing the ownership DAG:
-/// `RepositoriesBranches` exposes repository and branch rows, while `Changes`
-/// exposes boundary groups and working-tree file rows. Cursor and selection
-/// validation use this component rather than assuming every row is a direct
-/// child.
-#[derive(Component, Clone, Debug, Default, Eq, PartialEq)]
-pub struct DatasetNavigationOrder(pub Vec<Entity>);
+/// `DatasetChildren` remains the canonical ownership DAG. A List or Tree
+/// manager derives this presentation collection without introducing a second
+/// state model. Tree depth is data on the element itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollectionElement {
+    pub entity: Entity,
+    pub depth: usize,
+}
 
+/// Ordered elements currently exposed by a Dataset.
+///
+/// The order is used for rendering and for choosing the previous/next active
+/// element, but it remains ordinary collection data.
+#[derive(Component, Clone, Debug, Default, Eq, PartialEq)]
+pub struct DatasetCollection(pub Vec<CollectionElement>);
+
+impl DatasetCollection {
+    pub fn entities(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.0.iter().map(|element| element.entity)
+    }
+
+    pub fn contains(&self, entity: Entity) -> bool {
+        self.0.iter().any(|element| element.entity == entity)
+    }
+
+    pub fn position(&self, entity: Entity) -> Option<usize> {
+        self.0.iter().position(|element| element.entity == entity)
+    }
+
+    pub fn first(&self) -> Option<Entity> {
+        self.0.first().map(|element| element.entity)
+    }
+
+    pub fn depth(&self, entity: Entity) -> usize {
+        self.0
+            .iter()
+            .find(|element| element.entity == entity)
+            .map(|element| element.depth)
+            .unwrap_or_default()
+    }
+}
+
+/// The single active element owned by this Dataset.
+///
+/// Inactive Datasets retain this value so an Active Dataset handoff can return
+/// to the previous element. Only the active Dataset's element is highlighted.
 #[derive(Component, Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DatasetCursor(pub Option<Entity>);
+pub struct DatasetActiveElement(pub Option<Entity>);
 
 #[derive(Component, Clone, Debug, Default, Eq, PartialEq)]
 pub struct DatasetSelection(pub Vec<Entity>);
@@ -66,8 +103,8 @@ pub struct DatasetBundle {
     pub kind: DatasetType,
     pub revision: DatasetRevision,
     pub children: DatasetChildren,
-    pub navigation: DatasetNavigationOrder,
-    pub cursor: DatasetCursor,
+    pub collection: DatasetCollection,
+    pub active_element: DatasetActiveElement,
     pub selection: DatasetSelection,
     pub viewport: DatasetViewport,
     pub template: DatasetTemplateRef,
@@ -82,8 +119,8 @@ impl DatasetBundle {
             kind: DatasetType(kind),
             revision: DatasetRevision::default(),
             children: DatasetChildren::default(),
-            navigation: DatasetNavigationOrder::default(),
-            cursor: DatasetCursor::default(),
+            collection: DatasetCollection::default(),
+            active_element: DatasetActiveElement::default(),
             selection: DatasetSelection::default(),
             viewport: DatasetViewport::default(),
             template: DatasetTemplateRef(template),

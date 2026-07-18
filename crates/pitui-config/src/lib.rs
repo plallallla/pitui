@@ -10,12 +10,13 @@
 use std::{env, path::PathBuf, time::Duration};
 
 use pitui_data::{
-    AvailabilityRule, AvailabilityRuleId, CommandId, CommandScope, CommandSpec, CommandSystemId,
-    DatasetBinding, DatasetIdentity, DatasetKind, DatasetTemplate, DatasetTemplateId,
-    DateTimePrecision, FieldFormat, FieldId, FieldSpec, InteractionContextType, KeyCode,
-    KeySequence, KeyStroke, LayoutConstraint, NavigationModeRegistry, OperationId, OperationSpec,
-    RenderBindingId, RenderLayout, RenderModeId, RenderModeSpec, RenderProxyId, RenderProxySpec,
-    RendererKind, StyleSpec, TargetSource,
+    ActiveDirection, ActiveHandoffRegistry, ActiveHandoffSpec, ActiveHandoffTarget,
+    AvailabilityRule, AvailabilityRuleId, CollectionManagerSpec, CommandId, CommandScope,
+    CommandSpec, CommandSystemId, DatasetBinding, DatasetIdentity, DatasetKind, DatasetTemplate,
+    DatasetTemplateId, DateTimePrecision, FieldFormat, FieldId, FieldSpec, InteractionContextType,
+    KeyCode, KeySequence, KeyStroke, LayoutConstraint, OperationId, OperationSpec, RenderBindingId,
+    RenderLayout, RenderModeId, RenderModeSpec, RenderProxyId, RenderProxySpec, RendererKind,
+    StyleSpec, TargetSource, TreeManagerSpec, TreeSelectionMode, TreeSiblingOrder,
 };
 
 /// Version of the Data Driven configuration schema.
@@ -103,6 +104,7 @@ pub fn builtin_dataset_templates() -> Vec<DatasetTemplate> {
         (Kind::Commits, "commits"),
         (Kind::Commit, "commit"),
         (Kind::Files, "files"),
+        (Kind::FileTreeDirectory, "file-tree-directory"),
         (Kind::File, "file"),
         (Kind::FileChanges, "file-changes"),
         (Kind::Changes, "changes"),
@@ -122,10 +124,56 @@ pub fn builtin_dataset_templates() -> Vec<DatasetTemplate> {
     .map(|(kind, name)| DatasetTemplate {
         id: DatasetTemplateId::from(name),
         kind,
+        collection: collection_manager_for(kind),
         operations: operations_for_dataset(kind),
         render_proxies: builtin_proxies(kind),
     })
     .collect()
+}
+
+fn collection_manager_for(kind: DatasetKind) -> CollectionManagerSpec {
+    use DatasetKind as Kind;
+
+    let tree = |visible_kinds, selectable_kinds, sibling_order| {
+        CollectionManagerSpec::Tree(TreeManagerSpec {
+            visible_kinds,
+            selectable_kinds,
+            sibling_order,
+            selection: TreeSelectionMode::Cascade,
+        })
+    };
+    match kind {
+        Kind::RepositoriesBranches => tree(
+            vec![Kind::Repository, Kind::Branch],
+            vec![Kind::Repository, Kind::Branch],
+            TreeSiblingOrder::Source,
+        ),
+        Kind::Files => tree(
+            vec![Kind::FileTreeDirectory, Kind::File],
+            vec![Kind::FileTreeDirectory, Kind::File],
+            TreeSiblingOrder::Path,
+        ),
+        Kind::Changes => tree(
+            vec![
+                Kind::WorkingTreeFiles,
+                Kind::FileTreeDirectory,
+                Kind::WorkingTreeFile,
+            ],
+            vec![Kind::FileTreeDirectory, Kind::WorkingTreeFile],
+            TreeSiblingOrder::Path,
+        ),
+        Kind::WorkingTreeFiles => tree(
+            vec![Kind::FileTreeDirectory, Kind::WorkingTreeFile],
+            vec![Kind::FileTreeDirectory, Kind::WorkingTreeFile],
+            TreeSiblingOrder::Path,
+        ),
+        Kind::FileTreeDirectory => tree(
+            vec![Kind::FileTreeDirectory, Kind::File, Kind::WorkingTreeFile],
+            vec![Kind::FileTreeDirectory, Kind::File, Kind::WorkingTreeFile],
+            TreeSiblingOrder::Path,
+        ),
+        _ => CollectionManagerSpec::List,
+    }
 }
 
 /// Built-in render interpretations. Dataset templates only reference these IDs;
@@ -199,15 +247,21 @@ pub fn builtin_render_proxies() -> Vec<RenderProxySpec> {
             ],
         ),
         proxy(
-            "files.list",
+            "files.tree",
             Kind::Files,
-            Renderer::List,
+            Renderer::PathTree,
             vec![
                 plain(Field::FileStatus),
                 plain(Field::FilePath),
                 plain(Field::FileAdditions),
                 plain(Field::FileDeletions),
             ],
+        ),
+        proxy(
+            "file-tree-directory.detail",
+            Kind::FileTreeDirectory,
+            Renderer::Detail,
+            vec![labeled(Field::FilePath, "Directory")],
         ),
         proxy(
             "file.detail",
@@ -237,13 +291,13 @@ pub fn builtin_render_proxies() -> Vec<RenderProxySpec> {
         proxy(
             "changes.tree",
             Kind::Changes,
-            Renderer::Tree,
+            Renderer::PathTree,
             vec![plain(Field::FileStatus), plain(Field::DatasetLabel)],
         ),
         proxy(
-            "working-tree-files.list",
+            "working-tree-files.tree",
             Kind::WorkingTreeFiles,
-            Renderer::List,
+            Renderer::PathTree,
             vec![plain(Field::FileStatus), plain(Field::FilePath)],
         ),
         proxy(
@@ -372,13 +426,13 @@ pub fn builtin_render_modes() -> Vec<RenderModeSpec> {
                     dataset: DatasetBinding::Stable(DatasetIdentity::GlobalRepositoriesBranches),
                     proxy: RenderProxyId::from("repositories-branches.compact"),
                     constraint: LayoutConstraint::Percentage(35),
-                    focusable: true,
+                    activatable: true,
                 },
                 RenderLayout::Dataset {
                     dataset: DatasetBinding::Context(RenderBindingId::CurrentCommits),
                     proxy: RenderProxyId::from("commits.detailed"),
                     constraint: LayoutConstraint::Fill(1),
-                    focusable: true,
+                    activatable: true,
                 },
             ]),
         },
@@ -389,20 +443,20 @@ pub fn builtin_render_modes() -> Vec<RenderModeSpec> {
                     dataset: DatasetBinding::Context(RenderBindingId::CurrentCommits),
                     proxy: RenderProxyId::from("commits.compact"),
                     constraint: LayoutConstraint::Percentage(35),
-                    focusable: true,
+                    activatable: true,
                 },
                 RenderLayout::Column(vec![
                     RenderLayout::Dataset {
                         dataset: DatasetBinding::Context(RenderBindingId::CurrentCommit),
                         proxy: RenderProxyId::from("commit.detail"),
                         constraint: LayoutConstraint::Percentage(40),
-                        focusable: false,
+                        activatable: false,
                     },
                     RenderLayout::Dataset {
                         dataset: DatasetBinding::Context(RenderBindingId::CurrentFiles),
-                        proxy: RenderProxyId::from("files.list"),
+                        proxy: RenderProxyId::from("files.tree"),
                         constraint: LayoutConstraint::Fill(1),
-                        focusable: true,
+                        activatable: true,
                     },
                 ]),
             ]),
@@ -421,13 +475,13 @@ pub fn builtin_render_modes() -> Vec<RenderModeSpec> {
                     dataset: DatasetBinding::Context(RenderBindingId::CurrentReflog),
                     proxy: RenderProxyId::from("reflog.list"),
                     constraint: LayoutConstraint::Percentage(55),
-                    focusable: true,
+                    activatable: true,
                 },
                 RenderLayout::Dataset {
                     dataset: DatasetBinding::Context(RenderBindingId::CurrentReflogEntry),
                     proxy: RenderProxyId::from("reflog-entry.detail"),
                     constraint: LayoutConstraint::Fill(1),
-                    focusable: false,
+                    activatable: false,
                 },
             ]),
         },
@@ -438,24 +492,36 @@ pub fn builtin_render_modes() -> Vec<RenderModeSpec> {
                     dataset: DatasetBinding::Stable(DatasetIdentity::GlobalGitOperationLog),
                     proxy: RenderProxyId::from("git-operation-log.list"),
                     constraint: LayoutConstraint::Percentage(45),
-                    focusable: true,
+                    activatable: true,
                 },
                 RenderLayout::Dataset {
                     dataset: DatasetBinding::Context(RenderBindingId::CurrentGitOperationLogEntry),
                     proxy: RenderProxyId::from("git-operation-log-entry.detail"),
                     constraint: LayoutConstraint::Fill(1),
-                    focusable: false,
+                    activatable: false,
                 },
             ]),
         },
     ]
 }
 
-pub fn builtin_navigation_modes() -> NavigationModeRegistry {
-    NavigationModeRegistry {
-        drill_down: [
-            (DatasetKind::Commits, RenderModeId::from("commit")),
-            (DatasetKind::Files, RenderModeId::from("file-diff.unified")),
+pub fn builtin_active_handoffs() -> ActiveHandoffRegistry {
+    ActiveHandoffRegistry {
+        rules: [
+            (
+                (DatasetKind::Commits, ActiveDirection::Right),
+                ActiveHandoffSpec {
+                    render_mode: RenderModeId::from("commit"),
+                    target: ActiveHandoffTarget::KeepActiveDataset,
+                },
+            ),
+            (
+                (DatasetKind::Files, ActiveDirection::Right),
+                ActiveHandoffSpec {
+                    render_mode: RenderModeId::from("file-diff.unified"),
+                    target: ActiveHandoffTarget::KeepActiveDataset,
+                },
+            ),
         ]
         .into_iter()
         .collect(),
@@ -471,20 +537,20 @@ fn file_diff_mode(id: &str, diff_proxy: &str) -> RenderModeSpec {
                     dataset: DatasetBinding::Context(RenderBindingId::CurrentCommit),
                     proxy: RenderProxyId::from("commit.detail"),
                     constraint: LayoutConstraint::Percentage(40),
-                    focusable: false,
+                    activatable: false,
                 },
                 RenderLayout::Dataset {
                     dataset: DatasetBinding::Context(RenderBindingId::CurrentFiles),
-                    proxy: RenderProxyId::from("files.list"),
+                    proxy: RenderProxyId::from("files.tree"),
                     constraint: LayoutConstraint::Fill(1),
-                    focusable: true,
+                    activatable: true,
                 },
             ]),
             RenderLayout::Dataset {
                 dataset: DatasetBinding::Context(RenderBindingId::CurrentFileChanges),
                 proxy: RenderProxyId::from(diff_proxy),
                 constraint: LayoutConstraint::Fill(2),
-                focusable: true,
+                activatable: true,
             },
         ]),
     }
@@ -498,13 +564,13 @@ fn changes_mode(id: &str, diff_proxy: &str) -> RenderModeSpec {
                 dataset: DatasetBinding::Stable(DatasetIdentity::GlobalChanges),
                 proxy: RenderProxyId::from("changes.tree"),
                 constraint: LayoutConstraint::Percentage(40),
-                focusable: true,
+                activatable: true,
             },
             RenderLayout::Dataset {
                 dataset: DatasetBinding::Context(RenderBindingId::CurrentChangesFileChanges),
                 proxy: RenderProxyId::from(diff_proxy),
                 constraint: LayoutConstraint::Fill(1),
-                focusable: true,
+                activatable: true,
             },
         ]),
     }
@@ -514,20 +580,20 @@ pub fn builtin_availability_rules() -> Vec<(AvailabilityRuleId, AvailabilityRule
     vec![
         (AvailabilityRuleId::from("always"), AvailabilityRule::Always),
         (
-            AvailabilityRuleId::from("has-cursor"),
-            AvailabilityRule::HasCursor,
+            AvailabilityRuleId::from("has-active-element"),
+            AvailabilityRule::HasActiveElement,
         ),
         (
             AvailabilityRuleId::from("has-selection"),
             AvailabilityRule::HasSelection,
         ),
         (
-            AvailabilityRuleId::from("selection-or-cursor"),
-            AvailabilityRule::HasSelectionOrCursor,
+            AvailabilityRuleId::from("selection-or-active-element"),
+            AvailabilityRule::HasSelectionOrActiveElement,
         ),
         (
-            AvailabilityRuleId::from("current-files-selection-or-cursor"),
-            AvailabilityRule::ContextHasSelectionOrCursor(RenderBindingId::CurrentFiles),
+            AvailabilityRuleId::from("current-files-selection-or-active-element"),
+            AvailabilityRule::ContextHasSelectionOrActiveElement(RenderBindingId::CurrentFiles),
         ),
         (
             AvailabilityRuleId::from("normal-context"),
@@ -573,11 +639,17 @@ pub fn builtin_availability_rules() -> Vec<(AvailabilityRuleId, AvailabilityRule
             ))),
         ),
         (
-            AvailabilityRuleId::from("changes-file-cursor"),
-            AvailabilityRule::ContextCursorKind(
-                RenderBindingId::Changes,
-                DatasetKind::WorkingTreeFile,
-            ),
+            AvailabilityRuleId::from("changes-file-active-element"),
+            AvailabilityRule::Any(vec![
+                AvailabilityRule::ContextActiveElementKind(
+                    RenderBindingId::Changes,
+                    DatasetKind::WorkingTreeFile,
+                ),
+                AvailabilityRule::ContextActiveElementKind(
+                    RenderBindingId::Changes,
+                    DatasetKind::FileTreeDirectory,
+                ),
+            ]),
         ),
         (
             AvailabilityRuleId::from("changes-unstaged-targets"),
@@ -619,10 +691,10 @@ pub fn builtin_command_specs() -> Vec<CommandSpec> {
     .into_iter()
     .map(|(id, name)| command(id, name, CommandScope::Global));
     let local = [
-        ("navigation.up", "up"),
-        ("navigation.down", "down"),
-        ("navigation.left", "left"),
-        ("navigation.right", "right"),
+        ("active.up", "up"),
+        ("active.down", "down"),
+        ("active.left", "left"),
+        ("active.right", "right"),
         ("selection.toggle", "toggle-selection"),
         ("copy.commit.hash", "copy-commit-hash"),
         ("copy.commit.info", "copy-commit-info"),
@@ -671,13 +743,13 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
     let commit_creation_context = AvailabilityRuleId::from("commit-creation-context");
     let notice_context = AvailabilityRuleId::from("notice-context");
     let changes_entry = AvailabilityRuleId::from("changes-entry-context");
-    let changes_file_cursor = AvailabilityRuleId::from("changes-file-cursor");
+    let changes_file_active = AvailabilityRuleId::from("changes-file-active-element");
     let changes_unstaged = AvailabilityRuleId::from("changes-unstaged-targets");
     let changes_staged = AvailabilityRuleId::from("changes-staged-targets");
     let changes_has_staged = AvailabilityRuleId::from("changes-has-staged-files");
-    let cursor = AvailabilityRuleId::from("has-cursor");
-    let selected_or_cursor = AvailabilityRuleId::from("selection-or-cursor");
-    let current_file = AvailabilityRuleId::from("current-files-selection-or-cursor");
+    let active_element = AvailabilityRuleId::from("has-active-element");
+    let selected_or_active = AvailabilityRuleId::from("selection-or-active-element");
+    let current_file = AvailabilityRuleId::from("current-files-selection-or-active-element");
     let mut operations = vec![
         operation(
             "global.quit",
@@ -816,15 +888,15 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
             "Select",
             "changes.selection.toggle",
             vec![single(KeyStroke::plain(KeyCode::Space))],
-            TargetSource::ContextCursor(RenderBindingId::Changes),
-            changes_file_cursor,
+            TargetSource::ContextActiveElement(RenderBindingId::Changes),
+            changes_file_active,
         ),
         operation(
             "changes.stage",
             "Stage",
             "changes.stage",
             vec![single(shifted('s'))],
-            TargetSource::ContextSelectionOrCursor(RenderBindingId::Changes),
+            TargetSource::ContextSelectionOrActiveElement(RenderBindingId::Changes),
             changes_unstaged,
         ),
         operation(
@@ -832,7 +904,7 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
             "Unstage",
             "changes.unstage",
             vec![single(shifted('u'))],
-            TargetSource::ContextSelectionOrCursor(RenderBindingId::Changes),
+            TargetSource::ContextSelectionOrActiveElement(RenderBindingId::Changes),
             changes_staged,
         ),
         operation(
@@ -871,9 +943,9 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
 
     operations.extend([
         operation(
-            "navigation.up",
+            "active.up",
             "Up",
-            "navigation.up",
+            "active.up",
             vec![
                 single(KeyStroke::character('w')),
                 single(KeyStroke::plain(KeyCode::Up)),
@@ -882,9 +954,9 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
             always.clone(),
         ),
         operation(
-            "navigation.down",
+            "active.down",
             "Down",
-            "navigation.down",
+            "active.down",
             vec![
                 single(KeyStroke::character('s')),
                 single(KeyStroke::plain(KeyCode::Down)),
@@ -893,9 +965,9 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
             always.clone(),
         ),
         operation(
-            "navigation.left",
+            "active.left",
             "Left",
-            "navigation.left",
+            "active.left",
             vec![
                 single(KeyStroke::character('a')),
                 single(KeyStroke::plain(KeyCode::Left)),
@@ -904,9 +976,9 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
             always.clone(),
         ),
         operation(
-            "navigation.right",
+            "active.right",
             "Right",
-            "navigation.right",
+            "active.right",
             vec![
                 single(KeyStroke::character('d')),
                 single(KeyStroke::plain(KeyCode::Right)),
@@ -919,40 +991,40 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
             "Select",
             "selection.toggle",
             vec![single(KeyStroke::plain(KeyCode::Space))],
-            TargetSource::Cursor,
-            cursor.clone(),
+            TargetSource::ActiveElement,
+            active_element.clone(),
         ),
         operation(
             "copy.commit.hash",
             "Copy hash",
             "copy.commit.hash",
             vec![copy_chord('h')],
-            TargetSource::SelectionOrCursor,
-            selected_or_cursor.clone(),
+            TargetSource::SelectionOrActiveElement,
+            selected_or_active.clone(),
         ),
         operation(
             "copy.commit.info",
             "Copy info",
             "copy.commit.info",
             vec![copy_chord('i')],
-            TargetSource::Cursor,
-            cursor.clone(),
+            TargetSource::ActiveElement,
+            active_element.clone(),
         ),
         operation(
             "copy.commit.message",
             "Copy message",
             "copy.commit.message",
             vec![copy_chord('m')],
-            TargetSource::Cursor,
-            cursor.clone(),
+            TargetSource::ActiveElement,
+            active_element.clone(),
         ),
         operation(
             "copy.reflog.hash",
             "Copy hash",
             "copy.reflog.hash",
             vec![copy_chord('h')],
-            TargetSource::Cursor,
-            cursor.clone(),
+            TargetSource::ActiveElement,
+            active_element.clone(),
         ),
         operation(
             "commits.cherry-pick",
@@ -967,7 +1039,7 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
             "Copy name",
             "copy.file.name",
             vec![copy_chord('n')],
-            TargetSource::ContextSelectionOrCursor(RenderBindingId::CurrentFiles),
+            TargetSource::ContextSelectionOrActiveElement(RenderBindingId::CurrentFiles),
             current_file.clone(),
         ),
         operation(
@@ -975,7 +1047,7 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
             "Copy absolute path",
             "copy.file.absolute",
             vec![copy_chord('a')],
-            TargetSource::ContextSelectionOrCursor(RenderBindingId::CurrentFiles),
+            TargetSource::ContextSelectionOrActiveElement(RenderBindingId::CurrentFiles),
             current_file.clone(),
         ),
         operation(
@@ -983,7 +1055,7 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
             "Copy relative path",
             "copy.file.relative",
             vec![copy_chord('r')],
-            TargetSource::ContextSelectionOrCursor(RenderBindingId::CurrentFiles),
+            TargetSource::ContextSelectionOrActiveElement(RenderBindingId::CurrentFiles),
             current_file,
         ),
         operation(
@@ -1127,16 +1199,17 @@ fn operations_for_dataset(kind: DatasetKind) -> Vec<OperationId> {
     use DatasetKind as Kind;
     let names: &[&str] = match kind {
         Kind::RepositoriesBranches => &[
-            "navigation.up",
-            "navigation.down",
-            "navigation.left",
-            "navigation.right",
+            "active.up",
+            "active.down",
+            "active.left",
+            "active.right",
+            "selection.toggle",
         ],
         Kind::Commits => &[
-            "navigation.up",
-            "navigation.down",
-            "navigation.left",
-            "navigation.right",
+            "active.up",
+            "active.down",
+            "active.left",
+            "active.right",
             "selection.toggle",
             "copy.commit.hash",
             "copy.commit.info",
@@ -1144,8 +1217,8 @@ fn operations_for_dataset(kind: DatasetKind) -> Vec<OperationId> {
             "commits.cherry-pick",
         ],
         Kind::Commit => &[
-            "navigation.left",
-            "navigation.right",
+            "active.left",
+            "active.right",
             "copy.commit.hash",
             "copy.commit.info",
             "copy.commit.message",
@@ -1155,20 +1228,20 @@ fn operations_for_dataset(kind: DatasetKind) -> Vec<OperationId> {
             "scroll.page-down",
         ],
         Kind::Files => &[
-            "navigation.up",
-            "navigation.down",
-            "navigation.left",
-            "navigation.right",
+            "active.up",
+            "active.down",
+            "active.left",
+            "active.right",
             "selection.toggle",
             "copy.file.name",
             "copy.file.absolute",
             "copy.file.relative",
         ],
         Kind::Changes => &[
-            "navigation.up",
-            "navigation.down",
-            "navigation.left",
-            "navigation.right",
+            "active.up",
+            "active.down",
+            "active.left",
+            "active.right",
             "changes.selection.toggle",
             "changes.stage",
             "changes.unstage",
@@ -1180,22 +1253,22 @@ fn operations_for_dataset(kind: DatasetKind) -> Vec<OperationId> {
             "commit-creation.submit",
         ],
         Kind::WorkingTreeFiles | Kind::Remotes => &[
-            "navigation.up",
-            "navigation.down",
-            "navigation.left",
-            "navigation.right",
+            "active.up",
+            "active.down",
+            "active.left",
+            "active.right",
             "selection.toggle",
         ],
         Kind::Reflog => &[
-            "navigation.up",
-            "navigation.down",
-            "navigation.left",
-            "navigation.right",
+            "active.up",
+            "active.down",
+            "active.left",
+            "active.right",
             "copy.reflog.hash",
         ],
         Kind::File | Kind::WorkingTreeFile => &[
-            "navigation.left",
-            "navigation.right",
+            "active.left",
+            "active.right",
             "copy.file.name",
             "copy.file.absolute",
             "copy.file.relative",
@@ -1205,7 +1278,7 @@ fn operations_for_dataset(kind: DatasetKind) -> Vec<OperationId> {
             "scroll.page-down",
         ],
         Kind::FileChanges | Kind::WorkingTreeFileChanges => &[
-            "navigation.left",
+            "active.left",
             "copy.file.name",
             "copy.file.absolute",
             "copy.file.relative",
@@ -1215,8 +1288,8 @@ fn operations_for_dataset(kind: DatasetKind) -> Vec<OperationId> {
             "scroll.page-down",
         ],
         Kind::GitOperationLog => &[
-            "navigation.up",
-            "navigation.down",
+            "active.up",
+            "active.down",
             "scroll.home",
             "scroll.end",
             "scroll.page-up",
@@ -1234,6 +1307,7 @@ fn operations_for_dataset(kind: DatasetKind) -> Vec<OperationId> {
         ],
         Kind::Repository
         | Kind::Branch
+        | Kind::FileTreeDirectory
         | Kind::ReflogEntry
         | Kind::Remote
         | Kind::GitOperationLogEntry => &[],
@@ -1258,11 +1332,12 @@ fn builtin_proxies(kind: DatasetKind) -> Vec<RenderProxyId> {
         Kind::Branch => &["branch.detail"],
         Kind::Commits => &["commits.compact", "commits.detailed"],
         Kind::Commit => &["commit.detail"],
-        Kind::Files => &["files.list"],
+        Kind::Files => &["files.tree"],
+        Kind::FileTreeDirectory => &["file-tree-directory.detail"],
         Kind::File => &["file.detail"],
         Kind::FileChanges => &["file-changes.unified", "file-changes.side-by-side"],
         Kind::Changes => &["changes.tree"],
-        Kind::WorkingTreeFiles => &["working-tree-files.list"],
+        Kind::WorkingTreeFiles => &["working-tree-files.tree"],
         Kind::WorkingTreeFile => &["working-tree-file.detail"],
         Kind::WorkingTreeFileChanges => &[
             "working-tree-file-changes.unified",

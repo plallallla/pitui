@@ -22,6 +22,7 @@ fn register_template(
         .register_template(DatasetTemplate {
             id: id.clone(),
             kind,
+            collection: pitui_data::CollectionManagerSpec::List,
             operations,
             render_proxies: vec![RenderProxyId::from("test")],
         })
@@ -59,7 +60,7 @@ fn initialize_single_panel(runtime: &mut DatasetRuntime, dataset: bevy_ecs::prel
                 dataset,
                 proxy: RenderProxyId::from("test"),
                 constraint: LayoutConstraint::Fill(1),
-                focusable: true,
+                activatable: true,
             },
             ResolvedOperationSet::default(),
         )

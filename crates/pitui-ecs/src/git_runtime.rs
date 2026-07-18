@@ -9,16 +9,17 @@ use bevy_ecs::prelude::{
     Entity, Message, MessageReader, MessageWriter, Messages, Res, ResMut, Resource, World,
 };
 use pitui_core::{
-    Branch, BranchKind, ChangedFile, Commit, CommitDetail, FileDiff, ReflogEntry, Repository,
-    WorkingTreeChange, WorkingTreeDiff,
+    Branch, BranchKind, ChangedFile, Commit, CommitDetail, FileDiff, GitPath, ReflogEntry,
+    Repository, WorkingTreeChange, WorkingTreeDiff,
 };
 use pitui_data::{
     ActiveUiContext, BranchMetadata, ChangeBoundary, CommitMetadata, DatasetChildren,
     DatasetIdentity, DatasetIndex, DatasetKey, DatasetKind, DatasetRevision, DatasetTemplateId,
     DatasetTemplateRef, DatasetTemplateRegistry, DatasetType, DefaultDatasetTemplates,
-    FileChangesMetadata, FileMetadata, GitOperationLogEntryMetadata, GitOperationStatus,
-    HasSnapshot, InteractionNoticeRequest, ReflogEntryMetadata, RenderBindingId, RepositoryKey,
-    RepositoryMetadata, WorkingTreeFileChangesMetadata, WorkingTreeFileMetadata,
+    FileChangesMetadata, FileMetadata, FileTreeDirectoryMetadata, GitOperationLogEntryMetadata,
+    GitOperationStatus, HasSnapshot, InteractionNoticeRequest, ReflogEntryMetadata,
+    RenderBindingId, RepositoryKey, RepositoryMetadata, WorkingTreeFileChangesMetadata,
+    WorkingTreeFileMetadata,
 };
 use pitui_git::{
     CliGitExecutor, GitCommand, GitExecutor, GitFailure, ParsedGitPayload,
@@ -511,10 +512,10 @@ fn record_git_operation(
         let log_is_active = world
             .get_resource::<ActiveUiContext>()
             .is_some_and(|context| context.active_dataset == log);
-        if let Some(mut cursor) = world.get_mut::<pitui_data::DatasetCursor>(log)
-            && (!log_is_active || cursor.0.is_none())
+        if let Some(mut active) = world.get_mut::<pitui_data::DatasetActiveElement>(log)
+            && (!log_is_active || active.0.is_none())
         {
-            cursor.0 = Some(entry);
+            active.0 = Some(entry);
         }
     }
 }
@@ -574,6 +575,7 @@ enum MetadataUpdate {
     Branch(DatasetIdentity, Branch),
     Commit(DatasetIdentity, CommitMetadata),
     File(DatasetIdentity, ChangedFile),
+    FileTreeDirectory(DatasetIdentity, GitPath),
     FileChanges(DatasetIdentity, FileDiff),
     WorkingTreeFile(DatasetIdentity, WorkingTreeChange),
     WorkingTreeFileChanges(DatasetIdentity, WorkingTreeDiff),
@@ -890,6 +892,67 @@ fn commits_plan(
     Ok(plan)
 }
 
+#[derive(Default)]
+struct FileTreePlanState {
+    directory_ids: HashSet<DatasetIdentity>,
+    relations: HashMap<DatasetIdentity, Vec<DatasetIdentity>>,
+}
+
+fn attach_file_to_tree(
+    plan: &mut DatasetSnapshotPlan,
+    tree: &mut FileTreePlanState,
+    root: &DatasetIdentity,
+    file: DatasetIdentity,
+    path: &GitPath,
+    directory_template: &DatasetTemplateId,
+    directory_identity: impl Fn(GitPath) -> DatasetIdentity,
+) {
+    let components = path
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    let mut parent = root.clone();
+    let mut directory_path = Vec::new();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        if !directory_path.is_empty() {
+            directory_path.push(b'/');
+        }
+        directory_path.extend_from_slice(component);
+        let path = GitPath::from_bytes(directory_path.clone());
+        let directory = directory_identity(path.clone());
+        if tree.directory_ids.insert(directory.clone()) {
+            plan.add_node(
+                directory.clone(),
+                DatasetKind::FileTreeDirectory,
+                directory_template.clone(),
+            );
+            plan.metadata
+                .push(MetadataUpdate::FileTreeDirectory(directory.clone(), path));
+        }
+        tree.relations
+            .entry(parent)
+            .or_default()
+            .push(directory.clone());
+        tree.relations.entry(directory.clone()).or_default();
+        parent = directory;
+    }
+    tree.relations.entry(parent).or_default().push(file);
+}
+
+fn apply_file_tree_relations(
+    plan: &mut DatasetSnapshotPlan,
+    relations: HashMap<DatasetIdentity, Vec<DatasetIdentity>>,
+) {
+    let mut relations = relations.into_iter().collect::<Vec<_>>();
+    relations.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (parent, mut children) in relations {
+        children.sort();
+        children.dedup();
+        plan.replace_children(parent, children);
+    }
+}
+
 fn commit_detail_plan(
     world: &World,
     repository: RepositoryKey,
@@ -897,6 +960,7 @@ fn commit_detail_plan(
 ) -> Result<DatasetSnapshotPlan, GitDataError> {
     let commit_template = template_for(world, DatasetKind::Commit)?;
     let files_template = template_for(world, DatasetKind::Files)?;
+    let directory_template = template_for(world, DatasetKind::FileTreeDirectory)?;
     let file_template = template_for(world, DatasetKind::File)?;
     let changes_template = template_for(world, DatasetKind::FileChanges)?;
     let commit_id = DatasetIdentity::Commit {
@@ -926,8 +990,10 @@ fn commit_detail_plan(
         },
     ));
 
-    let mut file_ids = Vec::with_capacity(detail.files.len());
+    let mut tree = FileTreePlanState::default();
+    tree.relations.insert(files_id.clone(), Vec::new());
     for file in detail.files {
+        let file_path = file.path.clone();
         let file_id = DatasetIdentity::File {
             repository: repository.clone(),
             commit: detail.commit.hash.clone(),
@@ -947,9 +1013,21 @@ fn commit_detail_plan(
         plan.metadata
             .push(MetadataUpdate::File(file_id.clone(), file));
         plan.replace_children(file_id.clone(), vec![changes_id]);
-        file_ids.push(file_id);
+        attach_file_to_tree(
+            &mut plan,
+            &mut tree,
+            &files_id,
+            file_id,
+            &file_path,
+            &directory_template,
+            |path| DatasetIdentity::FileDirectory {
+                repository: repository.clone(),
+                commit: detail.commit.hash.clone(),
+                path,
+            },
+        );
     }
-    plan.replace_children(files_id.clone(), file_ids);
+    apply_file_tree_relations(&mut plan, tree.relations);
     plan.replace_children(commit_id, vec![files_id]);
     Ok(plan)
 }
@@ -984,6 +1062,7 @@ fn working_tree_plan(
 ) -> Result<DatasetSnapshotPlan, GitDataError> {
     let changes_template = template_for(world, DatasetKind::Changes)?;
     let groups_template = template_for(world, DatasetKind::WorkingTreeFiles)?;
+    let directory_template = template_for(world, DatasetKind::FileTreeDirectory)?;
     let file_template = template_for(world, DatasetKind::WorkingTreeFile)?;
     let diff_template = template_for(world, DatasetKind::WorkingTreeFileChanges)?;
     let changes_id = DatasetIdentity::GlobalChanges;
@@ -1005,8 +1084,9 @@ fn working_tree_plan(
         );
     }
 
-    let mut staged_files = Vec::new();
-    let mut unstaged_files = Vec::new();
+    let mut tree = FileTreePlanState::default();
+    tree.relations.insert(staged_group.clone(), Vec::new());
+    tree.relations.insert(unstaged_group.clone(), Vec::new());
     for change in changes {
         for boundary in [ChangeBoundary::Staged, ChangeBoundary::Unstaged] {
             let included = match boundary {
@@ -1042,14 +1122,26 @@ fn working_tree_plan(
                 change.clone(),
             ));
             plan.replace_children(file_id.clone(), vec![diff_id]);
-            match boundary {
-                ChangeBoundary::Staged => staged_files.push(file_id),
-                ChangeBoundary::Unstaged => unstaged_files.push(file_id),
-            }
+            let root = match boundary {
+                ChangeBoundary::Staged => &staged_group,
+                ChangeBoundary::Unstaged => &unstaged_group,
+            };
+            attach_file_to_tree(
+                &mut plan,
+                &mut tree,
+                root,
+                file_id,
+                &change.path,
+                &directory_template,
+                |path| DatasetIdentity::WorkingTreeDirectory {
+                    repository: repository.clone(),
+                    boundary,
+                    path,
+                },
+            );
         }
     }
-    plan.replace_children(staged_group.clone(), staged_files);
-    plan.replace_children(unstaged_group.clone(), unstaged_files);
+    apply_file_tree_relations(&mut plan, tree.relations);
     plan.replace_children(changes_id, vec![staged_group, unstaged_group]);
     Ok(plan)
 }
@@ -1287,6 +1379,12 @@ fn apply_plan(world: &mut World, plan: DatasetSnapshotPlan) -> Result<(), GitDat
             MetadataUpdate::File(identity, metadata) => {
                 let entity = entity_for(world, &identity)?;
                 world.entity_mut(entity).insert(FileMetadata(metadata));
+            }
+            MetadataUpdate::FileTreeDirectory(identity, path) => {
+                let entity = entity_for(world, &identity)?;
+                world
+                    .entity_mut(entity)
+                    .insert(FileTreeDirectoryMetadata(path));
             }
             MetadataUpdate::FileChanges(identity, metadata) => {
                 let entity = entity_for(world, &identity)?;
