@@ -1,4 +1,4 @@
-//! Canonical ECS data for the next-generation Pitui runtime.
+//! Canonical ECS data for the Pitui runtime.
 //!
 //! This crate contains facts and declarative descriptions only. It has no Git
 //! process runner, terminal renderer, input loop or application controller.

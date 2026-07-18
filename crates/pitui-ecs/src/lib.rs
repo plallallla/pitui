@@ -207,7 +207,7 @@ pub enum InvariantViolation {
     ActiveDatasetNotFocusable(Entity),
 }
 
-/// Composition root for the next-generation ECS world.
+/// Runtime owner for the Data Driven ECS world.
 pub struct DatasetRuntime {
     world: World,
     schedule: Schedule,

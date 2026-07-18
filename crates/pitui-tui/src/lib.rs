@@ -1,4 +1,4 @@
-//! Terminal adapter for the next-generation runtime.
+//! Terminal adapter for the Data Driven runtime.
 //!
 //! It will translate terminal events into input data and present immutable
 //! frame projections. It must not receive mutable ECS World access.

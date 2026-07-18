@@ -17,7 +17,6 @@ members = [
     "crates/pitui-git",
     "crates/pitui-config",
     "crates/pitui-tui",
-    "crates/pitui-next",
 ]
 resolver = "3"
 
@@ -41,13 +40,12 @@ tempfile = "3.27.0"
 unicode-width = "0.2.2"
 
 [dependencies]
-crossterm.workspace = true
-pitui-core.workspace = true
+bevy_ecs.workspace = true
+pitui-config.workspace = true
+pitui-data.workspace = true
+pitui-ecs.workspace = true
 pitui-git.workspace = true
-ratatui.workspace = true
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
-unicode-width.workspace = true
+pitui-tui.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

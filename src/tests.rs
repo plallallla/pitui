@@ -39,7 +39,7 @@ fn repository_arguments_preserve_order_and_remove_duplicates() {
 }
 
 #[test]
-fn composition_bootstraps_history_without_legacy_app_state() {
+fn composition_bootstraps_history_from_dataset_ecs() {
     let repository = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
         let output = Command::new("git")
@@ -60,7 +60,7 @@ fn composition_bootstraps_history_without_legacy_app_state() {
     git(&["add", "README.md"]);
     git(&["commit", "-m", "second"]);
 
-    let mut app = NextApp::open_from(repository.path(), Vec::new()).unwrap();
+    let mut app = App::open_from(repository.path(), Vec::new()).unwrap();
 
     assert!(app.runtime().validate_registration_contracts().is_empty());
 
@@ -1224,7 +1224,7 @@ fn changes_supports_clean_repositories_and_committing_the_last_visible_file() {
     git(&["add", "file.txt"]);
     git(&["commit", "-m", "initial"]);
 
-    let mut app = NextApp::open_from(repository.path(), Vec::new()).unwrap();
+    let mut app = App::open_from(repository.path(), Vec::new()).unwrap();
     let changes = app
         .runtime()
         .world()
@@ -1339,7 +1339,7 @@ fn failed_commit_restores_changes_then_opens_a_redacted_notice_context() {
     git(&["add", "file.txt"]);
     git(&["commit", "-m", "initial"]);
 
-    let mut app = NextApp::open_from(repository.path(), Vec::new()).unwrap();
+    let mut app = App::open_from(repository.path(), Vec::new()).unwrap();
     fs::write(repository.path().join("file.txt"), "changed\n").unwrap();
     app.dispatch_input(InputIntent::Key(KeyStroke::control('g')));
     let changes = app
@@ -1462,7 +1462,7 @@ fn failed_commit_restores_changes_then_opens_a_redacted_notice_context() {
 #[test]
 fn initial_non_repository_failure_keeps_a_blank_snapshot_and_presents_notice_later() {
     let directory = tempfile::tempdir().unwrap();
-    let mut app = NextApp::open_from(directory.path(), Vec::new()).unwrap();
+    let mut app = App::open_from(directory.path(), Vec::new()).unwrap();
     let interaction = app
         .runtime()
         .world()
@@ -1525,7 +1525,7 @@ fn git_operation_log_is_a_navigable_data_backed_two_column_context() {
     git(&["add", "file.txt"]);
     git(&["commit", "-m", "initial"]);
 
-    let mut app = NextApp::open_from(repository.path(), Vec::new()).unwrap();
+    let mut app = App::open_from(repository.path(), Vec::new()).unwrap();
     let log = app
         .runtime()
         .world()
@@ -1665,13 +1665,9 @@ fn injected_jsonl_sink_and_session_log_receive_the_same_git_results() {
             max_message_chars: 4096,
         })
         .unwrap();
-    let app = NextApp::open_from_with_log_sink(
-        repository.path(),
-        Vec::new(),
-        Arc::new(sink.clone()),
-        None,
-    )
-    .unwrap();
+    let app =
+        App::open_from_with_log_sink(repository.path(), Vec::new(), Arc::new(sink.clone()), None)
+            .unwrap();
     pitui_git::logging::GitOperationLogSink::flush(&sink);
 
     let log = app
@@ -1718,7 +1714,7 @@ fn reflog_command_opens_a_data_backed_context_and_copies_the_current_hash() {
     fs::write(repository.path().join("file.txt"), "second\n").unwrap();
     git(&["commit", "-am", "second"]);
 
-    let mut app = NextApp::open_from(repository.path(), Vec::new()).unwrap();
+    let mut app = App::open_from(repository.path(), Vec::new()).unwrap();
     app.dispatch_input(InputIntent::CommandLine("reflog".into()));
 
     let context = app.runtime().world().resource::<ActiveUiContext>();
@@ -1841,7 +1837,7 @@ fn commits_selection_is_the_only_cherry_pick_source_and_replays_oldest_first() {
     let two = git(&["rev-parse", "HEAD"]);
     git(&["switch", "main"]);
 
-    let mut app = NextApp::open_from(repository.path(), Vec::new()).unwrap();
+    let mut app = App::open_from(repository.path(), Vec::new()).unwrap();
     let repository_entity = app.repositories()[0];
     let DatasetIdentity::Repository(repository_key) = app
         .runtime()
@@ -2003,7 +1999,7 @@ fn cherry_pick_conflict_is_aborted_noticed_and_logged_as_typed_data() {
     git(&["commit", "-am", "main conflict"]);
     let head_before = git(&["rev-parse", "HEAD"]);
 
-    let mut app = NextApp::open_from(repository.path(), Vec::new()).unwrap();
+    let mut app = App::open_from(repository.path(), Vec::new()).unwrap();
     let repository_entity = app.repositories()[0];
     let DatasetIdentity::Repository(repository_key) = app
         .runtime()

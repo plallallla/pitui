@@ -3,456 +3,118 @@
 > [!IMPORTANT]
 > **Vibe Coding 声明：当前仓库中的全部代码、测试和文档均通过 vibe coding 生成；维护者负责提出需求、审阅结果并运行验证。**
 
-Pitui 是一个安全、克制、支持多仓库的 Git TUI，以分支、commit 和 diff 浏览为核心。
+Pitui 是一个使用 Rust、`bevy_ecs`、ratatui 和 Git CLI 实现的 Data Driven Git TUI。
+仓库只有一套正式运行时：根包 `pitui`。所有界面状态、焦点、操作、Git 请求与渲染结果都通过
+类型化数据表达。
 
-> [!NOTE]
-> 当前 binary 是已经验收的 0.1.0 Legacy 行为基线。下一代不在现有
-> `AppState/GitModel/Controller` 核心上继续重构，而是使用独立 `bevy_ecs` crate 按
-> Data Driven Development 重新开发。Next 的当前实现证据、已知缺口、资产边界和验收门禁见
-> [`docs/next-development-status.md`](docs/next-development-status.md) 与
-> [`docs/code-assets.md`](docs/code-assets.md)。
+## 当前能力
+
+- 同时打开一个或多个本地 Git 仓库。
+- 以仓库/分支树浏览分支，并查看对应 commit 列表。
+- 查看 commit 作者、时间、tag、message、changed files 和文件 diff。
+- 查看 staged/unstaged changes，支持文件多选、stage、unstage 和创建 commit。
+- 查看 reflog，并复制 reflog hash。
+- 多选 commits 后安全执行 cherry-pick；冲突时自动尝试 abort。
+- 复制 commit hash/info/message，以及文件名、绝对路径和仓库相对路径。
+- 查看会话 Git 操作日志，并可持久化为自动轮转的 JSONL 日志。
+- 快捷键、底部提示、Help 和 Command Palette 共用当前唯一有效 Operation Set。
+- 只在数据发生变化或终端 resize 时重绘；Git 数据使用 `Ctrl+R` 手动刷新。
+
+当前尚未实现 remote 管理、fetch、pull、push、sync、reset 和 rebase。相关未实现命令会明确拒绝，
+不会静默执行。外部 TOML 配置也尚未接入，当前使用 `pitui-config` 提供的严格内置配置数据。
+
+## 运行
+
+要求：
+
+- Rust 1.95 或更新版本
+- `git` 可从 `PATH` 调用
+
+```bash
+cargo run -- /path/to/repository
+```
+
+同时打开多个仓库：
+
+```bash
+cargo run -- /repo/one /repo/two
+```
+
+不传路径时默认打开当前目录。
+
+## 主要快捷键
+
+底部只显示当前焦点下真正可执行的快捷键；按 `h` 可查看当前上下文帮助。
+
+| 快捷键 | 操作 |
+|---|---|
+| `W/A/S/D` 或方向键 | 上/左/下/右导航 |
+| `Space` | 选择或反选当前条目 |
+| `Esc` | 返回或关闭交互层 |
+| `h` | 当前上下文帮助 |
+| `Ctrl+P` | Command Palette |
+| `Ctrl+R` | 手动刷新当前上下文 |
+| `Ctrl+G` | 打开 Changes |
+| `Ctrl+C`, `h/i/m` | 复制 commit hash/info/message |
+| `Ctrl+C`, `n/a/r` | 复制文件名/绝对路径/相对路径 |
+| `Shift+S` | Stage 选中的 unstaged 文件 |
+| `Shift+U` | Unstage 选中的 staged 文件 |
+| `Shift+C` | 使用 staged 文件创建 commit |
+| `Home/End/PageUp/PageDown` | 详细内容和 diff 滚动 |
+| `q` | 退出 |
+
+二级快捷键只会在输入第一级后展示第二级提示。
+
+## Data Driven + ECS 架构
 
 ```text
-Repositories + Branches -> Commits -> Commit + Changed Files -> Files + Diff
-          |
-          +-------------> Reflog
-          +-------------> Remotes -> Add / Shared URL / Upstream
-
-Any main view -- Ctrl+G --> Changes -> Staged / Unstaged -> Files + Diff
+Terminal Event
+    -> InputIntent
+    -> ResolvedOperationSet
+    -> CommandInvocation
+    -> ECS Command System
+         -> Dataset/Cursor/Selection/ContextTransition
+         -> GitCommandData -> GitExecutor -> GitResultData
+    -> Reconcile bindings/layout/operations
+    -> immutable UiFrame
+    -> ratatui Renderer
 ```
 
-它允许你在**不切换当前工作分支**的情况下浏览任意本地或远程分支的提交；真正修改仓库的操作始终经过确认。
-
-## 功能
-
-- 浏览本地与远程分支。
-- 同时打开多个仓库，并以“仓库 → 分支”的树形结构展示。
-- 在仓库节点确认后执行 `git fetch --all --prune`。
-- 在仓库节点确认执行 pull/push；pull 固定使用 `git pull --rebase`，不会产生隐式 merge commit。
-- 独立 Remote 管理界面可新增 remote、将现有 remote 统一为一个 fetch/push URL，并为当前分支显式选择 upstream remote。
-- fetch、pull 和 push 前强制检查 remote 的 fetch/push URL 相同，并禁止当前分支从一个 remote 拉取却向另一个 remote 推送。
-- 按仓库浏览最近 300 条 reflog，并从 commit 或 reflog 条目选择 reset 目标。
-- 独立 Changes 界面使用“Changes → Staged/Unstaged → 文件”三级树展示当前修改。
-- Changes 与 commit file diff 复用 unified / side-by-side diff 组件。
-- unified / side-by-side 的启动默认模式可通过全局配置设置；窄终端仍安全降级为 unified。
-- Changes 支持文件/分组多选，可在文件树或 diff 焦点下 stage、unstage，并通过消息弹窗创建 commit。
-- Git worker 的每个后台 job 都写入持久化 JSONL 操作日志，包含排队、开始、完成、耗时与失败结果。
-- 不执行 checkout/switch 即可查看任意分支最近 300 个 commits。
-- 查看 commit 元信息、文件状态、增删行数和 hunk summary。
-- 查看单文件 unified diff。
-- 在宽度不小于 140 列时使用 side-by-side diff。
-- 分支和 commit 过滤。
-- commit 支持统一多选：可复制一个或多个完整 commit hash，也可按历史顺序确认并 cherry-pick 所选 commits；当前 commit info 和完整 message 仍可单独复制。
-- `Ctrl-C` 二级快捷键按 focus 挂载：Commits 复制 hash/info/message，文件列复制文件名/绝对路径/仓库相对路径；Diff 等其他列不会误挂载复制操作。
-- `h` 打开只包含全局命令与当前 focus 操作的快捷键参考框；Ctrl+Backtick 打开快捷命令框，输入 `help` 可进入同一指南。
-- `Ctrl-P` 打开当前 focus 的可搜索操作面板；面板与快捷键、footer、帮助共用同一 `OperationRegistry`，危险操作仍进入原确认流程。
-- 顶部状态栏只保留仓库、分支、选中对象、操作、工作区计数与 tracking 等信息，不再显示 `view`、`viewing`、`focus`。
-- 不进行定时 Git 状态轮询；所有主界面统一使用 `Ctrl-R` 手动刷新，避免状态栏周期性闪烁。
-- cherry-pick 只操作 Commits 中通过 `Space` 明确多选的 commits，不维护额外队列。
-- 分支切换确认。
-- `reset --soft` / `--mixed` / `--hard`；hard reset 采用警告确认 + 短哈希输入的双重确认。
-- 安全 rebase：只允许干净工作区确认执行；发生冲突时自动执行 `git rebase --abort` 并提示结果。
-- detached HEAD、unborn repository、rename、root commit、binary file 和非 UTF-8 Git 路径处理。
-- staged、unstaged、untracked、conflicted、ahead/behind 状态展示。
-
-## 环境要求
-
-- Rust toolchain，支持 Rust 2024 edition。
-- Git 可在 `PATH` 中调用。
-- 支持 ANSI alternate screen 的终端；复制功能使用 OSC 52，终端需允许应用写入剪贴板。
-
-## 构建与运行
-
-在项目目录中构建：
-
-```bash
-cargo build --release
-```
-
-不带参数时浏览当前 Git 仓库：
-
-```bash
-/path/to/pitui/target/release/pitui
-```
-
-也可以同时指定一个或多个仓库（相对路径按当前目录解析）：
-
-```bash
-/path/to/pitui/target/release/pitui /repo/frontend /repo/backend /repo/tools
-```
-
-开发时也可以直接指定 manifest：
-
-```bash
-cargo run --manifest-path /path/to/pitui/Cargo.toml -- /repo/frontend /repo/backend
-```
-
-## 全局配置
-
-Pitui 在进入 terminal raw mode 前读取并严格校验一个版本化 TOML 配置。默认文件不存在是
-正常情况，此时使用内置默认值；不会读取仓库内配置，也不会自动轮询配置文件。修改配置后
-需要重启 Pitui。
-
-| 平台 | 默认配置文件 |
-|---|---|
-| macOS | `~/Library/Application Support/pitui/config.toml` |
-| Linux / Unix | `${XDG_CONFIG_HOME:-~/.config}/pitui/config.toml` |
-| Windows | `%APPDATA%\pitui\config.toml` |
-
-配置文件查找优先级为 `--config <path>`、`PITUI_CONFIG`、平台默认路径；
-`--no-config` 可跳过文件。相对日志路径以配置文件所在目录为基准。可用以下命令先诊断，
-它们不会启动 TUI 或 Git worker：
-
-```bash
-pitui --check-config --config /path/to/config.toml
-pitui --print-config-path
-pitui --print-effective-config
-```
-
-最小配置必须声明 schema 版本。下面把共享 diff 组件的默认模式改为 side-by-side：
-
-```toml
-schema_version = 1
-
-[diff]
-default_mode = "side-by-side" # unified | side-by-side
-```
-
-该默认值同时初始化 Commit File Diff 和 Changes Diff。终端宽度小于 140 列时只在渲染时
-临时回退为 unified，不会修改配置或当前 session mode；按 `v` 切换只影响当前运行。
-
-同一个配置层还支持命令绑定、分级快捷键、底部提示和日志策略。例如：
-
-```toml
-schema_version = 1
-
-[ui.footer]
-mode = "contextual"            # contextual | compact | hidden
-max_rows = 2                    # 1..3
-default_visibility = "registry" # registry | all | allowlist
-show_alternative_bindings = false
-
-[ui.footer.groups."commit.copy"]
-visible = true
-label = "copy…"
-
-[ui.footer.groups."file.copy"]
-visible = true
-label = "copy file…"
-
-[keybindings]
-chord_timeout_ms = 0
-
-[keybindings.commands."app.refresh"]
-bindings = ["Ctrl+R"]
-
-[keybindings.commands."app.shortcuts"]
-bindings = ["h"]
-
-[keybindings.commands."app.command_prompt"]
-bindings = ["Ctrl+`"]
-
-[keybindings.commands."app.operation_palette"]
-bindings = ["Ctrl+P"]
-
-[keybindings.commands."navigation.up"]
-bindings = ["w", "Up", "k"]
-
-[keybindings.commands."navigation.left"]
-bindings = ["a", "Left"]
-
-[keybindings.commands."navigation.down"]
-bindings = ["s", "Down", "j"]
-
-[keybindings.commands."navigation.right"]
-bindings = ["d", "Right", "l"]
-
-[keybindings.commands."commit.copy.hash"]
-bindings = ["Ctrl+C h"]
-
-[keybindings.commands."file.copy.relative_path"]
-bindings = ["Ctrl+C r"]
-
-[views.history]
-left_width_percent = 42
-commit_density = "detailed" # compact | detailed
-show_commit_author = true
-show_commit_datetime = true
-show_commit_tags = true
-
-# 同一 operation 可在某个 view 使用不同绑定；未配置时继承全局绑定。
-[views.history.operations."app.refresh"]
-bindings = ["Ctrl+R"]
-
-[logging]
-enabled = true
-level = "info"
-path = "logs/pitui.jsonl"
-flush_interval_ms = 0
-buffer_capacity = 1024
-max_detail_chars = 4096
-fail_on_open_error = false
-
-[logging.rotation]
-enabled = true
-max_size = "5 MiB"
-keep_files = 3
-rotate_on_start = false
-```
-
-未出现的 command 继承默认绑定，`bindings = []` 才会解除绑定。隐藏 footer 提示不会解除
-按键；确认弹窗、hard reset 二次确认和文本编辑按键属于安全保留交互，不能通过配置绕过。
-完整字段和示例见 [`docs/config.example.toml`](docs/config.example.toml)，全部稳定 operation id
-可通过 `--print-effective-config` 查看；设计与约束见
-[`docs/legacy/global-configuration-design.md`](docs/legacy/global-configuration-design.md)。`views.history`、
-`views.commit`、`views.file-diff`、`views.changes`、`views.reflog`、`views.remotes` 已支持独立
-栏宽、commit density/字段开关及 operation binding 覆盖；完整分层演进方案见
-[`docs/legacy/view-configuration-design.md`](docs/legacy/view-configuration-design.md)。
-
-## 后台操作日志
-
-Pitui 会记录所有提交到 Git worker 的后台操作。每个 job 都至少包含 `queued`、`started`、`completed` 三条 JSONL 记录，以及 `job_id`、仓库 `cwd`、操作名、结果、耗时和错误摘要。后台 channel 意外断开也会写入错误记录。
-
-默认日志位置：
-
-| 平台 | 路径 |
-|---|---|
-| macOS | `~/Library/Logs/pitui/pitui.jsonl` |
-| Linux / Unix | `${XDG_STATE_HOME:-~/.local/state}/pitui/pitui.jsonl` |
-| Windows | `%LOCALAPPDATA%\pitui\pitui.jsonl` |
-
-可使用环境变量覆盖路径：
-
-```bash
-PITUI_LOG=/path/to/pitui.jsonl pitui /repo
-```
-
-默认日志达到 5 MiB 时轮转为 `pitui.jsonl.1`，保留当前文件和一份备份。全局配置可修改
-日志开关、路径、level、flush interval、writer buffer、详情长度、轮转大小和 `.1` 到 `.N`
-的保留数量。若配置位置无法创建且 `fail_on_open_error=false`，Pitui 会回退到临时目录并在
-底部消息中显示实际路径；`pitui --help` 也会输出当前默认路径。
-
-日志记录操作元数据、仓库路径、所选文件路径和 Git 错误，因此分享前应检查并脱敏。为避免无意泄露，diff/文件内容不会写入日志，commit message 只记录字节数，详情和错误字段最长保留 4096 个字符。
-
-## 快捷键
-
-下表是内置默认绑定。普通模式由 `OperationSpec` 可调用跳表按语义 `FocusKind` 挂载操作；
-底部提示、输入解析、配置冲突检查和全局帮助框读取同一张表，只显示当前状态下按下后确实
-会有动作的“下一键”。二级/三级快捷键只在按下当前前缀后逐级显示后续键。commit 提交、
-remote 编辑、确认框等 modal 模式使用独占的可调用输入表，普通 focus 表不会穿透进去。
-`Ctrl-P` 操作面板也从相同的 resolved operation set 生成。绑定、提示是否可见、label、
-priority、行数、overflow 以及 view 局部绑定均可配置。
-
-### 全局
-
-| Key | 操作 |
-|---|---|
-| `q` | 普通模式退出；普通确认/错误弹窗中取消或关闭；哈希输入弹窗中作为输入字符 |
-| `h` | 从任意普通 focus 打开快捷键参考框，只显示全局命令和来源 focus 的操作；`w/s`、`↑/↓`、PageUp/PageDown、Home/End 滚动，`h` / `Enter` / `Esc` / `q` 关闭 |
-| `Ctrl-P` | 打开当前 focus 的操作面板；输入过滤，`↑/↓` 选择，`Enter` 执行，`Esc` 关闭 |
-| <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> | 打开快捷命令框；输入 `help` 并按 `Enter` 返回当前 focus 的快捷键指南；`Ctrl-Space` 不绑定任何操作 |
-| `Ctrl-G` | 从任意主界面打开独立 Changes；再次按下或按 `Esc` 返回原界面和原焦点 |
-| `Ctrl-C` | Commits focus 进入 commit 复制表；Commit/File 列 focus 进入文件路径复制表；其他 focus 退出 |
-| `Tab` / `Shift-Tab` | 仅在当前双栏界面内循环切换面板焦点 |
-| `w` / `↑` / `k`, `s` / `↓` / `j` | 移动选择或滚动 diff |
-| `a` / `←`, `d` / `→` / `l` | 在分支/提交浏览主链中按 `Branches → Commits → Commit → Diff` 层级移动；到达双栏边界后平移界面，旧右栏成为新左栏，不会循环回起点 |
-| `PageUp`, `PageDown`, `Home`, `End` | 翻页或跳转 |
-| `Esc` | 返回上一视图或取消弹窗 |
-| `Ctrl-R` | 从任意主界面手动刷新全部仓库、分支、当前 commit 列表以及 reflog/Changes/Remotes 数据 |
-
-### Branch / Commit Overview
-
-| 焦点 | Key | 操作 |
-|---|---|---|
-| 仓库节点 | `Enter` | 展开/折叠该仓库的分支 |
-| 仓库节点 | `f` | 确认后在该仓库执行 `git fetch --all --prune` |
-| 仓库节点 | `p` | 确认后对当前分支执行 `git pull --rebase` |
-| 仓库节点 | `P` | 确认后对当前分支执行 `git push` |
-| 仓库节点 | `g` | 查看该仓库 reflog |
-| 仓库/分支节点 | `o` | 打开所属仓库的 Remote 管理界面 |
-| 分支节点 | `Enter` | 浏览所选分支 commits，不切换真实分支 |
-| 仓库/分支树 | `w` / `↑` / `k`, `s` / `↓` / `j` | 选择分支时自动刷新右侧 commits，焦点保持在左侧 |
-| Commits | `d` / `→` / `l` | 将 `Branches｜Commits` 平移为 `Commits｜Commit`；Commits 成为左栏并保持焦点 |
-| 分支节点 | `S` | 确认后在所属仓库执行 `git switch` |
-| 分支节点 | `b` | 确认后将当前分支 rebase 到所选分支；冲突自动 abort |
-| 仓库/分支树 | `/` | 按仓库名、路径、分支或 subject 过滤 |
-| Commits | `Enter` | 打开 commit detail |
-| Commit Detail 中的 Commits | `w` / `↑` / `k`, `s` / `↓` / `j` | 选择 commit 时自动刷新右侧 metadata/files，焦点保持在左侧 |
-| Commits | `Space` | 加入/移出 commit 多选集合（复制 hash 与 cherry-pick 共用） |
-| Commits | `Ctrl-C` → `h` | 按当前列表顺序复制所有多选 commit 的完整 hash；无多选时复制当前 hash |
-| Commits | `Ctrl-C` → `i` | 复制当前 commit info（hash、author、date、refs 和 message） |
-| Commits | `Ctrl-C` → `m` | 复制当前完整 commit message；需要时后台加载 body，但不改变语义 focus |
-| Commits | `/` | 过滤 commits |
-| Commits | `y` | 对已多选 commits 打开 cherry-pick 确认弹窗；未多选时不可执行 |
-| Commits | `R` | 选择 soft/mixed/hard reset 模式并确认 |
-
-在 `Branches｜Commits` 中，右侧 Commits 使用两行详细样式：第一行显示 hash 和 subject，
-第二行显示精确到分钟的日期时间与作者；只有 commit 真正带 Git tag 时才追加 tags 字段。
-平移到 `Commits｜Commit` 后，Commits 作为左栏恢复为原有单行紧凑样式，以保留更多纵向空间。
-
-Pull 只使用 rebase 策略，不读取 `pull.rebase` 配置来决定是否 merge。执行前 Controller 与 Git worker 都会检查 attached branch、干净的 working tree/index 和既存 rebase；发生冲突时自动执行 `git rebase --abort`。Push 使用 Git 已配置的 upstream/default push target；Pitui 不会在 push 时隐式创建 upstream，但可在 Remote 管理中由用户显式设置。
-
-复制操作采用按 focus 挂载的二级快捷键，避免各操作长期占用普通模式按键。Commits focus
-按下 `Ctrl-C` 后底部才显示 `h hash | i info | m message`；Changed Files / FileList focus
-则只显示 `n file name | a absolute path | r relative path`。两个表互斥，Diff focus 不会显示
-或执行任意 commit/file 复制命令；`Esc`、`q` 或未匹配的第二键取消，整个过程不改变 focus。
-
-Pitui 不会每隔固定时间轮询仓库。启动时会完成一次初始加载，Pitui 自己完成 Git 写操作后会刷新受影响的数据；外部命令或编辑器造成的变化由用户在任意主界面按 `Ctrl-R` 主动同步。
-
-### Remote Management
-
-在左侧仓库/分支树选中任意仓库或其分支后按 `o` 进入。左侧是 remote 列表，右侧同时显示 fetch URL、有效 push URL 以及当前分支路由。
-
-| Key | 操作 |
-|---|---|
-| `A` | 输入 remote name 和一个共享 URL，确认后执行 `git remote add` |
-| `e` | 将所选 remote 的所有 fetch URL 归一为输入值，并删除独立 `pushurl` |
-| `u` | 将所选 remote 设为当前分支的 fetch/pull upstream 和 push target；远程分支不存在时可由下一次 push 创建 |
-| `Ctrl-R` | 重新读取 remote 配置 |
-| `Esc` | 返回仓库/分支树 |
-
-标记 `★` 表示该 remote 同时是当前分支的拉取 upstream 与推送目标；`F` / `P` 表示两个方向被拆分；`!` 表示 fetch/push URL 不一致。后两种配置会阻止 fetch/pull/push，直到使用 `e` 或 `u` 修复。
-
-RemoteList 与 Remote 编辑弹窗是两张独立操作表。Add Remote 编辑器只响应文本/Backspace、
-`Tab`/`Shift-Tab` 切换 name 与 URL、`Enter` 继续和 `Esc` 取消；Set Shared URL 编辑器不挂载
-Tab 切换。弹窗期间列表的 `a/e/u` 不会穿透。
-
-### Reflog
-
-| Key | 操作 |
-|---|---|
-| `w` / `↑` / `k`, `s` / `↓` / `j` | 选择 reflog 条目 |
-| `R` | 以该条目的 commit 为目标打开 reset 模式选择 |
-| `Esc` | 返回仓库/分支树 |
-
-Reset 模式弹窗使用 `s` 选择 soft、`m` 选择 mixed、`h` 选择 hard。soft/mixed 需要一次命令确认；hard 还要先确认危险警告，再准确输入目标短哈希。
-
-### Changes
-
-Changes 是独立主界面，不挂在仓库树或 Working Tree 子页面下。左侧固定为三级结构：
+核心约束：
+
+- `DatasetIdentity` 是稳定业务身份，Bevy `Entity` 只是运行时句柄。
+- `ActiveUiContext.active_dataset` 是唯一语义焦点。
+- 同一时间只有一个 `ActiveRenderMode` 和一个 `ResolvedOperationSet`。
+- Dataset Template 声明某类数据可用的 Render Proxy 与 Operation。
+- Renderer 只能读取 `UiFrame`，不能访问或修改 ECS `World`。
+- Git effect 只能通过类型化 `GitCommand` 进入 `pitui-git`，不拼接 shell 命令字符串。
+- Help、footer、输入响应和 Command Palette 读取同一份已解析操作数据。
+
+## 源码布局
 
 ```text
-▼ Changes
-  ├─▼ Staged Changes
-  │  ├─ M src/indexed.rs
-  │  └─ A src/new.rs
-  └─▼ Unstaged Changes
-     ├─ M src/edited.rs
-     └─ ? notes.txt
+src/                    pitui binary、composition root、端到端测试
+crates/pitui-core/      纯 Git 值类型与 diff 算法
+crates/pitui-data/      Dataset、Context、Operation、Render 数据协议
+crates/pitui-config/    Template、Proxy、Mode、Command 和快捷键配置数据
+crates/pitui-git/       Git executor、parser 与 JSONL 日志
+crates/pitui-ecs/       World、Schedule、Systems、Reconcile 与 Projection
+crates/pitui-tui/       crossterm/ratatui 终端适配器
+docs/                   当前实现状态和代码资产说明
 ```
 
-同一文件如果同时存在 index 和 working-tree 修改（porcelain `MM`），会分别出现在 Staged 与 Unstaged 中；选择不同节点时右侧只展示对应边界的 diff，不会把两类修改混在一起。untracked 和 conflict 归入 Unstaged。
+详细说明见：
 
-| Key | 操作 |
-|---|---|
-| `Ctrl-G` | 从任意主界面进入；在 Changes 内再次按下返回原界面 |
-| `w` / `↑` / `k`, `s` / `↓` / `j` | 在 Changes、Staged/Unstaged 和文件节点间移动 |
-| `a` / `←`, `d` / `→` / `l`, `Enter` | 折叠/展开 Changes 或分组；文件节点上 `Enter` 聚焦 diff |
-| `Tab` / `Shift-Tab` | 在三级树和右侧 diff 之间切换焦点 |
-| `Space` | 文件节点选择/反选当前文件；分组/root 节点选择或反选全部子项；diff 焦点下作用于当前文件 |
-| `S` | stage 已选择的 Unstaged 文件；没有显式选择时 stage 当前 Unstaged 文件 |
-| `u` | unstage 已选择的 Staged 文件；没有显式选择时 unstage 当前 Staged 文件 |
-| `c` | 打开 commit message 弹窗；`Enter` 使用全部 staged 内容创建 commit |
-| `PageUp` / `PageDown` | 文件树翻页；diff 焦点下按 10 行滚动 |
-| `Home` / `End` | 跳到文件树首尾；diff 焦点下跳到内容顶部/底部 |
-| `v` | unified / side-by-side 切换；终端不足 140 列时自动回退 unified |
-| `W` | diff 换行开关 |
-| `Ctrl-R` | 重新读取当前工作区（与全局手动刷新相同） |
-| `Esc` | 返回进入 Changes 前的界面和焦点 |
-
-右侧直接复用 Commit File Diff 的解析、行号、配色、滚动、换行和两种 diff mode 组件。
-
-Stage 使用 path-limited `git add --all -- <paths>`；unstage 使用 path-limited `git reset -- <paths>`，只修改 index，不丢弃 working-tree 文件，并支持 unborn repository。创建 commit 前必须至少存在一个 staged 文件且 message 不能为空。
-
-按 `c` 后切换到 Commit Submission modal 操作表：字符与 Backspace 编辑 message，`Enter`
-提交，`Esc` 取消；Changes 的 stage/unstage、导航和复制表在此模式全部停用。
-
-### Commit Detail
-
-| 焦点 | Key | 操作 |
-|---|---|---|
-| Commits | `w` / `↑` / `k`, `s` / `↓` / `j` | 选择 commit 并自动刷新右侧详情，焦点保持在左侧 Commits |
-| Commits | `Ctrl-C` → `h` / `i` / `m` | 复制当前/多选 hash、当前 info 或完整 message |
-| Commits / Commit | `a` / `←`, `d` / `→` / `l` | 在 Commits 与完整 Commit 栏（metadata + files）间移动；越过边界时返回 Overview 或进入 File Diff |
-| Changed Files | `Space` | 展开或折叠文件 hunk summary |
-| Changed Files | `Enter` / `v` | 打开所选文件 diff |
-| Changed Files | `PageUp` / `PageDown`, `Home` / `End` | 文件列表翻页或跳到首尾 |
-| Changed Files | `Ctrl-C` → `n` / `a` / `r` | 复制文件名 / 绝对路径 / 仓库相对路径 |
-| 任意 | `Esc` | 返回 Branch / Commit Overview |
-
-### File Diff Detail
-
-左侧不再是孤立的 Files 列，而是完整复用上一级右侧的 Commit 栏：上方保留 commit metadata，
-下方保留 changed files；右侧显示所选文件 diff。
-
-| Key | 操作 |
-|---|---|
-| `a` / `←`, `d` / `→` / `l` | 在完整 Commit 栏和 Diff 间移动；从左栏继续向左返回 `Commits｜Commit` |
-| 文件列表 `w` / `↑` / `k`, `s` / `↓` / `j` | 选择文件并刷新右侧 diff，焦点保持在左侧文件列表 |
-| `PageUp` / `PageDown`, `Home` / `End` | 左侧焦点时翻页/跳到文件首尾且只加载最终文件；右侧焦点时滚动/跳到 diff 首尾 |
-| `n` / `p` | 下一个/上一个文件 |
-| `v` | unified / side-by-side 切换 |
-| `W` | diff 换行开关 |
-| 左侧 FileList focus：`Ctrl-C` → `n` / `a` / `r` | 复制文件名 / 绝对路径 / 仓库相对路径 |
-| 右侧 Diff focus：`Ctrl-C` | 不挂载复制表，执行全局退出 fallback |
-| `Esc` | 返回 Commit Detail |
+- [`docs/implementation-status.md`](docs/implementation-status.md)
+- [`docs/code-assets.md`](docs/code-assets.md)
 
 ## 安全边界
 
-- Renderer 只读取 `&AppState`，不会修改业务状态或执行 Git。
-- Input Mapper 只把终端事件转换为 `Action`。
-- Git Worker 是唯一允许执行 `git` 的组件；每个 job 显式携带仓库路径，并使用参数数组而非 shell 字符串。
-- Git Worker 为每个 job 写入 queued/started/completed JSONL 审计记录；日志失败不会阻塞 Git 操作。
-- 读请求带 job id；快速切换时，过期响应不会覆盖当前选择。
-- Git 输出中的控制字符在渲染前会被清理，避免终端转义注入。
-- `fetch`、`pull --rebase`、`push`、`switch`、rebase 与 cherry-pick 必须在执行前确认。
-- pull 永远显式传入 `--rebase`；要求干净工作区，冲突时自动 abort。push 只使用已配置目标，且终端认证提示被禁用以避免 TUI 卡住。
-- 每次 fetch/pull/push 前 worker 都重新读取 Git config；任意 remote 的有效 fetch/push URL 不相同，或当前分支的 upstream/push remote 被拆分时，操作会在联系网络前失败。
-- 新增 remote、统一 URL 和设置 upstream 都必须经过确认；URL 更新和分支路由更新在失败时尝试恢复原 Git config。
-- stage/unstage 只操作 Changes 中显式多选的文件；未多选时只操作当前文件。commit 必须先进入消息编辑弹窗。
-- `reset --hard` 必须准确输入所选 commit 的短哈希。
-- rebase 前要求工作区和 index 干净；检测到冲突后 worker 会立即尝试 `git rebase --abort`，成功后 UI 弹窗说明已经恢复。
-- 集成测试中的所有写操作只发生在临时 Git 仓库。
-
-> Pitui 只负责确认并提交 Git 命令。若 cherry-pick 产生冲突，请退出 Pitui 后使用标准 Git 命令完成或中止该操作。
-
-## 架构
-
-> 本节描述当前 0.1.0 Legacy 实现，仅作为可复用资产与行为基线；下一代当前状态与代码资产
-> 边界见 [`docs/next-development-status.md`](docs/next-development-status.md) 和
-> [`docs/code-assets.md`](docs/code-assets.md)。
-
-```text
-Git Worker -> GitResponse -> Model reducer -> normalized GitModel
-                                            Repository
-                                              ├─ Branch -> [CommitId]
-                                              ├─ Commit -> [FileId]
-                                              └─ Changes/Reflog/Remotes facets
-
-Input / Ctrl-P palette -> OperationId -> shared executor -> state/effects
-GitModel + FocusPath + ViewConfig -> ViewProjection -> reusable panels -> Renderer
-OperationRegistry + FocusContext -> key resolver / footer / help / palette
-Focus/View change -> DataRequirement reconcile -> deduplicated GitRequest
-```
-
-实现严格分为：
-
-- `src/tui`：终端生命周期、输入和渲染。
-- `src/app/model.rs`：带类型 ID、`Resource<T>` 加载状态和规范化 Repository→Branch→Commit→File 模型。
-- `src/app/focus.rs`：语义 `FocusContext` / `FocusPath`、稳定 ID cursor 与层级导航。
-- `src/app/view.rs`：完全由 `FocusKind + FocusRole` 派生的 `ViewProjection`，不维护独立页面状态。
-- `src/app/command.rs`：唯一 `OperationId -> OperationSpec` 可调用注册表；快捷键、提示、帮助和操作面板共用。
-- `src/app/requirement.rs`：由 view/focus 声明数据依赖，Controller 统一 reconcile。
-- `src/app/controller.rs`：operation executor、Git effect 调度、model reducer 和声明式数据需求 reconcile。
-- `crates/pitui-core`：仓库、分支、commit、reflog、文件和 diff 的 canonical 纯数据；
-  `src/domain` 只是 Legacy 兼容 facade。
-- `crates/pitui-git`：两套运行时共享的 canonical parser 与 Next 同步 executor；`src/git` 保留
-  Legacy Worker、尚未迁移的写操作和兼容 facade。
-
-Legacy 模型驱动架构不变量见
-[`docs/legacy/model-driven-architecture.md`](docs/legacy/model-driven-architecture.md)，历史产品设计见
-[`docs/legacy/git-tui-design.md`](docs/legacy/git-tui-design.md)。当前代码资产索引见
-[`docs/code-assets.md`](docs/code-assets.md)，全部文档分类见 [`docs/README.md`](docs/README.md)。
+- Git 命令使用 argv 调用，不通过 shell 执行。
+- Git 错误和日志进入 UI/持久化前会截断并隐藏 URL 类敏感内容。
+- cherry-pick 前检查工作区状态；发生本次冲突时自动尝试 `git cherry-pick --abort`。
+- stage/unstage 只作用于当前光标或显式选择的文件。
+- 所有真实 Git 写操作测试只使用 `tempfile` 创建的临时仓库。
 
 ## 开发验证
 
@@ -463,14 +125,6 @@ cargo test --workspace --all-targets
 cargo test --workspace --doc
 ```
 
-## 参与贡献与安全问题
-
-- 贡献流程与安全设计约束见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
-- 漏洞请按 [`SECURITY.md`](SECURITY.md) 使用 GitHub 私密漏洞报告，不要公开敏感细节。
-- Bug report、Feature request、Pull Request 模板以及跨平台 CI 已放在 [`.github`](.github) 目录。
-
 ## License
 
-Pitui 采用 [MIT License](LICENSE)，Copyright (c) 2026 Pitui contributors。
-
-当前范围不包括逐行/逐 hunk partial staging、stash、交互式 rebase todo、merge conflict editor、blame 和内置文件编辑器。
+Pitui 使用 [MIT License](LICENSE)。

@@ -18,7 +18,7 @@ use pitui_data::{
     RendererKind, StyleSpec, TargetSource,
 };
 
-/// Version of the next-generation configuration schema being built.
+/// Version of the Data Driven configuration schema.
 pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -360,7 +360,7 @@ pub fn builtin_render_proxies() -> Vec<RenderProxySpec> {
     ]
 }
 
-/// Reference layouts from the authoritative design. Every leaf is declarative:
+/// Built-in reference layouts. Every leaf is declarative:
 /// stable singleton identities resolve through `DatasetIndex`, while current
 /// objects resolve through the active context bindings.
 pub fn builtin_render_modes() -> Vec<RenderModeSpec> {
