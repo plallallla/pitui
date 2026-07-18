@@ -1,6 +1,5 @@
 use std::{
     ffi::{OsStr, OsString},
-    fmt,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
@@ -9,25 +8,9 @@ use crate::domain::{
     BranchName, CommitHash, GitPath, RemoteInfo, WorkingTreeDiff, WorkingTreeDiffKind,
     WorkingTreeDiffSection,
 };
+use pitui_git::{CliGitExecutor, GitCommand as NextGitCommand, GitExecutor, ParsedGitPayload};
 
-use super::{
-    GitRequest, GitResponse, parse_branches, parse_commit_detail, parse_commits, parse_file_diff,
-    parse_reflog, parse_repository, parse_worktree_changes,
-};
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitFailure {
-    pub command: String,
-    pub stderr: String,
-}
-
-impl fmt::Display for GitFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}: {}", self.command, self.stderr)
-    }
-}
-
-impl std::error::Error for GitFailure {}
+use super::{GitFailure, GitRequest, GitResponse, parse_reflog, parse_worktree_changes};
 
 fn display_command(args: &[OsString]) -> String {
     let mut command = String::from("git");
@@ -109,35 +92,19 @@ fn failure_response(failure: GitFailure) -> GitResponse {
 }
 
 fn load_repository(cwd: &Path) -> Result<GitResponse, GitFailure> {
-    let root = run_git(cwd, ["rev-parse", "--show-toplevel"])?;
-    // An unborn repository is still a valid repository. `HEAD` cannot be
-    // resolved until the first commit, so represent it as an empty hash and do
-    // not turn normal first-run state into an error popup.
-    let head = run_git(cwd, ["rev-parse", "--verify", "--short=8", "HEAD"])
-        .map(|output| output.stdout)
-        .unwrap_or_default();
-    let branch = run_git(cwd, ["branch", "--show-current"])?;
-    let status = run_git(cwd, ["status", "--porcelain=v1", "-z", "-b"])?;
-
-    Ok(GitResponse::RepositoryStatusLoaded(parse_repository(
-        &root.stdout,
-        &head,
-        &branch.stdout,
-        &status.stdout,
-    )?))
+    match CliGitExecutor.execute(cwd, &NextGitCommand::LoadRepository)? {
+        ParsedGitPayload::Repository(repository) => {
+            Ok(GitResponse::RepositoryStatusLoaded(repository))
+        }
+        _ => unreachable!("LoadRepository returned a different payload kind"),
+    }
 }
 
 fn load_branches(cwd: &Path) -> Result<GitResponse, GitFailure> {
-    let output = run_git(
-        cwd,
-        [
-            "for-each-ref",
-            "--format=%(refname)%00%(refname:short)%00%(objectname)%00%(objectname:short)%00%(committerdate:iso8601-strict)%00%(subject)%00%(HEAD)",
-            "refs/heads",
-            "refs/remotes",
-        ],
-    )?;
-    Ok(GitResponse::BranchesLoaded(parse_branches(&output.stdout)))
+    match CliGitExecutor.execute(cwd, &NextGitCommand::LoadBranches)? {
+        ParsedGitPayload::Branches(branches) => Ok(GitResponse::BranchesLoaded(branches)),
+        _ => unreachable!("LoadBranches returned a different payload kind"),
+    }
 }
 
 fn config_values(cwd: &Path, key: &str) -> Result<Vec<String>, GitFailure> {
@@ -303,83 +270,19 @@ fn validate_remote_policy(cwd: &Path, command: &str) -> Result<(), GitFailure> {
 }
 
 fn load_commits(cwd: &Path, branch: BranchName, limit: usize) -> Result<GitResponse, GitFailure> {
-    let args = vec![
-        OsString::from("log"),
-        OsString::from(branch.0.clone()),
-        OsString::from(format!("--max-count={limit}")),
-        OsString::from("--date=iso-strict"),
-        OsString::from("--decorate=short"),
-        OsString::from("--format=%x1e%H%x1f%h%x1f%an%x1f%aI%x1f%D%x1f%s"),
-        OsString::from("--"),
-    ];
-    let output = run_git(cwd, args)?;
-    Ok(GitResponse::CommitsLoaded {
-        branch,
-        commits: parse_commits(&output.stdout),
-    })
+    match CliGitExecutor.execute(cwd, &NextGitCommand::LoadCommits { branch, limit })? {
+        ParsedGitPayload::Commits { branch, commits } => {
+            Ok(GitResponse::CommitsLoaded { branch, commits })
+        }
+        _ => unreachable!("LoadCommits returned a different payload kind"),
+    }
 }
 
 fn load_commit_detail(cwd: &Path, commit: CommitHash) -> Result<GitResponse, GitFailure> {
-    let metadata = run_git(
-        cwd,
-        [
-            OsString::from("show"),
-            OsString::from("--no-patch"),
-            OsString::from("--date=iso-strict"),
-            OsString::from(
-                "--format=%x1e%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI%x1f%s%x1f%B",
-            ),
-            OsString::from(commit.0.clone()),
-        ],
-    )?;
-    let name_status = run_git(
-        cwd,
-        [
-            OsString::from("diff-tree"),
-            OsString::from("--root"),
-            OsString::from("-m"),
-            OsString::from("--first-parent"),
-            OsString::from("--no-commit-id"),
-            OsString::from("--name-status"),
-            OsString::from("-r"),
-            OsString::from("-M"),
-            OsString::from("-z"),
-            OsString::from(commit.0.clone()),
-        ],
-    )?;
-    let numstat = run_git(
-        cwd,
-        [
-            OsString::from("show"),
-            OsString::from("--first-parent"),
-            OsString::from("--numstat"),
-            OsString::from("-z"),
-            OsString::from("--format="),
-            OsString::from("--find-renames"),
-            OsString::from(commit.0.clone()),
-        ],
-    )?;
-    let patch = run_git(
-        cwd,
-        [
-            OsString::from("show"),
-            OsString::from("--first-parent"),
-            OsString::from("--format="),
-            OsString::from("--patch"),
-            OsString::from("--find-renames"),
-            OsString::from("--no-ext-diff"),
-            OsString::from("--no-color"),
-            OsString::from(commit.0.clone()),
-        ],
-    )?;
-
-    let detail = parse_commit_detail(
-        &metadata.stdout,
-        &name_status.stdout,
-        &numstat.stdout,
-        &patch.stdout,
-    )?;
-    Ok(GitResponse::CommitDetailLoaded(detail))
+    match CliGitExecutor.execute(cwd, &NextGitCommand::LoadCommitDetail { commit })? {
+        ParsedGitPayload::CommitDetail(detail) => Ok(GitResponse::CommitDetailLoaded(detail)),
+        _ => unreachable!("LoadCommitDetail returned a different payload kind"),
+    }
 }
 
 fn load_commit_message(cwd: &Path, commit: CommitHash) -> Result<GitResponse, GitFailure> {
@@ -405,30 +308,17 @@ fn load_file_diff(
     path: GitPath,
     old_path: Option<GitPath>,
 ) -> Result<GitResponse, GitFailure> {
-    let mut args = vec![
-        OsString::from("show"),
-        OsString::from("--first-parent"),
-        OsString::from("--format="),
-        OsString::from("--patch"),
-        OsString::from("--find-renames"),
-        OsString::from("--no-ext-diff"),
-        OsString::from("--no-color"),
-        OsString::from(commit.0.clone()),
-        OsString::from("--"),
-        path.to_os_string(),
-    ];
-    if let Some(old_path) = &old_path
-        && old_path != &path
-    {
-        args.push(old_path.to_os_string());
+    match CliGitExecutor.execute(
+        cwd,
+        &NextGitCommand::LoadFileDiff {
+            commit,
+            path,
+            old_path,
+        },
+    )? {
+        ParsedGitPayload::FileDiff(diff) => Ok(GitResponse::FileDiffLoaded(diff)),
+        _ => unreachable!("LoadFileDiff returned a different payload kind"),
     }
-    let patch = run_git(cwd, args)?;
-    Ok(GitResponse::FileDiffLoaded(parse_file_diff(
-        &patch.stdout,
-        commit,
-        path,
-        old_path,
-    )))
 }
 
 fn load_reflog(cwd: &Path, limit: usize) -> Result<GitResponse, GitFailure> {

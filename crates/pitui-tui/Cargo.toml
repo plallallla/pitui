@@ -1,0 +1,20 @@
+[package]
+name = "pitui-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Terminal input and pure UiFrame presentation adapter for Pitui"
+
+[dependencies]
+crossterm.workspace = true
+pitui-core.workspace = true
+pitui-data.workspace = true
+ratatui.workspace = true
+unicode-width.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+bevy_ecs.workspace = true

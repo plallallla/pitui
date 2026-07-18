@@ -1,0 +1,16 @@
+[package]
+name = "pitui-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Git parsing and synchronous execution boundary for Pitui"
+
+[dependencies]
+pitui-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lib]
+path = "src/lib.rs"

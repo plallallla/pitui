@@ -1,0 +1,2119 @@
+//! Dataset ECS kernel for Pitui.
+//!
+//! The kernel owns lifecycle and invariant enforcement. Operations feed data
+//! into this boundary; renderers never receive a mutable [`World`].
+
+#![forbid(unsafe_code)]
+
+use std::{collections::HashSet, error::Error, fmt, sync::Arc};
+
+use bevy_ecs::{
+    prelude::{
+        Entity, In, IntoScheduleConfigs, IntoSystem, Query, Resource, Schedule, SystemSet, World,
+    },
+    schedule::ScheduleLabel,
+};
+use pitui_data::{
+    ActiveRenderMode, ActiveUiContext, AvailabilityRegistryError, AvailabilityRule,
+    AvailabilityRuleId, AvailabilityRuleRegistry, CommandId, CommandInvocation, CommandRegistry,
+    CommandRegistryError, CommandSpec, CommandSystemId, ContextStack, Dataset, DatasetBinding,
+    DatasetBundle, DatasetChildren, DatasetCursor, DatasetIdentity, DatasetIndex, DatasetKey,
+    DatasetKind, DatasetNavigationOrder, DatasetRevision, DatasetRoots, DatasetSelection,
+    DatasetTemplate, DatasetTemplateId, DatasetTemplateRef, DatasetTemplateRegistry, DatasetType,
+    DefaultDatasetTemplates, GlobalOperationSet, HasSnapshot, InputIntent, NavigationModeRegistry,
+    OperationId, OperationRegistry, OperationRegistryError, OperationSpec, PendingChordState,
+    QuitRequested, RenderContextBindings, RenderLayout, RenderModeId, RenderModeRegistry,
+    RenderModeSpec, RenderProxyId, RenderProxyRegistry, RenderProxySpec, RenderRegistryError,
+    ResolvedOperationSet, ResolvedRenderLayout, UiContextSnapshot, UiFrame, ViewportMeasurement,
+};
+
+mod binding_reconcile;
+mod git_runtime;
+mod operation_runtime;
+mod projection;
+
+pub use binding_reconcile::RenderReconcileDiagnostics;
+pub use git_runtime::{
+    GitCommandData, GitDataError, GitExecutionFailure, GitExecutionFailures, GitExecutorResource,
+    GitMutationSuccess, GitMutationSuccesses, GitOperationLogSinkResource, GitResultData,
+};
+pub use operation_runtime::{
+    ClipboardRequests, CommandExecution, CommandExecutionLog, CommandSystemRegistrationError,
+    OperationNotices, OperationResolutionDiagnostics, OperationResolutionError,
+    PendingInteractionNotices,
+};
+pub use projection::{ProjectionDiagnostic, ProjectionDiagnostics};
+
+#[derive(ScheduleLabel, Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PituiSchedule;
+
+#[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RuntimeSet {
+    Ingress,
+    Resolve,
+    Execute,
+    Reconcile,
+    Projection,
+    Present,
+}
+
+#[derive(Resource, Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeDiagnostics {
+    pub invariant_violations: Vec<InvariantViolation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KernelError {
+    MissingTemplate(DatasetTemplateId),
+    TemplateKindMismatch {
+        template: DatasetTemplateId,
+        expected: DatasetKind,
+        actual: DatasetKind,
+    },
+    IdentityKindMismatch {
+        identity: Box<DatasetIdentity>,
+        expected: DatasetKind,
+        actual: DatasetKind,
+    },
+    IdentityTemplateMismatch {
+        identity: Box<DatasetIdentity>,
+        expected: DatasetTemplateId,
+        actual: DatasetTemplateId,
+    },
+    MissingDataset(Entity),
+    DuplicateChild(Entity),
+    Cycle {
+        parent: Entity,
+        child: Entity,
+    },
+    CursorOutsideDataset {
+        dataset: Entity,
+        cursor: Entity,
+    },
+    SelectionOutsideDataset {
+        dataset: Entity,
+        selected: Entity,
+    },
+    ActiveDatasetNotFocusable(Entity),
+    NoDeeperFocusableDataset(Entity),
+    ContextAlreadyInitialized,
+    ContextUnavailable,
+    MissingRenderMode(RenderModeId),
+    MissingStableRenderDataset(Box<DatasetIdentity>),
+    MissingRenderProxy(pitui_data::RenderProxyId),
+    RenderProxyKindMismatch {
+        proxy: pitui_data::RenderProxyId,
+        expected: DatasetKind,
+        actual: DatasetKind,
+    },
+}
+
+impl fmt::Display for KernelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for KernelError {}
+
+/// Cross-registry contract failures detected after configuration is loaded and
+/// command Systems are registered, but before any Dataset or terminal state is
+/// created. This is the extension boundary for every future semantic Dataset.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegistrationContractError {
+    MissingDefaultTemplate(DatasetKind),
+    MissingDefaultTemplateDefinition {
+        kind: DatasetKind,
+        template: DatasetTemplateId,
+    },
+    DefaultTemplateKindMismatch {
+        kind: DatasetKind,
+        template: DatasetTemplateId,
+        actual: DatasetKind,
+    },
+    DatasetTemplateHasNoRenderProxy(DatasetTemplateId),
+    DuplicateTemplateOperation {
+        template: DatasetTemplateId,
+        operation: OperationId,
+    },
+    DuplicateTemplateProxy {
+        template: DatasetTemplateId,
+        proxy: RenderProxyId,
+    },
+    MissingTemplateOperation {
+        template: DatasetTemplateId,
+        operation: OperationId,
+    },
+    MissingTemplateProxy {
+        template: DatasetTemplateId,
+        proxy: RenderProxyId,
+    },
+    TemplateProxyKindMismatch {
+        template: DatasetTemplateId,
+        proxy: RenderProxyId,
+        expected: DatasetKind,
+        actual: DatasetKind,
+    },
+    MissingGlobalOperation(OperationId),
+    DuplicateGlobalOperation(OperationId),
+    OperationMissingCommand {
+        operation: OperationId,
+        command: CommandId,
+    },
+    OperationMissingAvailability {
+        operation: OperationId,
+        availability: AvailabilityRuleId,
+    },
+    CommandSystemMissing {
+        command: CommandId,
+        system: CommandSystemId,
+    },
+    RenderModeMissingProxy {
+        mode: RenderModeId,
+        proxy: RenderProxyId,
+    },
+    StableRenderProxyKindMismatch {
+        mode: RenderModeId,
+        identity: Box<DatasetIdentity>,
+        proxy: RenderProxyId,
+        expected: DatasetKind,
+        actual: DatasetKind,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InvariantViolation {
+    IndexPointsToMissingEntity(DatasetIdentity),
+    IndexKeyMismatch(DatasetIdentity),
+    DatasetMissingFromIndex(DatasetIdentity),
+    IdentityKindMismatch {
+        identity: DatasetIdentity,
+        actual: DatasetKind,
+    },
+    DanglingChild {
+        parent: Entity,
+        child: Entity,
+    },
+    DanglingNavigationTarget {
+        dataset: Entity,
+        target: Entity,
+    },
+    InvalidNavigationOrder(Entity),
+    DatasetCycle(Entity),
+    DanglingRoot(Entity),
+    DanglingActiveDataset(Entity),
+    DanglingRenderBinding(Entity),
+    DanglingContextEntity(Entity),
+    ActiveDatasetNotFocusable(Entity),
+}
+
+/// Composition root for the next-generation ECS world.
+pub struct DatasetRuntime {
+    world: World,
+    schedule: Schedule,
+}
+
+impl Default for DatasetRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DatasetRuntime {
+    pub fn new() -> Self {
+        Self::with_git_executor(Arc::new(pitui_git::CliGitExecutor))
+    }
+
+    pub fn with_git_executor(executor: Arc<dyn pitui_git::GitExecutor>) -> Self {
+        Self::with_git_executor_and_log_sink(
+            executor,
+            Arc::new(pitui_git::logging::NoopGitOperationLogSink),
+        )
+    }
+
+    pub fn with_git_executor_and_log_sink(
+        executor: Arc<dyn pitui_git::GitExecutor>,
+        log_sink: Arc<dyn pitui_git::logging::GitOperationLogSink>,
+    ) -> Self {
+        let mut world = World::new();
+        world.init_resource::<DatasetIndex>();
+        world.init_resource::<DatasetRoots>();
+        world.init_resource::<DatasetTemplateRegistry>();
+        world.init_resource::<DefaultDatasetTemplates>();
+        world.init_resource::<RenderProxyRegistry>();
+        world.init_resource::<RenderModeRegistry>();
+        world.init_resource::<NavigationModeRegistry>();
+        world.init_resource::<UiFrame>();
+        world.init_resource::<ProjectionDiagnostics>();
+        world.init_resource::<bevy_ecs::prelude::Messages<ViewportMeasurement>>();
+        world.init_resource::<ContextStack>();
+        world.init_resource::<PendingChordState>();
+        world.init_resource::<RuntimeDiagnostics>();
+        world.init_resource::<RenderReconcileDiagnostics>();
+        binding_reconcile::initialize_binding_reconcile(&mut world);
+        git_runtime::initialize_git_runtime(&mut world, executor, log_sink);
+        operation_runtime::initialize_operation_runtime(&mut world);
+
+        let mut schedule = Schedule::new(PituiSchedule);
+        schedule.configure_sets(
+            (
+                RuntimeSet::Ingress,
+                RuntimeSet::Resolve,
+                RuntimeSet::Execute,
+                RuntimeSet::Reconcile,
+                RuntimeSet::Projection,
+                RuntimeSet::Present,
+            )
+                .chain(),
+        );
+        schedule.add_systems(
+            (
+                operation_runtime::apply_text_edits,
+                operation_runtime::collect_command_invocations,
+                operation_runtime::dispatch_pending_commands,
+                binding_reconcile::update_dependent_render_bindings,
+                git_runtime::enqueue_dependent_reads,
+                git_runtime::execute_git_commands,
+                git_runtime::collect_git_results,
+                git_runtime::apply_pending_git_results,
+                operation_runtime::collect_clipboard_requests,
+                operation_runtime::collect_operation_notices,
+                operation_runtime::collect_interaction_notice_requests,
+            )
+                .chain()
+                .in_set(RuntimeSet::Execute),
+        );
+        schedule.add_systems(
+            (
+                operation_runtime::release_deferred_invocations,
+                operation_runtime::resolve_input_intents,
+            )
+                .chain()
+                .in_set(RuntimeSet::Resolve),
+        );
+        schedule.add_systems(projection::apply_viewport_measurements.in_set(RuntimeSet::Ingress));
+        schedule.add_systems(projection::build_ui_frame.in_set(RuntimeSet::Projection));
+        schedule.add_systems(
+            (
+                rebuild_dataset_navigation_orders,
+                repair_dataset_navigation,
+                operation_runtime::reconcile_pending_changes_focus,
+                binding_reconcile::collect_context_transitions,
+                binding_reconcile::apply_context_transitions,
+                binding_reconcile::update_dependent_render_bindings,
+                binding_reconcile::resolve_active_render_mode,
+                operation_runtime::present_next_interaction_notice,
+                operation_runtime::resolve_active_operation_set,
+                projection::update_dataset_viewports,
+                collect_unreachable_datasets,
+            )
+                .chain()
+                .in_set(RuntimeSet::Reconcile),
+        );
+
+        Self { world, schedule }
+    }
+
+    pub fn world(&self) -> &World {
+        &self.world
+    }
+
+    /// Mutable World access is kept at the composition/testing boundary. UI
+    /// renderers must consume a projection instead of calling this method.
+    pub fn world_mut(&mut self) -> &mut World {
+        &mut self.world
+    }
+
+    pub fn register_template(&mut self, template: DatasetTemplate) -> Result<(), DatasetTemplate> {
+        self.world
+            .resource_mut::<DatasetTemplateRegistry>()
+            .register(template)
+    }
+
+    pub fn register_default_template(
+        &mut self,
+        template: DatasetTemplate,
+    ) -> Result<(), DatasetTemplate> {
+        let id = template.id.clone();
+        let kind = template.kind;
+        if self
+            .world
+            .resource::<DefaultDatasetTemplates>()
+            .get(kind)
+            .is_some()
+        {
+            return Err(template);
+        }
+        self.register_template(template)?;
+        self.world
+            .resource_mut::<DefaultDatasetTemplates>()
+            .bind(kind, id);
+        Ok(())
+    }
+
+    pub fn register_render_proxy(
+        &mut self,
+        spec: RenderProxySpec,
+    ) -> Result<(), RenderRegistryError> {
+        self.world
+            .resource_mut::<RenderProxyRegistry>()
+            .register(spec)
+    }
+
+    pub fn register_render_mode(
+        &mut self,
+        spec: RenderModeSpec,
+    ) -> Result<(), RenderRegistryError> {
+        self.world
+            .resource_mut::<RenderModeRegistry>()
+            .register(spec)
+    }
+
+    pub fn register_command(&mut self, spec: CommandSpec) -> Result<(), CommandRegistryError> {
+        self.world.resource_mut::<CommandRegistry>().register(spec)
+    }
+
+    pub fn register_operation(
+        &mut self,
+        spec: OperationSpec,
+    ) -> Result<(), OperationRegistryError> {
+        self.world
+            .resource_mut::<OperationRegistry>()
+            .register(spec)
+    }
+
+    pub fn register_availability_rule(
+        &mut self,
+        id: AvailabilityRuleId,
+        rule: AvailabilityRule,
+    ) -> Result<(), AvailabilityRegistryError> {
+        self.world
+            .resource_mut::<AvailabilityRuleRegistry>()
+            .register(id, rule)
+    }
+
+    pub fn set_global_operations(&mut self, operations: Vec<OperationId>) {
+        self.world.resource_mut::<GlobalOperationSet>().0 = operations;
+    }
+
+    pub fn set_navigation_modes(&mut self, modes: NavigationModeRegistry) {
+        self.world.insert_resource(modes);
+    }
+
+    /// Validates the complete Dataset/Proxy/Operation/Command graph. Call this
+    /// once after composing effective configuration and registering Systems;
+    /// failures are deterministic startup errors rather than latent input-time
+    /// surprises.
+    pub fn validate_registration_contracts(&self) -> Vec<RegistrationContractError> {
+        let templates = self.world.resource::<DatasetTemplateRegistry>();
+        let defaults = self.world.resource::<DefaultDatasetTemplates>();
+        let proxies = self.world.resource::<RenderProxyRegistry>();
+        let modes = self.world.resource::<RenderModeRegistry>();
+        let commands = self.world.resource::<CommandRegistry>();
+        let operations = self.world.resource::<OperationRegistry>();
+        let availability = self.world.resource::<AvailabilityRuleRegistry>();
+        let global = self.world.resource::<GlobalOperationSet>();
+        let mut errors = Vec::new();
+
+        for kind in DatasetKind::ALL {
+            let Some(template_id) = defaults.get(kind) else {
+                errors.push(RegistrationContractError::MissingDefaultTemplate(kind));
+                continue;
+            };
+            let Some(template) = templates.get(template_id) else {
+                errors.push(
+                    RegistrationContractError::MissingDefaultTemplateDefinition {
+                        kind,
+                        template: template_id.clone(),
+                    },
+                );
+                continue;
+            };
+            if template.kind != kind {
+                errors.push(RegistrationContractError::DefaultTemplateKindMismatch {
+                    kind,
+                    template: template_id.clone(),
+                    actual: template.kind,
+                });
+            }
+        }
+
+        for template in templates.templates.values() {
+            if template.render_proxies.is_empty() {
+                errors.push(RegistrationContractError::DatasetTemplateHasNoRenderProxy(
+                    template.id.clone(),
+                ));
+            }
+            let mut seen_operations = HashSet::new();
+            for operation_id in &template.operations {
+                if !seen_operations.insert(operation_id) {
+                    errors.push(RegistrationContractError::DuplicateTemplateOperation {
+                        template: template.id.clone(),
+                        operation: operation_id.clone(),
+                    });
+                }
+                if operations.get(operation_id).is_none() {
+                    errors.push(RegistrationContractError::MissingTemplateOperation {
+                        template: template.id.clone(),
+                        operation: operation_id.clone(),
+                    });
+                }
+            }
+            let mut seen_proxies = HashSet::new();
+            for proxy_id in &template.render_proxies {
+                if !seen_proxies.insert(proxy_id) {
+                    errors.push(RegistrationContractError::DuplicateTemplateProxy {
+                        template: template.id.clone(),
+                        proxy: proxy_id.clone(),
+                    });
+                }
+                let Some(proxy) = proxies.get(proxy_id) else {
+                    errors.push(RegistrationContractError::MissingTemplateProxy {
+                        template: template.id.clone(),
+                        proxy: proxy_id.clone(),
+                    });
+                    continue;
+                };
+                if proxy.dataset_kind != template.kind {
+                    errors.push(RegistrationContractError::TemplateProxyKindMismatch {
+                        template: template.id.clone(),
+                        proxy: proxy_id.clone(),
+                        expected: template.kind,
+                        actual: proxy.dataset_kind,
+                    });
+                }
+            }
+        }
+
+        let mut seen_global = HashSet::new();
+        for operation_id in &global.0 {
+            if !seen_global.insert(operation_id) {
+                errors.push(RegistrationContractError::DuplicateGlobalOperation(
+                    operation_id.clone(),
+                ));
+            }
+            if operations.get(operation_id).is_none() {
+                errors.push(RegistrationContractError::MissingGlobalOperation(
+                    operation_id.clone(),
+                ));
+            }
+        }
+        for operation in operations.operations.values() {
+            if commands.get(&operation.command).is_none() {
+                errors.push(RegistrationContractError::OperationMissingCommand {
+                    operation: operation.id.clone(),
+                    command: operation.command.clone(),
+                });
+            }
+            if availability.get(&operation.availability).is_none() {
+                errors.push(RegistrationContractError::OperationMissingAvailability {
+                    operation: operation.id.clone(),
+                    availability: operation.availability.clone(),
+                });
+            }
+        }
+        for command in commands.commands.values() {
+            if !operation_runtime::command_system_registered(&self.world, &command.system) {
+                errors.push(RegistrationContractError::CommandSystemMissing {
+                    command: command.id.clone(),
+                    system: command.system.clone(),
+                });
+            }
+        }
+        for mode in modes.modes.values() {
+            validate_render_layout_contract(&mode.id, &mode.layout, proxies, &mut errors);
+        }
+
+        errors
+    }
+
+    pub fn register_command_system<M, S>(
+        &mut self,
+        id: CommandSystemId,
+        system: S,
+    ) -> Result<(), CommandSystemRegistrationError>
+    where
+        S: IntoSystem<In<CommandInvocation>, CommandExecution, M> + 'static,
+        M: 'static,
+    {
+        operation_runtime::register_command_system(&mut self.world, id, system)
+    }
+
+    pub fn register_builtin_interaction_systems(
+        &mut self,
+    ) -> Result<(), CommandSystemRegistrationError> {
+        self.register_command_system(
+            CommandSystemId::from("quit"),
+            operation_runtime::request_quit,
+        )?;
+        self.register_command_system(CommandSystemId::from("help"), operation_runtime::open_help)?;
+        self.register_command_system(
+            CommandSystemId::from("command-palette"),
+            operation_runtime::open_command_palette,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("changes"),
+            operation_runtime::open_changes,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("reflog"),
+            operation_runtime::open_reflog,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("logs"),
+            operation_runtime::open_git_operation_log,
+        )?;
+        for id in ["remotes", "fetch", "pull", "push", "sync"] {
+            self.register_command_system(
+                CommandSystemId::from(id),
+                operation_runtime::reject_unimplemented,
+            )?;
+        }
+        self.register_command_system(
+            CommandSystemId::from("refresh"),
+            operation_runtime::refresh_active_context,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("interaction.close"),
+            operation_runtime::close_interaction,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("palette.up"),
+            operation_runtime::palette_up,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("palette.down"),
+            operation_runtime::palette_down,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("palette.submit"),
+            operation_runtime::submit_palette_command,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("navigation.up"),
+            operation_runtime::navigate_up,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("navigation.down"),
+            operation_runtime::navigate_down,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("navigation.left"),
+            operation_runtime::navigate_left,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("navigation.right"),
+            operation_runtime::navigate_right,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("selection.toggle"),
+            operation_runtime::toggle_selection,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("commits.cherry-pick"),
+            operation_runtime::cherry_pick_selected,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("changes.selection.toggle"),
+            operation_runtime::toggle_changes_selection,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("changes.stage"),
+            operation_runtime::stage_changes,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("changes.unstage"),
+            operation_runtime::unstage_changes,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("changes.commit"),
+            operation_runtime::open_commit_creation,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("commit-creation.cancel"),
+            operation_runtime::navigate_back,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("commit-creation.submit"),
+            operation_runtime::submit_commit_creation,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("text.submit"),
+            operation_runtime::submit_text_input,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("back"),
+            operation_runtime::navigate_back,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("copy.commit.hash"),
+            operation_runtime::copy_commit_hashes,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("copy.commit.info"),
+            operation_runtime::copy_commit_info,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("copy.commit.message"),
+            operation_runtime::copy_commit_message,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("copy.reflog.hash"),
+            operation_runtime::copy_reflog_hash,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("copy.file.name"),
+            operation_runtime::copy_file_name,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("copy.file.absolute"),
+            operation_runtime::copy_file_absolute_path,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("copy.file.relative"),
+            operation_runtime::copy_file_relative_path,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("scroll.home"),
+            operation_runtime::scroll_home,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("scroll.end"),
+            operation_runtime::scroll_end,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("scroll.page-up"),
+            operation_runtime::scroll_page_up,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("scroll.page-down"),
+            operation_runtime::scroll_page_down,
+        )
+    }
+
+    pub fn enqueue_input_intent(&mut self, intent: InputIntent) {
+        self.world
+            .resource_mut::<bevy_ecs::prelude::Messages<InputIntent>>()
+            .write(intent);
+    }
+
+    pub fn enqueue_interaction_notice(&mut self, request: pitui_data::InteractionNoticeRequest) {
+        self.world
+            .resource_mut::<bevy_ecs::prelude::Messages<pitui_data::InteractionNoticeRequest>>()
+            .write(request);
+    }
+
+    pub fn enqueue_viewport_measurement(&mut self, measurement: ViewportMeasurement) {
+        self.world
+            .resource_mut::<bevy_ecs::prelude::Messages<ViewportMeasurement>>()
+            .write(measurement);
+    }
+
+    pub fn ui_frame(&self) -> &UiFrame {
+        self.world.resource::<UiFrame>()
+    }
+
+    pub fn quit_requested(&self) -> bool {
+        self.world.resource::<QuitRequested>().0
+    }
+
+    pub fn take_clipboard_requests(&mut self) -> Vec<pitui_data::ClipboardRequest> {
+        std::mem::take(&mut self.world.resource_mut::<ClipboardRequests>().0)
+    }
+
+    pub fn resolve_render_mode(
+        &self,
+        mode: &RenderModeId,
+        bindings: &RenderContextBindings,
+    ) -> Result<ResolvedRenderLayout, KernelError> {
+        let layout = self
+            .world
+            .resource::<RenderModeRegistry>()
+            .get(mode)
+            .ok_or_else(|| KernelError::MissingRenderMode(mode.clone()))?
+            .layout
+            .clone();
+        resolve_render_layout(&self.world, &layout, bindings)
+    }
+
+    pub fn enqueue_git_command(&mut self, data: GitCommandData) -> Result<(), KernelError> {
+        self.require_dataset(data.repository_dataset)?;
+        self.world
+            .resource_mut::<bevy_ecs::prelude::Messages<GitCommandData>>()
+            .write(data);
+        Ok(())
+    }
+
+    /// Returns the canonical Entity for an identity, creating it when needed.
+    pub fn ensure_dataset(
+        &mut self,
+        identity: DatasetIdentity,
+        kind: DatasetKind,
+        template: DatasetTemplateId,
+    ) -> Result<Entity, KernelError> {
+        ensure_dataset_in_world(&mut self.world, identity, kind, template)
+    }
+
+    pub fn add_root(&mut self, entity: Entity) -> Result<(), KernelError> {
+        self.require_dataset(entity)?;
+        let mut roots = self.world.resource_mut::<DatasetRoots>();
+        if !roots.0.contains(&entity) {
+            roots.0.push(entity);
+        }
+        Ok(())
+    }
+
+    pub fn remove_root(&mut self, entity: Entity) {
+        self.world
+            .resource_mut::<DatasetRoots>()
+            .0
+            .retain(|root| *root != entity);
+    }
+
+    /// Transactionally replaces a Dataset's ordered child references. All
+    /// validation happens before any component is changed.
+    pub fn replace_children(
+        &mut self,
+        parent: Entity,
+        children: Vec<Entity>,
+        has_snapshot: bool,
+    ) -> Result<(), KernelError> {
+        replace_children_in_world(&mut self.world, parent, children, has_snapshot)
+    }
+
+    pub fn set_cursor(
+        &mut self,
+        dataset: Entity,
+        cursor: Option<Entity>,
+    ) -> Result<(), KernelError> {
+        self.require_dataset(dataset)?;
+        if let Some(cursor) = cursor
+            && !self
+                .world
+                .get::<DatasetNavigationOrder>(dataset)
+                .is_some_and(|navigation| navigation.0.contains(&cursor))
+        {
+            return Err(KernelError::CursorOutsideDataset { dataset, cursor });
+        }
+        self.world.entity_mut(dataset).insert(DatasetCursor(cursor));
+        Ok(())
+    }
+
+    pub fn set_selection(
+        &mut self,
+        dataset: Entity,
+        selection: Vec<Entity>,
+    ) -> Result<(), KernelError> {
+        self.require_dataset(dataset)?;
+        let navigation = &self
+            .world
+            .get::<DatasetNavigationOrder>(dataset)
+            .expect("validated Dataset must have a navigation order")
+            .0;
+        if let Some(selected) = selection
+            .iter()
+            .find(|selected| !navigation.contains(selected))
+        {
+            return Err(KernelError::SelectionOutsideDataset {
+                dataset,
+                selected: *selected,
+            });
+        }
+        self.world
+            .entity_mut(dataset)
+            .insert(DatasetSelection(selection));
+        Ok(())
+    }
+
+    pub fn initialize_ui_from_mode(
+        &mut self,
+        active_dataset: Entity,
+        render_mode: RenderModeId,
+        render_bindings: RenderContextBindings,
+        operations: ResolvedOperationSet,
+    ) -> Result<(), KernelError> {
+        let layout = self.resolve_render_mode(&render_mode, &render_bindings)?;
+        self.initialize_ui(
+            active_dataset,
+            render_mode,
+            render_bindings,
+            layout,
+            operations,
+        )
+    }
+
+    pub fn replace_context_from_mode(
+        &mut self,
+        active_dataset: Entity,
+        render_mode: RenderModeId,
+        render_bindings: RenderContextBindings,
+        operations: ResolvedOperationSet,
+    ) -> Result<(), KernelError> {
+        let layout = self.resolve_render_mode(&render_mode, &render_bindings)?;
+        self.replace_context(
+            active_dataset,
+            render_mode,
+            render_bindings,
+            layout,
+            operations,
+        )
+    }
+
+    pub fn push_context_from_mode(
+        &mut self,
+        active_dataset: Entity,
+        render_mode: RenderModeId,
+        render_bindings: RenderContextBindings,
+        operations: ResolvedOperationSet,
+    ) -> Result<(), KernelError> {
+        let layout = self.resolve_render_mode(&render_mode, &render_bindings)?;
+        self.push_context(
+            active_dataset,
+            render_mode,
+            render_bindings,
+            layout,
+            operations,
+        )
+    }
+
+    pub fn pop_context_from_mode(
+        &mut self,
+        operations: ResolvedOperationSet,
+    ) -> Result<(), KernelError> {
+        let snapshot = self
+            .world
+            .resource::<ContextStack>()
+            .0
+            .last()
+            .cloned()
+            .ok_or(KernelError::ContextUnavailable)?;
+        let layout = self.resolve_render_mode(&snapshot.render_mode, &snapshot.render_bindings)?;
+        self.pop_context(layout, operations)
+    }
+
+    pub fn initialize_ui(
+        &mut self,
+        active_dataset: Entity,
+        render_mode: RenderModeId,
+        render_bindings: RenderContextBindings,
+        layout: ResolvedRenderLayout,
+        operations: ResolvedOperationSet,
+    ) -> Result<(), KernelError> {
+        if self.world.contains_resource::<ActiveUiContext>() {
+            return Err(KernelError::ContextAlreadyInitialized);
+        }
+        self.validate_ui_state(active_dataset, &render_bindings, &layout)?;
+        self.apply_ui_state(
+            active_dataset,
+            render_mode,
+            render_bindings,
+            layout,
+            operations,
+            0,
+        );
+        Ok(())
+    }
+
+    pub fn replace_context(
+        &mut self,
+        active_dataset: Entity,
+        render_mode: RenderModeId,
+        render_bindings: RenderContextBindings,
+        layout: ResolvedRenderLayout,
+        operations: ResolvedOperationSet,
+    ) -> Result<(), KernelError> {
+        self.validate_ui_state(active_dataset, &render_bindings, &layout)?;
+        let generation = self
+            .world
+            .get_resource::<ActiveUiContext>()
+            .ok_or(KernelError::ContextUnavailable)?
+            .generation
+            + 1;
+        self.apply_ui_state(
+            active_dataset,
+            render_mode,
+            render_bindings,
+            layout,
+            operations,
+            generation,
+        );
+        Ok(())
+    }
+
+    pub fn push_context(
+        &mut self,
+        active_dataset: Entity,
+        render_mode: RenderModeId,
+        render_bindings: RenderContextBindings,
+        layout: ResolvedRenderLayout,
+        operations: ResolvedOperationSet,
+    ) -> Result<(), KernelError> {
+        self.validate_ui_state(active_dataset, &render_bindings, &layout)?;
+        let current = self
+            .world
+            .get_resource::<ActiveUiContext>()
+            .cloned()
+            .ok_or(KernelError::ContextUnavailable)?;
+        self.world
+            .resource_mut::<ContextStack>()
+            .0
+            .push(UiContextSnapshot {
+                active_dataset: current.active_dataset,
+                render_mode: current.render_mode,
+                render_bindings: current.render_bindings,
+            });
+        self.apply_ui_state(
+            active_dataset,
+            render_mode,
+            render_bindings,
+            layout,
+            operations,
+            current.generation + 1,
+        );
+        Ok(())
+    }
+
+    /// Pops the navigation context. The caller supplies projections resolved
+    /// from the restored Mode/Active Dataset; only validated data is committed.
+    pub fn pop_context(
+        &mut self,
+        layout: ResolvedRenderLayout,
+        operations: ResolvedOperationSet,
+    ) -> Result<(), KernelError> {
+        let snapshot = self
+            .world
+            .resource::<ContextStack>()
+            .0
+            .last()
+            .cloned()
+            .ok_or(KernelError::ContextUnavailable)?;
+        self.validate_ui_state(snapshot.active_dataset, &snapshot.render_bindings, &layout)?;
+        let generation = self
+            .world
+            .get_resource::<ActiveUiContext>()
+            .ok_or(KernelError::ContextUnavailable)?
+            .generation
+            + 1;
+        self.world.resource_mut::<ContextStack>().0.pop();
+        self.apply_ui_state(
+            snapshot.active_dataset,
+            snapshot.render_mode,
+            snapshot.render_bindings,
+            layout,
+            operations,
+            generation,
+        );
+        Ok(())
+    }
+
+    pub fn run_schedule(&mut self) {
+        self.schedule.run(&mut self.world);
+        git_runtime::update_git_messages(&mut self.world);
+        operation_runtime::update_operation_messages(&mut self.world);
+        self.world
+            .resource_mut::<bevy_ecs::prelude::Messages<ViewportMeasurement>>()
+            .update();
+        let violations = validate_invariants(&mut self.world);
+        self.world
+            .resource_mut::<RuntimeDiagnostics>()
+            .invariant_violations = violations;
+    }
+
+    pub fn validate(&mut self) -> Vec<InvariantViolation> {
+        validate_invariants(&mut self.world)
+    }
+
+    fn require_dataset(&self, entity: Entity) -> Result<(), KernelError> {
+        self.world
+            .get::<Dataset>(entity)
+            .map(|_| ())
+            .ok_or(KernelError::MissingDataset(entity))
+    }
+
+    fn validate_ui_state(
+        &self,
+        active_dataset: Entity,
+        render_bindings: &RenderContextBindings,
+        layout: &ResolvedRenderLayout,
+    ) -> Result<(), KernelError> {
+        self.require_dataset(active_dataset)?;
+        if !layout.is_focus_owner(active_dataset) {
+            return Err(KernelError::ActiveDatasetNotFocusable(active_dataset));
+        }
+        for entity in render_bindings.entities() {
+            self.require_dataset(entity)?;
+        }
+        let mut rendered = Vec::new();
+        layout.dataset_entities(&mut rendered);
+        for entity in rendered {
+            self.require_dataset(entity)?;
+        }
+        Ok(())
+    }
+
+    fn apply_ui_state(
+        &mut self,
+        active_dataset: Entity,
+        render_mode: RenderModeId,
+        render_bindings: RenderContextBindings,
+        layout: ResolvedRenderLayout,
+        operations: ResolvedOperationSet,
+        generation: u64,
+    ) {
+        self.world.insert_resource(ActiveUiContext {
+            active_dataset,
+            render_mode: render_mode.clone(),
+            render_bindings,
+            resolved_operations: operations.id.clone(),
+            generation,
+        });
+        self.world.insert_resource(ActiveRenderMode {
+            id: render_mode,
+            layout,
+        });
+        self.world.insert_resource(operations);
+    }
+}
+
+fn validate_render_layout_contract(
+    mode: &RenderModeId,
+    layout: &RenderLayout,
+    proxies: &RenderProxyRegistry,
+    errors: &mut Vec<RegistrationContractError>,
+) {
+    match layout {
+        RenderLayout::Row(children)
+        | RenderLayout::Column(children)
+        | RenderLayout::Overlay(children) => {
+            for child in children {
+                validate_render_layout_contract(mode, child, proxies, errors);
+            }
+        }
+        RenderLayout::Dataset { dataset, proxy, .. } => {
+            let Some(spec) = proxies.get(proxy) else {
+                errors.push(RegistrationContractError::RenderModeMissingProxy {
+                    mode: mode.clone(),
+                    proxy: proxy.clone(),
+                });
+                return;
+            };
+            if let DatasetBinding::Stable(identity) = dataset {
+                let expected = identity.kind();
+                if spec.dataset_kind != expected {
+                    errors.push(RegistrationContractError::StableRenderProxyKindMismatch {
+                        mode: mode.clone(),
+                        identity: Box::new(identity.clone()),
+                        proxy: proxy.clone(),
+                        expected,
+                        actual: spec.dataset_kind,
+                    });
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn ensure_dataset_in_world(
+    world: &mut World,
+    identity: DatasetIdentity,
+    kind: DatasetKind,
+    template: DatasetTemplateId,
+) -> Result<Entity, KernelError> {
+    let identity_kind = identity.kind();
+    if identity_kind != kind {
+        return Err(KernelError::IdentityKindMismatch {
+            identity: Box::new(identity),
+            expected: identity_kind,
+            actual: kind,
+        });
+    }
+    let template_kind = world
+        .resource::<DatasetTemplateRegistry>()
+        .get(&template)
+        .map(|definition| definition.kind)
+        .ok_or_else(|| KernelError::MissingTemplate(template.clone()))?;
+    if template_kind != kind {
+        return Err(KernelError::TemplateKindMismatch {
+            template,
+            expected: kind,
+            actual: template_kind,
+        });
+    }
+
+    if let Some(entity) = world.resource::<DatasetIndex>().get(&identity) {
+        let actual_kind = world
+            .get::<DatasetType>(entity)
+            .ok_or(KernelError::MissingDataset(entity))?
+            .0;
+        if actual_kind != kind {
+            return Err(KernelError::IdentityKindMismatch {
+                identity: Box::new(identity),
+                expected: kind,
+                actual: actual_kind,
+            });
+        }
+        let actual_template = world
+            .get::<DatasetTemplateRef>(entity)
+            .ok_or(KernelError::MissingDataset(entity))?
+            .0
+            .clone();
+        if actual_template != template {
+            return Err(KernelError::IdentityTemplateMismatch {
+                identity: Box::new(identity),
+                expected: template,
+                actual: actual_template,
+            });
+        }
+        return Ok(entity);
+    }
+
+    let entity = world
+        .spawn(DatasetBundle::new(identity.clone(), kind, template))
+        .id();
+    world
+        .resource_mut::<DatasetIndex>()
+        .by_key
+        .insert(identity, entity);
+    Ok(entity)
+}
+
+fn resolve_render_layout(
+    world: &World,
+    layout: &RenderLayout,
+    bindings: &RenderContextBindings,
+) -> Result<ResolvedRenderLayout, KernelError> {
+    fn resolve(
+        world: &World,
+        layout: &RenderLayout,
+        bindings: &RenderContextBindings,
+    ) -> Result<Option<ResolvedRenderLayout>, KernelError> {
+        let resolve_children = |children: &[RenderLayout]| {
+            children
+                .iter()
+                .map(|child| resolve(world, child, bindings))
+                .filter_map(|result| match result {
+                    Ok(Some(layout)) => Some(Ok(layout)),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+
+        match layout {
+            RenderLayout::Row(children) => {
+                Ok(Some(ResolvedRenderLayout::Row(resolve_children(children)?)))
+            }
+            RenderLayout::Column(children) => Ok(Some(ResolvedRenderLayout::Column(
+                resolve_children(children)?,
+            ))),
+            RenderLayout::Overlay(children) => Ok(Some(ResolvedRenderLayout::Overlay(
+                resolve_children(children)?,
+            ))),
+            RenderLayout::Dataset {
+                dataset,
+                proxy,
+                constraint,
+                focusable,
+            } => {
+                let entity = match dataset {
+                    DatasetBinding::Stable(identity) => world
+                        .resource::<DatasetIndex>()
+                        .get(identity)
+                        .ok_or_else(|| {
+                            KernelError::MissingStableRenderDataset(Box::new(identity.clone()))
+                        })?,
+                    DatasetBinding::Context(binding) => {
+                        let Some(entity) = bindings.get(binding) else {
+                            // A context leaf is optional until its semantic object
+                            // exists (for example an unborn repository has no
+                            // CurrentCommits). The rest of the configured layout
+                            // remains intact and no renderer guesses a fallback.
+                            return Ok(None);
+                        };
+                        entity
+                    }
+                };
+                require_dataset(world, entity)?;
+                let actual = world
+                    .get::<DatasetType>(entity)
+                    .ok_or(KernelError::MissingDataset(entity))?
+                    .0;
+                let spec = world
+                    .resource::<RenderProxyRegistry>()
+                    .get(proxy)
+                    .ok_or_else(|| KernelError::MissingRenderProxy(proxy.clone()))?;
+                if spec.dataset_kind != actual {
+                    return Err(KernelError::RenderProxyKindMismatch {
+                        proxy: proxy.clone(),
+                        expected: spec.dataset_kind,
+                        actual,
+                    });
+                }
+                Ok(Some(ResolvedRenderLayout::Dataset {
+                    dataset: entity,
+                    proxy: proxy.clone(),
+                    constraint: *constraint,
+                    focusable: *focusable,
+                }))
+            }
+        }
+    }
+
+    resolve(world, layout, bindings)
+        .map(|layout| layout.unwrap_or_else(|| ResolvedRenderLayout::Row(Vec::new())))
+}
+
+fn replace_children_in_world(
+    world: &mut World,
+    parent: Entity,
+    children: Vec<Entity>,
+    has_snapshot: bool,
+) -> Result<(), KernelError> {
+    require_dataset(world, parent)?;
+    let mut seen = HashSet::new();
+    for child in &children {
+        require_dataset(world, *child)?;
+        if !seen.insert(*child) {
+            return Err(KernelError::DuplicateChild(*child));
+        }
+        if *child == parent || is_reachable(world, *child, parent) {
+            return Err(KernelError::Cycle {
+                parent,
+                child: *child,
+            });
+        }
+    }
+
+    world.entity_mut(parent).insert((
+        DatasetChildren(children.clone()),
+        DatasetNavigationOrder(children),
+        HasSnapshot(has_snapshot),
+    ));
+    world
+        .get_mut::<DatasetRevision>(parent)
+        .expect("validated Dataset must have a revision")
+        .0 += 1;
+    Ok(())
+}
+
+fn require_dataset(world: &World, entity: Entity) -> Result<(), KernelError> {
+    world
+        .get::<Dataset>(entity)
+        .map(|_| ())
+        .ok_or(KernelError::MissingDataset(entity))
+}
+
+fn rebuild_dataset_navigation_orders(world: &mut World) {
+    let datasets = {
+        let mut query = world.query::<(Entity, &DatasetType, &DatasetChildren)>();
+        query
+            .iter(world)
+            .map(|(entity, kind, children)| (entity, kind.0, children.0.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    for (entity, kind, children) in datasets {
+        let expected = expected_navigation_order(world, kind, &children);
+        let should_update = world
+            .get::<DatasetNavigationOrder>(entity)
+            .is_none_or(|navigation| navigation.0 != expected);
+        if should_update {
+            world
+                .entity_mut(entity)
+                .insert(DatasetNavigationOrder(expected));
+        }
+    }
+}
+
+fn expected_navigation_order(world: &World, kind: DatasetKind, children: &[Entity]) -> Vec<Entity> {
+    match kind {
+        DatasetKind::RepositoriesBranches => flatten_one_level(
+            world,
+            children,
+            DatasetKind::Repository,
+            DatasetKind::Branch,
+        ),
+        DatasetKind::Changes => flatten_one_level(
+            world,
+            children,
+            DatasetKind::WorkingTreeFiles,
+            DatasetKind::WorkingTreeFile,
+        ),
+        _ => children.to_vec(),
+    }
+}
+
+fn flatten_one_level(
+    world: &World,
+    parents: &[Entity],
+    parent_kind: DatasetKind,
+    child_kind: DatasetKind,
+) -> Vec<Entity> {
+    let mut rows = Vec::new();
+    for parent in parents {
+        if world.get::<DatasetType>(*parent).map(|kind| kind.0) != Some(parent_kind) {
+            continue;
+        }
+        rows.push(*parent);
+        if let Some(children) = world.get::<DatasetChildren>(*parent) {
+            rows.extend(children.0.iter().copied().filter(|child| {
+                world.get::<DatasetType>(*child).map(|kind| kind.0) == Some(child_kind)
+            }));
+        }
+    }
+    rows
+}
+
+fn repair_dataset_navigation(
+    mut datasets: Query<(
+        &DatasetNavigationOrder,
+        &mut DatasetCursor,
+        &mut DatasetSelection,
+    )>,
+) {
+    for (navigation, mut cursor, mut selection) in &mut datasets {
+        if cursor
+            .0
+            .is_none_or(|entity| !navigation.0.contains(&entity))
+        {
+            cursor.0 = navigation.0.first().copied();
+        }
+
+        let selected = selection.0.iter().copied().collect::<HashSet<_>>();
+        selection.0 = navigation
+            .0
+            .iter()
+            .copied()
+            .filter(|row| selected.contains(row))
+            .collect();
+    }
+}
+
+fn collect_unreachable_datasets(world: &mut World) {
+    let mut reachable = HashSet::new();
+    let mut pending = world.resource::<DatasetRoots>().0.clone();
+
+    if let Some(context) = world.get_resource::<ActiveUiContext>() {
+        pending.push(context.active_dataset);
+        pending.extend(context.render_bindings.entities());
+    }
+    if let Some(mode) = world.get_resource::<ActiveRenderMode>() {
+        mode.layout.dataset_entities(&mut pending);
+    }
+    for snapshot in &world.resource::<ContextStack>().0 {
+        pending.push(snapshot.active_dataset);
+        pending.extend(snapshot.render_bindings.entities());
+    }
+
+    while let Some(entity) = pending.pop() {
+        if !reachable.insert(entity) {
+            continue;
+        }
+        if let Some(children) = world.get::<DatasetChildren>(entity) {
+            pending.extend(children.0.iter().copied());
+        }
+    }
+
+    let all_datasets = {
+        let mut query = world.query_filtered::<Entity, bevy_ecs::query::With<Dataset>>();
+        query.iter(world).collect::<Vec<_>>()
+    };
+    for entity in all_datasets {
+        if !reachable.contains(&entity) {
+            let _ = world.despawn(entity);
+        }
+    }
+    world
+        .resource_mut::<DatasetIndex>()
+        .by_key
+        .retain(|_, entity| reachable.contains(entity));
+}
+
+fn is_reachable(world: &World, start: Entity, target: Entity) -> bool {
+    let mut seen = HashSet::new();
+    let mut pending = vec![start];
+    while let Some(entity) = pending.pop() {
+        if entity == target {
+            return true;
+        }
+        if !seen.insert(entity) {
+            continue;
+        }
+        if let Some(children) = world.get::<DatasetChildren>(entity) {
+            pending.extend(children.0.iter().copied());
+        }
+    }
+    false
+}
+
+fn validate_invariants(world: &mut World) -> Vec<InvariantViolation> {
+    let mut violations = Vec::new();
+    let index = world.resource::<DatasetIndex>().clone();
+
+    for (identity, entity) in &index.by_key {
+        let Some(key) = world.get::<DatasetKey>(*entity) else {
+            violations.push(InvariantViolation::IndexPointsToMissingEntity(
+                identity.clone(),
+            ));
+            continue;
+        };
+        if &key.0 != identity {
+            violations.push(InvariantViolation::IndexKeyMismatch(identity.clone()));
+        }
+    }
+
+    let datasets = {
+        let mut query = world.query::<(
+            Entity,
+            &DatasetKey,
+            &DatasetType,
+            &DatasetChildren,
+            &DatasetNavigationOrder,
+        )>();
+        query
+            .iter(world)
+            .map(|(entity, key, kind, children, navigation)| {
+                (
+                    entity,
+                    key.0.clone(),
+                    kind.0,
+                    children.0.clone(),
+                    navigation.0.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for (entity, identity, kind, children, navigation) in &datasets {
+        if index.get(identity) != Some(*entity) {
+            violations.push(InvariantViolation::DatasetMissingFromIndex(
+                identity.clone(),
+            ));
+        }
+        if identity.kind() != *kind {
+            violations.push(InvariantViolation::IdentityKindMismatch {
+                identity: identity.clone(),
+                actual: *kind,
+            });
+        }
+        for child in children {
+            if world.get::<Dataset>(*child).is_none() {
+                violations.push(InvariantViolation::DanglingChild {
+                    parent: *entity,
+                    child: *child,
+                });
+            }
+        }
+        for target in navigation {
+            if world.get::<Dataset>(*target).is_none() {
+                violations.push(InvariantViolation::DanglingNavigationTarget {
+                    dataset: *entity,
+                    target: *target,
+                });
+            }
+        }
+        if navigation != &expected_navigation_order(world, *kind, children) {
+            violations.push(InvariantViolation::InvalidNavigationOrder(*entity));
+        }
+        if is_reachable_without_origin(world, *entity, *entity) {
+            violations.push(InvariantViolation::DatasetCycle(*entity));
+        }
+    }
+
+    for root in &world.resource::<DatasetRoots>().0 {
+        if world.get::<Dataset>(*root).is_none() {
+            violations.push(InvariantViolation::DanglingRoot(*root));
+        }
+    }
+    if let Some(context) = world.get_resource::<ActiveUiContext>() {
+        if world.get::<Dataset>(context.active_dataset).is_none() {
+            violations.push(InvariantViolation::DanglingActiveDataset(
+                context.active_dataset,
+            ));
+        }
+        for entity in context.render_bindings.entities() {
+            if world.get::<Dataset>(entity).is_none() {
+                violations.push(InvariantViolation::DanglingRenderBinding(entity));
+            }
+        }
+        if let Some(mode) = world.get_resource::<ActiveRenderMode>()
+            && !mode.layout.is_focus_owner(context.active_dataset)
+        {
+            violations.push(InvariantViolation::ActiveDatasetNotFocusable(
+                context.active_dataset,
+            ));
+        }
+    }
+    for snapshot in &world.resource::<ContextStack>().0 {
+        if world.get::<Dataset>(snapshot.active_dataset).is_none() {
+            violations.push(InvariantViolation::DanglingContextEntity(
+                snapshot.active_dataset,
+            ));
+        }
+        for entity in snapshot.render_bindings.entities() {
+            if world.get::<Dataset>(entity).is_none() {
+                violations.push(InvariantViolation::DanglingContextEntity(entity));
+            }
+        }
+    }
+
+    violations
+}
+
+fn is_reachable_without_origin(world: &World, origin: Entity, target: Entity) -> bool {
+    let Some(children) = world.get::<DatasetChildren>(origin) else {
+        return false;
+    };
+    children
+        .0
+        .iter()
+        .copied()
+        .any(|child| is_reachable(world, child, target))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pitui_data::{RenderBindingId, RenderProxyId, ResolvedOperationSetId};
+
+    fn register(runtime: &mut DatasetRuntime, id: &str, kind: DatasetKind) -> DatasetTemplateId {
+        let id = DatasetTemplateId::from(id);
+        runtime
+            .register_template(DatasetTemplate {
+                id: id.clone(),
+                kind,
+                operations: Vec::new(),
+                render_proxies: vec![RenderProxyId::from("test")],
+            })
+            .unwrap();
+        id
+    }
+
+    fn operations() -> ResolvedOperationSet {
+        ResolvedOperationSet {
+            id: ResolvedOperationSetId::from("test"),
+            ..ResolvedOperationSet::default()
+        }
+    }
+
+    #[test]
+    fn canonical_identity_is_shared_by_multiple_parents() {
+        let mut runtime = DatasetRuntime::new();
+        let root_template = register(&mut runtime, "root", DatasetKind::RepositoriesBranches);
+        let commits_template = register(&mut runtime, "commits", DatasetKind::Commits);
+        let commit_template = register(&mut runtime, "commit", DatasetKind::Commit);
+        let repository = pitui_data::RepositoryKey::new("/repo");
+        let root = runtime
+            .ensure_dataset(
+                DatasetIdentity::GlobalRepositoriesBranches,
+                DatasetKind::RepositoriesBranches,
+                root_template,
+            )
+            .unwrap();
+        let left = runtime
+            .ensure_dataset(
+                DatasetIdentity::Commits {
+                    repository: repository.clone(),
+                    branch: pitui_core::BranchName("main".into()),
+                },
+                DatasetKind::Commits,
+                commits_template.clone(),
+            )
+            .unwrap();
+        let right = runtime
+            .ensure_dataset(
+                DatasetIdentity::Commits {
+                    repository: repository.clone(),
+                    branch: pitui_core::BranchName("feature".into()),
+                },
+                DatasetKind::Commits,
+                commits_template,
+            )
+            .unwrap();
+        let identity = DatasetIdentity::Commit {
+            repository,
+            hash: pitui_core::CommitHash("abc".into()),
+        };
+        let commit = runtime
+            .ensure_dataset(
+                identity.clone(),
+                DatasetKind::Commit,
+                commit_template.clone(),
+            )
+            .unwrap();
+        let same_commit = runtime
+            .ensure_dataset(identity, DatasetKind::Commit, commit_template)
+            .unwrap();
+        assert_eq!(commit, same_commit);
+
+        runtime.replace_children(left, vec![commit], true).unwrap();
+        runtime.replace_children(right, vec![commit], true).unwrap();
+        runtime
+            .replace_children(root, vec![left, right], true)
+            .unwrap();
+        runtime.add_root(root).unwrap();
+        runtime.run_schedule();
+
+        assert!(runtime.world().get_entity(commit).is_ok());
+        assert!(runtime.validate().is_empty());
+    }
+
+    #[test]
+    fn rejects_cycles_before_mutating_children() {
+        let mut runtime = DatasetRuntime::new();
+        let template = register(&mut runtime, "repository", DatasetKind::Repository);
+        let a = runtime
+            .ensure_dataset(
+                DatasetIdentity::Repository(pitui_data::RepositoryKey::new("/a")),
+                DatasetKind::Repository,
+                template.clone(),
+            )
+            .unwrap();
+        let b = runtime
+            .ensure_dataset(
+                DatasetIdentity::Repository(pitui_data::RepositoryKey::new("/b")),
+                DatasetKind::Repository,
+                template,
+            )
+            .unwrap();
+        runtime.replace_children(a, vec![b], true).unwrap();
+
+        assert!(matches!(
+            runtime.replace_children(b, vec![a], true),
+            Err(KernelError::Cycle { .. })
+        ));
+        assert!(
+            runtime
+                .world()
+                .get::<DatasetChildren>(b)
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cursor_repair_does_not_move_active_dataset() {
+        let mut runtime = DatasetRuntime::new();
+        let commits_template = register(&mut runtime, "commits", DatasetKind::Commits);
+        let commit_template = register(&mut runtime, "commit", DatasetKind::Commit);
+        let repository = pitui_data::RepositoryKey::new("/repo");
+        let commits = runtime
+            .ensure_dataset(
+                DatasetIdentity::Commits {
+                    repository: repository.clone(),
+                    branch: pitui_core::BranchName("main".into()),
+                },
+                DatasetKind::Commits,
+                commits_template,
+            )
+            .unwrap();
+        let first = runtime
+            .ensure_dataset(
+                DatasetIdentity::Commit {
+                    repository: repository.clone(),
+                    hash: pitui_core::CommitHash("one".into()),
+                },
+                DatasetKind::Commit,
+                commit_template.clone(),
+            )
+            .unwrap();
+        let second = runtime
+            .ensure_dataset(
+                DatasetIdentity::Commit {
+                    repository,
+                    hash: pitui_core::CommitHash("two".into()),
+                },
+                DatasetKind::Commit,
+                commit_template,
+            )
+            .unwrap();
+        runtime
+            .replace_children(commits, vec![first, second], true)
+            .unwrap();
+        runtime.add_root(commits).unwrap();
+        runtime.set_cursor(commits, Some(first)).unwrap();
+        runtime.set_selection(commits, vec![first, second]).unwrap();
+        runtime
+            .initialize_ui(
+                commits,
+                RenderModeId::from("history"),
+                RenderContextBindings::default(),
+                ResolvedRenderLayout::Dataset {
+                    dataset: commits,
+                    proxy: RenderProxyId::from("commits.detailed"),
+                    constraint: pitui_data::LayoutConstraint::Fill(1),
+                    focusable: true,
+                },
+                operations(),
+            )
+            .unwrap();
+
+        runtime
+            .replace_children(commits, vec![second], true)
+            .unwrap();
+        runtime.run_schedule();
+
+        assert_eq!(
+            runtime.world().get::<DatasetCursor>(commits).unwrap().0,
+            Some(second)
+        );
+        assert_eq!(
+            runtime.world().get::<DatasetSelection>(commits).unwrap().0,
+            vec![second]
+        );
+        assert_eq!(
+            runtime.world().resource::<ActiveUiContext>().active_dataset,
+            commits
+        );
+        assert!(runtime.validate().is_empty());
+    }
+
+    #[test]
+    fn repository_tree_navigation_exposes_repositories_and_branches_only() {
+        let mut runtime = DatasetRuntime::new();
+        let root_template = register(
+            &mut runtime,
+            "repositories-branches",
+            DatasetKind::RepositoriesBranches,
+        );
+        let repository_template = register(&mut runtime, "repository", DatasetKind::Repository);
+        let branch_template = register(&mut runtime, "branch", DatasetKind::Branch);
+        let commits_template = register(&mut runtime, "commits", DatasetKind::Commits);
+        let repository_key = pitui_data::RepositoryKey::new("/repo");
+        let root = runtime
+            .ensure_dataset(
+                DatasetIdentity::GlobalRepositoriesBranches,
+                DatasetKind::RepositoriesBranches,
+                root_template,
+            )
+            .unwrap();
+        let repository = runtime
+            .ensure_dataset(
+                DatasetIdentity::Repository(repository_key.clone()),
+                DatasetKind::Repository,
+                repository_template,
+            )
+            .unwrap();
+        let branch = runtime
+            .ensure_dataset(
+                DatasetIdentity::Branch {
+                    repository: repository_key.clone(),
+                    name: pitui_core::BranchName("main".into()),
+                },
+                DatasetKind::Branch,
+                branch_template,
+            )
+            .unwrap();
+        let commits = runtime
+            .ensure_dataset(
+                DatasetIdentity::Commits {
+                    repository: repository_key,
+                    branch: pitui_core::BranchName("main".into()),
+                },
+                DatasetKind::Commits,
+                commits_template,
+            )
+            .unwrap();
+
+        runtime
+            .replace_children(branch, vec![commits], true)
+            .unwrap();
+        runtime
+            .replace_children(repository, vec![branch], true)
+            .unwrap();
+        runtime
+            .replace_children(root, vec![repository], true)
+            .unwrap();
+        runtime.add_root(root).unwrap();
+        runtime.run_schedule();
+
+        assert_eq!(
+            runtime
+                .world()
+                .get::<DatasetNavigationOrder>(root)
+                .unwrap()
+                .0,
+            vec![repository, branch]
+        );
+        runtime.set_cursor(root, Some(branch)).unwrap();
+        assert!(matches!(
+            runtime.set_cursor(root, Some(commits)),
+            Err(KernelError::CursorOutsideDataset { .. })
+        ));
+
+        runtime
+            .replace_children(repository, Vec::new(), true)
+            .unwrap();
+        runtime.run_schedule();
+        assert_eq!(
+            runtime
+                .world()
+                .get::<DatasetNavigationOrder>(root)
+                .unwrap()
+                .0,
+            vec![repository]
+        );
+        assert_eq!(
+            runtime.world().get::<DatasetCursor>(root).unwrap().0,
+            Some(repository)
+        );
+        assert!(runtime.validate().is_empty());
+    }
+
+    #[test]
+    fn changes_tree_navigation_reaches_third_level_files_without_exposing_diffs() {
+        let mut runtime = DatasetRuntime::new();
+        let changes_template = register(&mut runtime, "changes", DatasetKind::Changes);
+        let group_template = register(
+            &mut runtime,
+            "working-tree-files",
+            DatasetKind::WorkingTreeFiles,
+        );
+        let file_template = register(
+            &mut runtime,
+            "working-tree-file",
+            DatasetKind::WorkingTreeFile,
+        );
+        let diff_template = register(
+            &mut runtime,
+            "working-tree-file-changes",
+            DatasetKind::WorkingTreeFileChanges,
+        );
+        let repository = pitui_data::RepositoryKey::new("/repo");
+        let root = runtime
+            .ensure_dataset(
+                DatasetIdentity::GlobalChanges,
+                DatasetKind::Changes,
+                changes_template,
+            )
+            .unwrap();
+        let group = runtime
+            .ensure_dataset(
+                DatasetIdentity::WorkingTreeFiles {
+                    repository: repository.clone(),
+                    boundary: pitui_data::ChangeBoundary::Unstaged,
+                },
+                DatasetKind::WorkingTreeFiles,
+                group_template,
+            )
+            .unwrap();
+        let file = runtime
+            .ensure_dataset(
+                DatasetIdentity::WorkingTreeFile {
+                    repository: repository.clone(),
+                    boundary: pitui_data::ChangeBoundary::Unstaged,
+                    path: pitui_core::GitPath::from("src/main.rs"),
+                },
+                DatasetKind::WorkingTreeFile,
+                file_template,
+            )
+            .unwrap();
+        let diff = runtime
+            .ensure_dataset(
+                DatasetIdentity::WorkingTreeFileChanges {
+                    repository,
+                    boundary: pitui_data::ChangeBoundary::Unstaged,
+                    path: pitui_core::GitPath::from("src/main.rs"),
+                },
+                DatasetKind::WorkingTreeFileChanges,
+                diff_template,
+            )
+            .unwrap();
+
+        runtime.replace_children(file, vec![diff], true).unwrap();
+        runtime.replace_children(group, vec![file], true).unwrap();
+        runtime.replace_children(root, vec![group], true).unwrap();
+        runtime.add_root(root).unwrap();
+        runtime.run_schedule();
+
+        assert_eq!(
+            runtime
+                .world()
+                .get::<DatasetNavigationOrder>(root)
+                .unwrap()
+                .0,
+            vec![group, file]
+        );
+        runtime.set_cursor(root, Some(file)).unwrap();
+        runtime.set_selection(root, vec![file]).unwrap();
+        assert!(matches!(
+            runtime.set_cursor(root, Some(diff)),
+            Err(KernelError::CursorOutsideDataset { .. })
+        ));
+        assert_eq!(
+            runtime.world().get::<DatasetSelection>(root).unwrap().0,
+            vec![file]
+        );
+        assert!(runtime.validate().is_empty());
+    }
+
+    #[test]
+    fn gc_removes_only_unreachable_datasets() {
+        let mut runtime = DatasetRuntime::new();
+        let template = register(&mut runtime, "repository", DatasetKind::Repository);
+        let root = runtime
+            .ensure_dataset(
+                DatasetIdentity::Repository(pitui_data::RepositoryKey::new("/root")),
+                DatasetKind::Repository,
+                template.clone(),
+            )
+            .unwrap();
+        let child = runtime
+            .ensure_dataset(
+                DatasetIdentity::Repository(pitui_data::RepositoryKey::new("/child")),
+                DatasetKind::Repository,
+                template.clone(),
+            )
+            .unwrap();
+        let orphan_identity =
+            DatasetIdentity::Repository(pitui_data::RepositoryKey::new("/orphan"));
+        let orphan = runtime
+            .ensure_dataset(orphan_identity.clone(), DatasetKind::Repository, template)
+            .unwrap();
+        runtime.replace_children(root, vec![child], true).unwrap();
+        runtime.add_root(root).unwrap();
+
+        runtime.run_schedule();
+
+        assert!(runtime.world().get_entity(root).is_ok());
+        assert!(runtime.world().get_entity(child).is_ok());
+        assert!(runtime.world().get_entity(orphan).is_err());
+        assert_eq!(
+            runtime
+                .world()
+                .resource::<DatasetIndex>()
+                .get(&orphan_identity),
+            None
+        );
+    }
+
+    #[test]
+    fn context_push_and_pop_restore_active_mode_and_bindings_atomically() {
+        let mut runtime = DatasetRuntime::new();
+        let template = register(&mut runtime, "repository", DatasetKind::Repository);
+        let history = runtime
+            .ensure_dataset(
+                DatasetIdentity::Repository(pitui_data::RepositoryKey::new("/history")),
+                DatasetKind::Repository,
+                template.clone(),
+            )
+            .unwrap();
+        let detail = runtime
+            .ensure_dataset(
+                DatasetIdentity::Repository(pitui_data::RepositoryKey::new("/detail")),
+                DatasetKind::Repository,
+                template,
+            )
+            .unwrap();
+        let history_layout = ResolvedRenderLayout::Dataset {
+            dataset: history,
+            proxy: RenderProxyId::from("history"),
+            constraint: pitui_data::LayoutConstraint::Fill(1),
+            focusable: true,
+        };
+        let detail_layout = ResolvedRenderLayout::Dataset {
+            dataset: detail,
+            proxy: RenderProxyId::from("detail"),
+            constraint: pitui_data::LayoutConstraint::Fill(1),
+            focusable: true,
+        };
+        let mut history_bindings = RenderContextBindings::default();
+        history_bindings.bind(RenderBindingId::CurrentRepository, history);
+        let mut detail_bindings = RenderContextBindings::default();
+        detail_bindings.bind(RenderBindingId::CurrentRepository, detail);
+
+        runtime
+            .initialize_ui(
+                history,
+                RenderModeId::from("history"),
+                history_bindings,
+                history_layout.clone(),
+                operations(),
+            )
+            .unwrap();
+        runtime
+            .push_context(
+                detail,
+                RenderModeId::from("detail"),
+                detail_bindings,
+                detail_layout,
+                operations(),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.world().resource::<ActiveUiContext>().active_dataset,
+            detail
+        );
+        assert_eq!(runtime.world().resource::<ContextStack>().0.len(), 1);
+
+        runtime.pop_context(history_layout, operations()).unwrap();
+
+        let restored = runtime.world().resource::<ActiveUiContext>();
+        assert_eq!(restored.active_dataset, history);
+        assert_eq!(restored.render_mode, RenderModeId::from("history"));
+        assert_eq!(
+            restored
+                .render_bindings
+                .get(&RenderBindingId::CurrentRepository),
+            Some(history)
+        );
+        assert_eq!(restored.generation, 2);
+        assert!(runtime.world().resource::<ContextStack>().0.is_empty());
+    }
+
+    #[test]
+    fn stable_dataset_identity_rejects_a_caller_selected_wrong_kind() {
+        let mut runtime = DatasetRuntime::new();
+        let template = register(&mut runtime, "commit", DatasetKind::Commit);
+        let error = runtime
+            .ensure_dataset(
+                DatasetIdentity::GlobalChanges,
+                DatasetKind::Commit,
+                template,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            KernelError::IdentityKindMismatch {
+                identity: Box::new(DatasetIdentity::GlobalChanges),
+                expected: DatasetKind::Changes,
+                actual: DatasetKind::Commit,
+            }
+        );
+    }
+
+    #[test]
+    fn registration_contracts_reject_dangling_proxy_and_command_system_references() {
+        let mut runtime = DatasetRuntime::new();
+        runtime
+            .register_default_template(DatasetTemplate {
+                id: DatasetTemplateId::from("changes"),
+                kind: DatasetKind::Changes,
+                operations: Vec::new(),
+                render_proxies: vec![RenderProxyId::from("missing.proxy")],
+            })
+            .unwrap();
+        runtime
+            .register_command(CommandSpec {
+                id: CommandId::from("missing-system"),
+                name: "missing-system".into(),
+                scope: pitui_data::CommandScope::Dataset,
+                system: CommandSystemId::from("missing-system"),
+            })
+            .unwrap();
+
+        let errors = runtime.validate_registration_contracts();
+        assert!(
+            errors.contains(&RegistrationContractError::MissingTemplateProxy {
+                template: DatasetTemplateId::from("changes"),
+                proxy: RenderProxyId::from("missing.proxy"),
+            })
+        );
+        assert!(
+            errors.contains(&RegistrationContractError::CommandSystemMissing {
+                command: CommandId::from("missing-system"),
+                system: CommandSystemId::from("missing-system"),
+            })
+        );
+    }
+}

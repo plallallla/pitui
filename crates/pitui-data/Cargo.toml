@@ -1,0 +1,14 @@
+[package]
+name = "pitui-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Typed Dataset ECS components and declarative UI data for Pitui"
+
+[dependencies]
+bevy_ecs.workspace = true
+pitui-core.workspace = true
+
+[lib]
+path = "src/lib.rs"

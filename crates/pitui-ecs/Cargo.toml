@@ -1,0 +1,20 @@
+[package]
+name = "pitui-ecs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Dataset ECS world, systems and schedule for Pitui"
+
+[dependencies]
+bevy_ecs.workspace = true
+pitui-core.workspace = true
+pitui-data.workspace = true
+pitui-git.workspace = true
+
+[dev-dependencies]
+pitui-config.workspace = true
+tempfile.workspace = true
+
+[lib]
+path = "src/lib.rs"

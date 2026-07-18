@@ -1,0 +1,13 @@
+[package]
+name = "pitui-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Strict next-generation Pitui configuration boundary"
+
+[dependencies]
+pitui-data.workspace = true
+
+[lib]
+path = "src/lib.rs"
