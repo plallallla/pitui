@@ -7,7 +7,10 @@ use pitui_data::{
     FileChangesMetadata, HasSnapshot, RepositoryKey, RepositoryMetadata,
     WorkingTreeFileChangesMetadata,
 };
-use pitui_ecs::{DatasetRuntime, GitCommandData, GitExecutionFailures};
+use pitui_ecs::{
+    DatasetRuntime, GitCommandData, GitExecutionFailures, GitLoadKey, GitLoadStatus, GitLoadTarget,
+    GitLoadTracker, GitRequestId,
+};
 use pitui_git::GitCommand;
 
 fn git(cwd: &Path, args: &[&str]) -> String {
@@ -46,8 +49,8 @@ fn enqueue(
     repository_dataset: bevy_ecs::prelude::Entity,
     cwd: &Path,
     command: GitCommand,
-) {
-    runtime
+) -> GitRequestId {
+    let request_id = runtime
         .enqueue_git_command(GitCommandData {
             repository_dataset,
             cwd: cwd.to_path_buf(),
@@ -55,6 +58,7 @@ fn enqueue(
         })
         .unwrap();
     runtime.run_schedule();
+    request_id
 }
 
 #[test]
@@ -98,7 +102,7 @@ fn git_messages_build_the_canonical_dataset_chain_and_keep_cache_on_failure() {
         .unwrap();
     runtime.add_root(repository_dataset).unwrap();
 
-    enqueue(
+    let repository_request = enqueue(
         &mut runtime,
         repository_dataset,
         &cwd,
@@ -119,6 +123,18 @@ fn git_messages_build_the_canonical_dataset_chain_and_keep_cache_on_failure() {
             .get::<HasSnapshot>(repository_dataset)
             .unwrap()
             .0
+    );
+    assert_eq!(
+        runtime
+            .world()
+            .resource::<GitLoadTracker>()
+            .get(&GitLoadKey {
+                repository_dataset,
+                target: GitLoadTarget::Repository,
+            }),
+        Some(&GitLoadStatus::Ready {
+            request_id: repository_request,
+        })
     );
 
     enqueue(
@@ -256,7 +272,7 @@ fn git_messages_build_the_canonical_dataset_chain_and_keep_cache_on_failure() {
         .get::<DatasetRevision>(main_commits)
         .unwrap()
         .0;
-    enqueue(
+    let failed_request = enqueue(
         &mut runtime,
         repository_dataset,
         &cwd.join("missing-directory"),
@@ -285,6 +301,18 @@ fn git_messages_build_the_canonical_dataset_chain_and_keep_cache_on_failure() {
         runtime.world().resource::<GitExecutionFailures>().0.len(),
         1
     );
+    assert!(matches!(
+        runtime
+            .world()
+            .resource::<GitLoadTracker>()
+            .get(&GitLoadKey {
+                repository_dataset,
+                target: GitLoadTarget::Commits {
+                    branch: BranchName("main".into()),
+                },
+            }),
+        Some(GitLoadStatus::Failed { request_id, .. }) if *request_id == failed_request
+    ));
     assert!(runtime.validate().is_empty());
 }
 
@@ -375,7 +403,7 @@ fn working_tree_snapshot_builds_three_level_changes_and_invalidates_cached_diff(
         .unwrap();
     let changes = runtime
         .ensure_dataset(
-            DatasetIdentity::GlobalChanges,
+            DatasetIdentity::Changes(repository_key.clone()),
             DatasetKind::Changes,
             DatasetTemplateId::from("changes"),
         )

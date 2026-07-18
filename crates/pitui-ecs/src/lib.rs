@@ -16,15 +16,15 @@ use pitui_data::{
     AvailabilityRule, AvailabilityRuleId, AvailabilityRuleRegistry, CollectionElement,
     CollectionManagerSpec, CommandId, CommandRegistry, CommandRegistryError, CommandSpec,
     ContextStack, Dataset, DatasetActiveElement, DatasetBinding, DatasetBundle, DatasetChildren,
-    DatasetCollection, DatasetIdentity, DatasetIndex, DatasetKey, DatasetKind, DatasetRevision,
-    DatasetRoots, DatasetSelection, DatasetTemplate, DatasetTemplateId, DatasetTemplateRef,
-    DatasetTemplateRegistry, DatasetType, DatasetViewId, DatasetViewState, DefaultDatasetTemplates,
-    GlobalOperationSet, HasSnapshot, InputIntent, OperationHotkeyTable, OperationId,
-    OperationInvocation, OperationRegistry, OperationRegistryError, OperationSpec,
+    DatasetCollection, DatasetIdentity, DatasetIndex, DatasetKey, DatasetKind, DatasetParents,
+    DatasetRevision, DatasetRoots, DatasetSelection, DatasetTemplate, DatasetTemplateId,
+    DatasetTemplateRef, DatasetTemplateRegistry, DatasetType, DatasetViewId, DatasetViewState,
+    DefaultDatasetTemplates, GlobalOperationSet, HasSnapshot, InputIntent, OperationHotkeyTable,
+    OperationId, OperationInvocation, OperationRegistry, OperationRegistryError, OperationSpec,
     PendingChordState, QuitRequested, RenderContextBindings, RenderLayout, RenderModeId,
     RenderModeRegistry, RenderModeSpec, RenderProxyId, RenderProxyRegistry, RenderProxySpec,
-    RenderRegistryError, ResolvedOperationSet, ResolvedRenderLayout, UiContextSnapshot, UiFrame,
-    ViewportMeasurement,
+    RenderRegistryError, ResolvedOperationSet, ResolvedRenderLayout, UiContextFrame,
+    UiContextFrameKind, UiContextSnapshot, UiFrame, ViewportMeasurement,
 };
 
 mod binding_reconcile;
@@ -36,14 +36,17 @@ mod projection;
 pub use binding_reconcile::RenderReconcileDiagnostics;
 pub use git_runtime::{
     GitCommandData, GitDataError, GitExecutionFailure, GitExecutionFailures, GitExecutorResource,
-    GitMutationSuccess, GitMutationSuccesses, GitOperationLogSinkResource, GitResultData,
+    GitJob, GitLoadKey, GitLoadStatus, GitLoadTarget, GitLoadTracker, GitMutationSuccess,
+    GitMutationSuccesses, GitOperationLogSinkResource, GitRefreshPlan, GitRefreshTarget,
+    GitRequestId, GitRequestOutcome, GitRequestOutcomes, GitRequestQueue, GitResultData,
+    GitRuntimeRetention,
 };
 pub use operation::{
     ClipboardRequests, OperationExecution, OperationExecutionLog, OperationNotices,
-    OperationResolutionDiagnostics, OperationResolutionError, OperationSystemRegistrationError,
-    PendingInteractionNotices,
+    OperationResolutionDiagnostics, OperationResolutionError, OperationRuntimeRetention,
+    OperationSystemRegistrationError, PendingInteractionNotices,
 };
-pub use projection::{ProjectionDiagnostic, ProjectionDiagnostics};
+pub use projection::{ProjectionDiagnostic, ProjectionDiagnostics, ProjectionRuntimeState};
 
 #[derive(ScheduleLabel, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PituiSchedule;
@@ -62,6 +65,18 @@ pub enum RuntimeSet {
 pub struct RuntimeDiagnostics {
     pub invariant_violations: Vec<InvariantViolation>,
 }
+
+#[derive(Resource, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RuntimeValidationMode {
+    /// Full graph validation is requested explicitly at startup, in tests or
+    /// by diagnostics. This avoids repeated whole-World DFS work per keypress.
+    #[default]
+    OnDemand,
+    EverySchedule,
+}
+
+#[derive(Resource, Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DatasetGcRequested(bool);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KernelError {
@@ -105,8 +120,16 @@ pub enum KernelError {
         actual: DatasetKind,
     },
     ActiveDatasetNotActivatable(Entity),
+    InvalidDatasetView {
+        dataset: Entity,
+        view: Option<DatasetViewId>,
+    },
     ContextAlreadyInitialized,
     ContextUnavailable,
+    ContextFrameKindMismatch {
+        expected: UiContextFrameKind,
+        actual: UiContextFrameKind,
+    },
     MissingRenderMode(RenderModeId),
     MissingStableRenderDataset(Box<DatasetIdentity>),
     MissingRenderProxy(pitui_data::RenderProxyId),
@@ -236,6 +259,14 @@ pub enum InvariantViolation {
         parent: Entity,
         child: Entity,
     },
+    ParentIndexMissing {
+        parent: Entity,
+        child: Entity,
+    },
+    ParentIndexHasNoChildEdge {
+        parent: Entity,
+        child: Entity,
+    },
     DanglingCollectionElement {
         dataset: Entity,
         target: Entity,
@@ -292,6 +323,7 @@ impl DatasetRuntime {
         let mut world = World::new();
         world.init_resource::<DatasetIndex>();
         world.init_resource::<DatasetRoots>();
+        world.init_resource::<DatasetParents>();
         world.init_resource::<DatasetTemplateRegistry>();
         world.init_resource::<DefaultDatasetTemplates>();
         world.init_resource::<RenderProxyRegistry>();
@@ -299,14 +331,19 @@ impl DatasetRuntime {
         world.init_resource::<ActiveHandoffRegistry>();
         world.init_resource::<UiFrame>();
         world.init_resource::<ProjectionDiagnostics>();
+        world.init_resource::<ProjectionRuntimeState>();
+        world.init_resource::<projection::ProjectionDependencies>();
         world.init_resource::<bevy_ecs::prelude::Messages<ViewportMeasurement>>();
         world.init_resource::<ContextStack>();
         world.init_resource::<PendingChordState>();
         world.init_resource::<RuntimeDiagnostics>();
+        world.init_resource::<RuntimeValidationMode>();
+        world.insert_resource(DatasetGcRequested(true));
         world.init_resource::<RenderReconcileDiagnostics>();
         binding_reconcile::initialize_binding_reconcile(&mut world);
         git_runtime::initialize_git_runtime(&mut world, executor, log_sink);
         operation::initialize_operation_layer(&mut world);
+        collection::initialize_collection_runtime(&mut world);
 
         let mut schedule = Schedule::new(PituiSchedule);
         schedule.configure_sets(
@@ -327,8 +364,15 @@ impl DatasetRuntime {
                 operation::dispatch_pending_operations,
                 binding_reconcile::update_dependent_render_bindings,
                 git_runtime::enqueue_dependent_reads,
+                git_runtime::prepare_git_commands,
                 git_runtime::execute_git_commands,
-                git_runtime::collect_git_results,
+                git_runtime::apply_pending_git_results,
+                // A successfully applied mutation may enqueue a typed refresh
+                // plan. The second pass consumes that continuation without
+                // relying on the original command batch order. A future async
+                // executor can keep the same queues and simply yield here.
+                git_runtime::prepare_git_commands,
+                git_runtime::execute_git_commands,
                 git_runtime::apply_pending_git_results,
                 operation::collect_clipboard_requests,
                 operation::collect_operation_notices,
@@ -346,11 +390,20 @@ impl DatasetRuntime {
                 .in_set(RuntimeSet::Resolve),
         );
         schedule.add_systems(projection::apply_viewport_measurements.in_set(RuntimeSet::Ingress));
-        schedule.add_systems(projection::build_ui_frame.in_set(RuntimeSet::Projection));
         schedule.add_systems(
             (
-                collection::rebuild_collections,
-                collection::repair_active_elements,
+                projection::mark_projection_from_resources,
+                projection::mark_projection_from_dataset_state,
+                projection::mark_projection_from_metadata_a,
+                projection::mark_projection_from_metadata_b,
+                projection::build_ui_frame,
+            )
+                .chain()
+                .in_set(RuntimeSet::Projection),
+        );
+        schedule.add_systems(
+            (
+                collection::reconcile_dirty_collections,
                 operation::reconcile_pending_changes_active,
                 binding_reconcile::collect_context_transitions,
                 binding_reconcile::apply_context_transitions,
@@ -712,12 +765,24 @@ impl DatasetRuntime {
         resolve_render_layout(&self.world, &layout, bindings)
     }
 
-    pub fn enqueue_git_command(&mut self, data: GitCommandData) -> Result<(), KernelError> {
+    pub fn enqueue_git_command(
+        &mut self,
+        data: GitCommandData,
+    ) -> Result<GitRequestId, KernelError> {
         self.require_dataset(data.repository_dataset)?;
-        self.world
-            .resource_mut::<bevy_ecs::prelude::Messages<GitCommandData>>()
-            .write(data);
-        Ok(())
+        Ok(self.world.resource_mut::<GitRequestQueue>().enqueue(data))
+    }
+
+    pub fn set_git_runtime_retention(&mut self, retention: GitRuntimeRetention) {
+        self.world.insert_resource(retention);
+    }
+
+    pub fn set_operation_runtime_retention(&mut self, retention: OperationRuntimeRetention) {
+        self.world.insert_resource(retention);
+    }
+
+    pub fn set_validation_mode(&mut self, mode: RuntimeValidationMode) {
+        self.world.insert_resource(mode);
     }
 
     /// Returns the canonical Entity for an identity, creating it when needed.
@@ -744,6 +809,7 @@ impl DatasetRuntime {
             .resource_mut::<DatasetRoots>()
             .0
             .retain(|root| *root != entity);
+        self.world.resource_mut::<DatasetGcRequested>().0 = true;
     }
 
     /// Transactionally replaces a Dataset's ordered child references. All
@@ -799,6 +865,42 @@ impl DatasetRuntime {
         self.world
             .entity_mut(dataset)
             .insert(DatasetSelection(selection));
+        collection::mark_collection_dirty(&mut self.world, dataset);
+        Ok(())
+    }
+
+    pub fn set_dataset_view(
+        &mut self,
+        dataset: Entity,
+        view: Option<DatasetViewId>,
+    ) -> Result<(), KernelError> {
+        self.require_dataset(dataset)?;
+        let template = self
+            .world
+            .get::<DatasetTemplateRef>(dataset)
+            .and_then(|template| {
+                self.world
+                    .resource::<DatasetTemplateRegistry>()
+                    .get(&template.0)
+            })
+            .ok_or(KernelError::MissingDataset(dataset))?;
+        let valid = if template.views.is_empty() {
+            view.is_none()
+        } else {
+            view.as_ref().is_some_and(|selected| {
+                template
+                    .views
+                    .iter()
+                    .any(|candidate| candidate.id == *selected)
+            })
+        };
+        if !valid {
+            return Err(KernelError::InvalidDatasetView { dataset, view });
+        }
+        self.world
+            .entity_mut(dataset)
+            .insert(DatasetViewState(view));
+        collection::mark_collection_dirty(&mut self.world, dataset);
         Ok(())
     }
 
@@ -860,8 +962,7 @@ impl DatasetRuntime {
         let snapshot = self
             .world
             .resource::<ContextStack>()
-            .0
-            .last()
+            .top_snapshot()
             .cloned()
             .ok_or(KernelError::ContextUnavailable)?;
         let layout = self.resolve_render_mode(&snapshot.render_mode, &snapshot.render_bindings)?;
@@ -934,10 +1035,13 @@ impl DatasetRuntime {
         self.world
             .resource_mut::<ContextStack>()
             .0
-            .push(UiContextSnapshot {
-                active_dataset: current.active_dataset,
-                render_mode: current.render_mode,
-                render_bindings: current.render_bindings,
+            .push(UiContextFrame {
+                kind: UiContextFrameKind::View,
+                snapshot: UiContextSnapshot {
+                    active_dataset: current.active_dataset,
+                    render_mode: current.render_mode,
+                    render_bindings: current.render_bindings,
+                },
             });
         self.apply_ui_state(
             active_dataset,
@@ -960,8 +1064,7 @@ impl DatasetRuntime {
         let snapshot = self
             .world
             .resource::<ContextStack>()
-            .0
-            .last()
+            .top_snapshot()
             .cloned()
             .ok_or(KernelError::ContextUnavailable)?;
         self.validate_ui_state(snapshot.active_dataset, &snapshot.render_bindings, &layout)?;
@@ -985,19 +1088,21 @@ impl DatasetRuntime {
 
     pub fn run_schedule(&mut self) {
         self.schedule.run(&mut self.world);
-        git_runtime::update_git_messages(&mut self.world);
         operation::update_operation_messages(&mut self.world);
         self.world
             .resource_mut::<bevy_ecs::prelude::Messages<ViewportMeasurement>>()
             .update();
-        let violations = validate_invariants(&mut self.world);
-        self.world
-            .resource_mut::<RuntimeDiagnostics>()
-            .invariant_violations = violations;
+        if self.world.resource::<RuntimeValidationMode>() == &RuntimeValidationMode::EverySchedule {
+            self.validate();
+        }
     }
 
     pub fn validate(&mut self) -> Vec<InvariantViolation> {
-        validate_invariants(&mut self.world)
+        let violations = validate_invariants(&mut self.world);
+        self.world
+            .resource_mut::<RuntimeDiagnostics>()
+            .invariant_violations = violations.clone();
+        violations
     }
 
     fn require_dataset(&self, entity: Entity) -> Result<(), KernelError> {
@@ -1049,6 +1154,7 @@ impl DatasetRuntime {
             layout,
         });
         self.world.insert_resource(operations);
+        self.world.resource_mut::<DatasetGcRequested>().0 = true;
     }
 }
 
@@ -1188,6 +1294,7 @@ pub(crate) fn ensure_dataset_in_world(
             world
                 .entity_mut(entity)
                 .insert(DatasetViewState(repaired_view));
+            collection::mark_collection_dirty(world, entity);
         }
         return Ok(entity);
     }
@@ -1199,6 +1306,8 @@ pub(crate) fn ensure_dataset_in_world(
         .resource_mut::<DatasetIndex>()
         .by_key
         .insert(identity, entity);
+    collection::mark_collection_dirty(world, entity);
+    world.resource_mut::<DatasetGcRequested>().0 = true;
     Ok(entity)
 }
 
@@ -1309,6 +1418,10 @@ fn replace_children_in_world(
     has_snapshot: bool,
 ) -> Result<(), KernelError> {
     require_dataset(world, parent)?;
+    let previous_children = world
+        .get::<DatasetChildren>(parent)
+        .map(|children| children.0.clone())
+        .unwrap_or_default();
     let mut seen = HashSet::new();
     for child in &children {
         require_dataset(world, *child)?;
@@ -1320,6 +1433,24 @@ fn replace_children_in_world(
                 parent,
                 child: *child,
             });
+        }
+    }
+
+    {
+        let mut parents = world.resource_mut::<DatasetParents>();
+        for child in &previous_children {
+            if let Some(entries) = parents.0.get_mut(child) {
+                entries.retain(|candidate| *candidate != parent);
+                if entries.is_empty() {
+                    parents.0.remove(child);
+                }
+            }
+        }
+        for child in &children {
+            let entries = parents.0.entry(*child).or_default();
+            if !entries.contains(&parent) {
+                entries.push(parent);
+            }
         }
     }
 
@@ -1337,6 +1468,8 @@ fn replace_children_in_world(
         .get_mut::<DatasetRevision>(parent)
         .expect("validated Dataset must have a revision")
         .0 += 1;
+    collection::mark_collection_ancestors_dirty(world, parent);
+    world.resource_mut::<DatasetGcRequested>().0 = true;
     Ok(())
 }
 
@@ -1348,6 +1481,10 @@ fn require_dataset(world: &World, entity: Entity) -> Result<(), KernelError> {
 }
 
 fn collect_unreachable_datasets(world: &mut World) {
+    if !world.resource::<DatasetGcRequested>().0 {
+        return;
+    }
+    world.resource_mut::<DatasetGcRequested>().0 = false;
     let mut reachable = HashSet::new();
     let mut pending = world.resource::<DatasetRoots>().0.clone();
 
@@ -1358,7 +1495,8 @@ fn collect_unreachable_datasets(world: &mut World) {
     if let Some(mode) = world.get_resource::<ActiveRenderMode>() {
         mode.layout.dataset_entities(&mut pending);
     }
-    for snapshot in &world.resource::<ContextStack>().0 {
+    for frame in &world.resource::<ContextStack>().0 {
+        let snapshot = &frame.snapshot;
         pending.push(snapshot.active_dataset);
         pending.extend(snapshot.render_bindings.entities());
     }
@@ -1381,6 +1519,16 @@ fn collect_unreachable_datasets(world: &mut World) {
             let _ = world.despawn(entity);
         }
     }
+    world
+        .resource_mut::<DatasetParents>()
+        .0
+        .retain(|child, parents| {
+            if !reachable.contains(child) {
+                return false;
+            }
+            parents.retain(|parent| reachable.contains(parent));
+            !parents.is_empty()
+        });
     world
         .resource_mut::<DatasetIndex>()
         .by_key
@@ -1471,6 +1619,16 @@ fn validate_invariants(world: &mut World) -> Vec<InvariantViolation> {
                     child: *child,
                 });
             }
+            if !world
+                .resource::<DatasetParents>()
+                .parents(*child)
+                .contains(entity)
+            {
+                violations.push(InvariantViolation::ParentIndexMissing {
+                    parent: *entity,
+                    child: *child,
+                });
+            }
         }
         for element in elements {
             if world.get::<Dataset>(element.entity).is_none() {
@@ -1526,6 +1684,20 @@ fn validate_invariants(world: &mut World) -> Vec<InvariantViolation> {
         }
     }
 
+    for (child, parents) in &world.resource::<DatasetParents>().0 {
+        for parent in parents {
+            if world
+                .get::<DatasetChildren>(*parent)
+                .is_none_or(|children| !children.0.contains(child))
+            {
+                violations.push(InvariantViolation::ParentIndexHasNoChildEdge {
+                    parent: *parent,
+                    child: *child,
+                });
+            }
+        }
+    }
+
     for root in &world.resource::<DatasetRoots>().0 {
         if world.get::<Dataset>(*root).is_none() {
             violations.push(InvariantViolation::DanglingRoot(*root));
@@ -1550,7 +1722,8 @@ fn validate_invariants(world: &mut World) -> Vec<InvariantViolation> {
             ));
         }
     }
-    for snapshot in &world.resource::<ContextStack>().0 {
+    for frame in &world.resource::<ContextStack>().0 {
+        let snapshot = &frame.snapshot;
         if world.get::<Dataset>(snapshot.active_dataset).is_none() {
             violations.push(InvariantViolation::DanglingContextEntity(
                 snapshot.active_dataset,

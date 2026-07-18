@@ -3,9 +3,9 @@ use std::{fs, path::Path, process::Command};
 use pitui_core::{BranchName, CommitHash, GitPath};
 use pitui_data::{
     CellProjection, DatasetChildren, DatasetIdentity, DatasetIndex, DatasetKind, DatasetTemplateId,
-    DatasetType, DatasetViewId, DatasetViewState, DatasetViewport, FieldId, InputIntent, KeyCode,
-    KeyStroke, RenderBindingId, RenderContentProjection, RenderContextBindings, RenderModeId,
-    RendererKind, ResolvedOperationSet, ResolvedOperationSetId, RowProjectionKind, RowsProjection,
+    DatasetType, DatasetViewId, DatasetViewport, FieldId, InputIntent, KeyCode, KeyStroke,
+    RenderBindingId, RenderContentProjection, RenderContextBindings, RenderModeId, RendererKind,
+    ResolvedOperationSet, ResolvedOperationSetId, RowProjectionKind, RowsProjection,
     SideBySideDiffProjection, UiFrame, UiLayoutProjection, UnifiedDiffProjection,
     ViewportMeasurement,
 };
@@ -335,9 +335,8 @@ fn commit_and_file_diff_modes_project_complete_immutable_data() {
         "Tree parent selection must include its File descendant"
     );
     runtime
-        .world_mut()
-        .entity_mut(files)
-        .insert(DatasetViewState(Some(DatasetViewId::from("list"))));
+        .set_dataset_view(files, Some(DatasetViewId::from("list")))
+        .unwrap();
     runtime.run_schedule();
     let UiLayoutProjection::Row(columns) = &runtime.world().resource::<UiFrame>().layout else {
         panic!("file diff mode must remain a row after switching Files View");
@@ -378,9 +377,8 @@ fn commit_and_file_diff_modes_project_complete_immutable_data() {
         "switching Files View must not rewrite the ownership DAG"
     );
     runtime
-        .world_mut()
-        .entity_mut(files)
-        .insert(DatasetViewState(Some(DatasetViewId::from("tree"))));
+        .set_dataset_view(files, Some(DatasetViewId::from("tree")))
+        .unwrap();
     runtime.run_schedule();
     assert!(
         runtime
@@ -527,7 +525,7 @@ fn changes_proxy_builds_a_path_tree_inside_each_boundary() {
     runtime.add_root(repository).unwrap();
     let changes = runtime
         .ensure_dataset(
-            DatasetIdentity::GlobalChanges,
+            DatasetIdentity::Changes(repository_key.clone()),
             DatasetKind::Changes,
             DatasetTemplateId::from("changes"),
         )

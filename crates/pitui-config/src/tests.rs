@@ -417,5 +417,115 @@ fn default_git_logging_profile_is_bounded_and_persistent() {
     assert!(logging.keep_files > 0);
     assert!(logging.buffer_capacity > 0);
     assert!(logging.max_message_chars > 0);
+    assert!(logging.session_log_entries > 0);
+    assert!(logging.failure_history_entries > 0);
+    assert!(logging.mutation_history_entries > 0);
+    assert!(logging.completed_load_entries > 0);
     assert!(!logging.path.as_os_str().is_empty());
+}
+
+#[test]
+fn strict_hotkey_profile_overrides_only_declared_operation_bindings() {
+    let profile = parse_hotkey_profile(
+        r#"
+version = 1
+
+[global]
+"global.help" = ["ctrl+h"]
+"global.changes" = []
+
+[datasets.commits]
+"copy.commit.hash" = ["ctrl+c h", "shift+h"]
+"#,
+    )
+    .unwrap();
+    let mut templates = builtin_dataset_templates();
+    let mut global = builtin_global_operation_set();
+    apply_hotkey_profile(&mut templates, &mut global, &profile).unwrap();
+
+    assert_eq!(
+        global
+            .hotkeys
+            .bindings_for(&OperationId::from("global.help")),
+        &[KeySequence::single(KeyStroke::control('h'))]
+    );
+    assert!(
+        global
+            .hotkeys
+            .bindings_for(&OperationId::from("global.changes"))
+            .is_empty()
+    );
+    let commits = templates
+        .iter()
+        .find(|template| template.id == DatasetTemplateId::from("commits"))
+        .unwrap();
+    assert_eq!(
+        commits
+            .hotkeys
+            .bindings_for(&OperationId::from("copy.commit.hash")),
+        &[
+            KeySequence::chord([KeyStroke::control('c'), KeyStroke::character('h')]),
+            KeySequence::single(KeyStroke {
+                code: KeyCode::Character('h'),
+                modifiers: pitui_data::KeyModifiers {
+                    shift: true,
+                    ..pitui_data::KeyModifiers::default()
+                },
+            }),
+        ]
+    );
+}
+
+#[test]
+fn hotkey_profile_rejects_code_injection_and_ambiguous_sequences() {
+    let profile = parse_hotkey_profile(
+        r#"
+version = 1
+[datasets.commits]
+"not.compiled" = ["x"]
+"#,
+    )
+    .unwrap();
+    let mut templates = builtin_dataset_templates();
+    let mut global = builtin_global_operation_set();
+    let original_templates = templates.clone();
+    let original_global = global.clone();
+    assert!(matches!(
+        apply_hotkey_profile(&mut templates, &mut global, &profile),
+        Err(HotkeyProfileError::OperationNotDeclared { operation, .. })
+            if operation == OperationId::from("not.compiled")
+    ));
+    assert_eq!(templates, original_templates);
+    assert_eq!(global, original_global);
+
+    let profile = parse_hotkey_profile(
+        r#"
+version = 1
+[global]
+"global.help" = ["ctrl+x"]
+"global.refresh" = ["ctrl+x h"]
+"#,
+    )
+    .unwrap();
+    let mut templates = builtin_dataset_templates();
+    let mut global = builtin_global_operation_set();
+    assert!(matches!(
+        apply_hotkey_profile(&mut templates, &mut global, &profile),
+        Err(HotkeyProfileError::AmbiguousKeyPrefix { .. })
+    ));
+
+    let profile = parse_hotkey_profile(
+        r#"
+version = 1
+[global]
+"global.help" = ["s"]
+"#,
+    )
+    .unwrap();
+    let mut templates = builtin_dataset_templates();
+    let mut global = builtin_global_operation_set();
+    assert!(matches!(
+        apply_hotkey_profile(&mut templates, &mut global, &profile),
+        Err(HotkeyProfileError::DuplicateKeySequence { .. })
+    ));
 }

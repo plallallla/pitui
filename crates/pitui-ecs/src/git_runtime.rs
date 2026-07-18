@@ -1,13 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use bevy_ecs::prelude::{
-    Entity, Message, MessageReader, MessageWriter, Messages, Res, ResMut, Resource, World,
-};
+use bevy_ecs::prelude::{Entity, Messages, Res, ResMut, Resource, World};
 use pitui_core::{
     Branch, BranchKind, ChangedFile, Commit, CommitDetail, FileDiff, GitPath, ReflogEntry,
     Repository, WorkingTreeChange, WorkingTreeDiff,
@@ -28,6 +26,14 @@ use pitui_git::{
 
 use crate::{KernelError, ensure_dataset_in_world, replace_children_in_world, require_dataset};
 
+mod logging;
+mod snapshot;
+
+use logging::{
+    GitOperationOutcome, payload_summary, record_git_operation, request_interaction_notice,
+};
+use snapshot::apply_payload;
+
 #[derive(Resource, Clone)]
 pub struct GitExecutorResource(pub Arc<dyn GitExecutor>);
 
@@ -46,18 +52,330 @@ impl Default for GitOperationLogSinkResource {
     }
 }
 
-#[derive(Message, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitCommandData {
     pub repository_dataset: Entity,
     pub cwd: PathBuf,
     pub command: GitCommand,
 }
 
-#[derive(Message, Clone, Debug, Eq, PartialEq)]
-pub struct GitResultData {
+/// Stable correlation key for one Git effect. Callers that need to react to a
+/// specific mutation retain this value instead of indexing an append-only
+/// success vector. It is also the stale-result guard used by the future async
+/// executor boundary.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GitRequestId(pub u64);
+
+/// Typed reads that must run after a Git job has completed and its payload has
+/// been accepted. Mutation Operations describe their data impact once; the
+/// Git runtime owns sequencing and never relies on message insertion order.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum GitRefreshTarget {
+    Repository,
+    Branches,
+    Commits {
+        branch: pitui_core::BranchName,
+        limit: usize,
+    },
+    WorkingTree,
+    Reflog {
+        limit: usize,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GitRefreshPlan(pub Vec<GitRefreshTarget>);
+
+impl GitRefreshPlan {
+    pub fn new(targets: impl IntoIterator<Item = GitRefreshTarget>) -> Self {
+        let mut unique = HashSet::new();
+        Self(
+            targets
+                .into_iter()
+                .filter(|target| unique.insert(target.clone()))
+                .collect(),
+        )
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Independent load channels within one repository. Repository metadata and
+/// its branch children deliberately use different keys, so a refresh can run
+/// both without either result superseding the other.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum GitLoadTarget {
+    Repository,
+    Branches,
+    Commits {
+        branch: pitui_core::BranchName,
+    },
+    CommitDetail {
+        commit: pitui_core::CommitHash,
+    },
+    FileDiff {
+        commit: pitui_core::CommitHash,
+        path: GitPath,
+    },
+    WorkingTree,
+    Reflog,
+    WorkingTreeDiff {
+        boundary: ChangeBoundary,
+        path: GitPath,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct GitLoadKey {
     pub repository_dataset: Entity,
-    pub cwd: PathBuf,
-    pub command: GitCommand,
+    pub target: GitLoadTarget,
+}
+
+impl GitLoadKey {
+    fn from_data(data: &GitCommandData) -> Option<Self> {
+        let target = match &data.command {
+            GitCommand::LoadRepository => GitLoadTarget::Repository,
+            GitCommand::LoadBranches => GitLoadTarget::Branches,
+            GitCommand::LoadCommits { branch, .. } => GitLoadTarget::Commits {
+                branch: branch.clone(),
+            },
+            GitCommand::LoadCommitDetail { commit } => GitLoadTarget::CommitDetail {
+                commit: commit.clone(),
+            },
+            GitCommand::LoadFileDiff { commit, path, .. } => GitLoadTarget::FileDiff {
+                commit: commit.clone(),
+                path: path.clone(),
+            },
+            GitCommand::LoadReflog { .. } => GitLoadTarget::Reflog,
+            GitCommand::LoadWorkingTree => GitLoadTarget::WorkingTree,
+            GitCommand::LoadWorkingTreeDiff {
+                path,
+                include_staged,
+                include_worktree,
+                untracked,
+                ..
+            } => {
+                let boundary = if *include_staged && !*include_worktree && !*untracked {
+                    ChangeBoundary::Staged
+                } else if !*include_staged && (*include_worktree || *untracked) {
+                    ChangeBoundary::Unstaged
+                } else {
+                    return None;
+                };
+                GitLoadTarget::WorkingTreeDiff {
+                    boundary,
+                    path: path.clone(),
+                }
+            }
+            GitCommand::StagePaths { .. }
+            | GitCommand::UnstagePaths { .. }
+            | GitCommand::Commit { .. }
+            | GitCommand::CherryPick { .. }
+            | GitCommand::Reset { .. } => return None,
+        };
+        Some(Self {
+            repository_dataset: data.repository_dataset,
+            target,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GitLoadStatus {
+    Queued {
+        request_id: GitRequestId,
+    },
+    Running {
+        request_id: GitRequestId,
+    },
+    Ready {
+        request_id: GitRequestId,
+    },
+    Failed {
+        request_id: GitRequestId,
+        message: String,
+    },
+}
+
+impl GitLoadStatus {
+    pub const fn request_id(&self) -> GitRequestId {
+        match self {
+            Self::Queued { request_id }
+            | Self::Running { request_id }
+            | Self::Ready { request_id }
+            | Self::Failed { request_id, .. } => *request_id,
+        }
+    }
+}
+
+/// Latest-wins load state. It prevents a slow, older diff/commit response from
+/// replacing a newer request while keeping every transition inspectable data.
+#[derive(Resource, Clone, Debug, Default, Eq, PartialEq)]
+pub struct GitLoadTracker {
+    states: HashMap<GitLoadKey, GitLoadStatus>,
+    completed: VecDeque<(GitLoadKey, GitRequestId)>,
+}
+
+impl GitLoadTracker {
+    pub fn get(&self, key: &GitLoadKey) -> Option<&GitLoadStatus> {
+        self.states.get(key)
+    }
+
+    pub fn states(&self) -> &HashMap<GitLoadKey, GitLoadStatus> {
+        &self.states
+    }
+
+    fn queue(&mut self, key: GitLoadKey, request_id: GitRequestId) {
+        self.states
+            .insert(key, GitLoadStatus::Queued { request_id });
+    }
+
+    fn start_if_current(&mut self, key: &GitLoadKey, request_id: GitRequestId) -> bool {
+        if self
+            .states
+            .get(key)
+            .is_none_or(|status| status.request_id() != request_id)
+        {
+            return false;
+        }
+        self.states
+            .insert(key.clone(), GitLoadStatus::Running { request_id });
+        true
+    }
+
+    fn is_current(&self, key: &GitLoadKey, request_id: GitRequestId) -> bool {
+        self.states
+            .get(key)
+            .is_some_and(|status| status.request_id() == request_id)
+    }
+
+    fn complete(&mut self, key: GitLoadKey, status: GitLoadStatus, retention: usize) {
+        let request_id = status.request_id();
+        self.states.insert(key.clone(), status);
+        self.completed.push_back((key, request_id));
+        while self.completed.len() > retention {
+            let Some((expired_key, expired_request)) = self.completed.pop_front() else {
+                break;
+            };
+            if self
+                .states
+                .get(&expired_key)
+                .is_some_and(|status| status.request_id() == expired_request)
+            {
+                self.states.remove(&expired_key);
+            }
+        }
+    }
+}
+
+/// One executable Git job. `GitCommandData` remains the public effect payload;
+/// the runtime adds identity and the success continuation when it is queued.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitJob {
+    pub request_id: GitRequestId,
+    /// Root request that caused this job. Initial requests correlate to
+    /// themselves; success-triggered refresh jobs retain the mutation ID.
+    pub correlation_id: GitRequestId,
+    pub tracks_outcome: bool,
+    pub data: GitCommandData,
+    pub load_key: Option<GitLoadKey>,
+    pub refresh_after_apply: GitRefreshPlan,
+}
+
+/// Deterministic ingress queue for Git effects. It is intentionally ordinary
+/// ECS data so a later background executor can drain jobs and return results
+/// without changing Operation Systems or their refresh semantics.
+#[derive(Resource, Clone, Debug)]
+pub struct GitRequestQueue {
+    next_request_id: u64,
+    pending: VecDeque<GitJob>,
+}
+
+impl Default for GitRequestQueue {
+    fn default() -> Self {
+        Self {
+            next_request_id: 1,
+            pending: VecDeque::new(),
+        }
+    }
+}
+
+impl GitRequestQueue {
+    pub fn enqueue(&mut self, data: GitCommandData) -> GitRequestId {
+        self.enqueue_with_refresh(data, GitRefreshPlan::default())
+    }
+
+    pub fn enqueue_with_refresh(
+        &mut self,
+        data: GitCommandData,
+        refresh_after_apply: GitRefreshPlan,
+    ) -> GitRequestId {
+        self.enqueue_job(data, refresh_after_apply, false)
+    }
+
+    /// Enqueues a mutation whose logical continuation must not depend on
+    /// bounded diagnostic histories. Correlated refresh jobs inherit this
+    /// flag and update [`GitRequestOutcomes`] on failure.
+    pub fn enqueue_with_refresh_tracked(
+        &mut self,
+        data: GitCommandData,
+        refresh_after_apply: GitRefreshPlan,
+    ) -> GitRequestId {
+        self.enqueue_job(data, refresh_after_apply, true)
+    }
+
+    fn enqueue_job(
+        &mut self,
+        data: GitCommandData,
+        refresh_after_apply: GitRefreshPlan,
+        tracks_outcome: bool,
+    ) -> GitRequestId {
+        let request_id = GitRequestId(self.next_request_id);
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        self.pending.push_back(GitJob {
+            request_id,
+            correlation_id: request_id,
+            tracks_outcome,
+            load_key: GitLoadKey::from_data(&data),
+            data,
+            refresh_after_apply,
+        });
+        request_id
+    }
+
+    fn enqueue_correlated(
+        &mut self,
+        data: GitCommandData,
+        correlation_id: GitRequestId,
+        tracks_outcome: bool,
+    ) -> GitRequestId {
+        let request_id = GitRequestId(self.next_request_id);
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        self.pending.push_back(GitJob {
+            request_id,
+            correlation_id,
+            tracks_outcome,
+            load_key: GitLoadKey::from_data(&data),
+            data,
+            refresh_after_apply: GitRefreshPlan::default(),
+        });
+        request_id
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn take_pending(&mut self) -> VecDeque<GitJob> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitResultData {
+    pub job: GitJob,
     pub started_at: SystemTime,
     pub duration: Duration,
     pub result: Result<ParsedGitPayload, GitFailure>,
@@ -84,12 +402,16 @@ impl From<KernelError> for GitDataError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GitExecutionFailure {
     Git {
+        request_id: GitRequestId,
+        correlation_id: GitRequestId,
         data: GitCommandData,
         failure: GitFailure,
         started_at: SystemTime,
         duration: Duration,
     },
     Dataset {
+        request_id: GitRequestId,
+        correlation_id: GitRequestId,
         data: GitCommandData,
         failure: GitDataError,
         started_at: SystemTime,
@@ -97,20 +419,85 @@ pub enum GitExecutionFailure {
     },
 }
 
+impl GitExecutionFailure {
+    pub const fn request_id(&self) -> GitRequestId {
+        match self {
+            Self::Git { request_id, .. } | Self::Dataset { request_id, .. } => *request_id,
+        }
+    }
+
+    pub const fn correlation_id(&self) -> GitRequestId {
+        match self {
+            Self::Git { correlation_id, .. } | Self::Dataset { correlation_id, .. } => {
+                *correlation_id
+            }
+        }
+    }
+}
+
 #[derive(Resource, Clone, Debug, Default, Eq, PartialEq)]
-pub struct GitExecutionFailures(pub Vec<GitExecutionFailure>);
+pub struct GitExecutionFailures(pub VecDeque<GitExecutionFailure>);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitMutationSuccess {
+    pub request_id: GitRequestId,
     pub command: GitCommand,
     pub message: String,
 }
 
 #[derive(Resource, Clone, Debug, Default, Eq, PartialEq)]
-pub struct GitMutationSuccesses(pub Vec<GitMutationSuccess>);
+pub struct GitMutationSuccesses(pub VecDeque<GitMutationSuccess>);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GitRequestOutcome {
+    MutationApplied { command: GitCommand },
+    Failed,
+}
+
+/// Control-plane completion state for explicitly tracked continuations.
+/// Unlike diagnostic histories this map is acknowledged by its consumer and
+/// is unaffected by logging retention settings.
+#[derive(Resource, Clone, Debug, Default, Eq, PartialEq)]
+pub struct GitRequestOutcomes(HashMap<GitRequestId, GitRequestOutcome>);
+
+impl GitRequestOutcomes {
+    pub fn get(&self, request_id: GitRequestId) -> Option<&GitRequestOutcome> {
+        self.0.get(&request_id)
+    }
+
+    pub fn acknowledge(&mut self, request_id: GitRequestId) {
+        self.0.remove(&request_id);
+    }
+
+    fn set(&mut self, request_id: GitRequestId, outcome: GitRequestOutcome) {
+        self.0.insert(request_id, outcome);
+    }
+}
 
 #[derive(Resource, Clone, Debug, Default)]
-pub(super) struct PendingGitResults(Vec<GitResultData>);
+pub(super) struct PendingGitResults(VecDeque<GitResultData>);
+
+/// Bounds diagnostic/session data independently from the persistent JSONL
+/// file rotation policy. Request IDs, rather than retained vector positions,
+/// provide effect correlation so old entries can be safely evicted.
+#[derive(Resource, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GitRuntimeRetention {
+    pub failure_entries: usize,
+    pub mutation_entries: usize,
+    pub session_log_entries: usize,
+    pub completed_load_entries: usize,
+}
+
+impl Default for GitRuntimeRetention {
+    fn default() -> Self {
+        Self {
+            failure_entries: 256,
+            mutation_entries: 256,
+            session_log_entries: 1_000,
+            completed_load_entries: 2_048,
+        }
+    }
+}
 
 #[derive(Resource, Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct LastDependentReadGeneration(Option<u64>);
@@ -125,11 +512,13 @@ pub(super) fn initialize_git_runtime(
 ) {
     world.insert_resource(GitExecutorResource(executor));
     world.insert_resource(GitOperationLogSinkResource(log_sink));
-    world.init_resource::<Messages<GitCommandData>>();
-    world.init_resource::<Messages<GitResultData>>();
+    world.init_resource::<GitRequestQueue>();
+    world.init_resource::<GitLoadTracker>();
     world.init_resource::<PendingGitResults>();
     world.init_resource::<GitExecutionFailures>();
     world.init_resource::<GitMutationSuccesses>();
+    world.init_resource::<GitRequestOutcomes>();
+    world.init_resource::<GitRuntimeRetention>();
     world.init_resource::<LastDependentReadGeneration>();
     world.init_resource::<NextGitOperationLogSequence>();
 }
@@ -145,7 +534,7 @@ pub(super) fn enqueue_dependent_reads(
     files: bevy_ecs::prelude::Query<&FileMetadata>,
     working_files: bevy_ecs::prelude::Query<&WorkingTreeFileMetadata>,
     snapshots: bevy_ecs::prelude::Query<&HasSnapshot>,
-    mut commands: MessageWriter<GitCommandData>,
+    mut commands: ResMut<GitRequestQueue>,
 ) {
     let Some(context) = context else {
         return;
@@ -171,7 +560,7 @@ pub(super) fn enqueue_dependent_reads(
             .is_ok_and(|metadata| metadata.message.is_none())
         && let Ok(DatasetKey(DatasetIdentity::Commit { hash, .. })) = keys.get(commit_entity)
     {
-        commands.write(GitCommandData {
+        commands.enqueue(GitCommandData {
             repository_dataset: repository_entity,
             cwd: cwd.clone(),
             command: GitCommand::LoadCommitDetail {
@@ -198,7 +587,7 @@ pub(super) fn enqueue_dependent_reads(
         let old_path = file
             .and_then(|file| files.get(file).ok())
             .and_then(|metadata| metadata.0.old_path.clone());
-        commands.write(GitCommandData {
+        commands.enqueue(GitCommandData {
             repository_dataset: repository_entity,
             cwd: cwd.clone(),
             command: GitCommand::LoadFileDiff {
@@ -225,7 +614,7 @@ pub(super) fn enqueue_dependent_reads(
             path: path.clone(),
         });
         let metadata = file.and_then(|file| working_files.get(file).ok());
-        commands.write(GitCommandData {
+        commands.enqueue(GitCommandData {
             repository_dataset: repository_entity,
             cwd,
             command: GitCommand::LoadWorkingTreeDiff {
@@ -241,24 +630,38 @@ pub(super) fn enqueue_dependent_reads(
     }
 }
 
-pub(super) fn update_git_messages(world: &mut World) {
-    world.resource_mut::<Messages<GitCommandData>>().update();
-    world.resource_mut::<Messages<GitResultData>>().update();
+pub(super) fn prepare_git_commands(
+    commands: Res<GitRequestQueue>,
+    mut loads: ResMut<GitLoadTracker>,
+) {
+    for job in &commands.pending {
+        if let Some(key) = &job.load_key {
+            loads.queue(key.clone(), job.request_id);
+        }
+    }
 }
 
 pub(super) fn execute_git_commands(
-    mut commands: MessageReader<GitCommandData>,
+    mut commands: ResMut<GitRequestQueue>,
     executor: Res<GitExecutorResource>,
-    mut results: MessageWriter<GitResultData>,
+    mut loads: ResMut<GitLoadTracker>,
+    mut outcomes: ResMut<GitRequestOutcomes>,
+    mut results: ResMut<PendingGitResults>,
 ) {
-    for data in commands.read() {
+    for job in commands.take_pending() {
+        if let Some(key) = &job.load_key
+            && !loads.start_if_current(key, job.request_id)
+        {
+            if job.tracks_outcome {
+                outcomes.set(job.correlation_id, GitRequestOutcome::Failed);
+            }
+            continue;
+        }
         let started_at = SystemTime::now();
         let started = std::time::Instant::now();
-        let result = executor.0.execute(&data.cwd, &data.command);
-        results.write(GitResultData {
-            repository_dataset: data.repository_dataset,
-            cwd: data.cwd.clone(),
-            command: data.command.clone(),
+        let result = executor.0.execute(&job.data.cwd, &job.data.command);
+        results.0.push_back(GitResultData {
+            job,
             started_at,
             duration: started.elapsed(),
             result,
@@ -266,21 +669,27 @@ pub(super) fn execute_git_commands(
     }
 }
 
-pub(super) fn collect_git_results(
-    mut results: MessageReader<GitResultData>,
-    mut pending: ResMut<PendingGitResults>,
-) {
-    pending.0.extend(results.read().cloned());
-}
-
 pub(super) fn apply_pending_git_results(world: &mut World) {
     let results = std::mem::take(&mut world.resource_mut::<PendingGitResults>().0);
     for result in results {
-        let command_data = GitCommandData {
-            repository_dataset: result.repository_dataset,
-            cwd: result.cwd.clone(),
-            command: result.command.clone(),
-        };
+        let request_id = result.job.request_id;
+        let correlation_id = result.job.correlation_id;
+        let tracks_outcome = result.job.tracks_outcome;
+        let command_data = result.job.data;
+        let load_key = result.job.load_key;
+        let refresh_after_apply = result.job.refresh_after_apply;
+        if load_key.as_ref().is_some_and(|key| {
+            !world
+                .resource::<GitLoadTracker>()
+                .is_current(key, request_id)
+        }) {
+            if tracks_outcome {
+                world
+                    .resource_mut::<GitRequestOutcomes>()
+                    .set(correlation_id, GitRequestOutcome::Failed);
+            }
+            continue;
+        }
         match result.result {
             Ok(payload) => {
                 let summary = payload_summary(&payload);
@@ -292,8 +701,26 @@ pub(super) fn apply_pending_git_results(world: &mut World) {
                     ),
                     _ => (GitOperationStatus::Success, false, None),
                 };
-                match apply_payload(world, &command_data, payload) {
+                match apply_payload(world, request_id, &command_data, payload) {
                     Ok(()) => {
+                        if tracks_outcome
+                            && matches!(
+                                command_data.command,
+                                GitCommand::StagePaths { .. }
+                                    | GitCommand::UnstagePaths { .. }
+                                    | GitCommand::Commit { .. }
+                                    | GitCommand::CherryPick { .. }
+                                    | GitCommand::Reset { .. }
+                            )
+                            && status == GitOperationStatus::Success
+                        {
+                            world.resource_mut::<GitRequestOutcomes>().set(
+                                correlation_id,
+                                GitRequestOutcome::MutationApplied {
+                                    command: command_data.command.clone(),
+                                },
+                            );
+                        }
                         record_git_operation(
                             world,
                             &command_data,
@@ -313,8 +740,21 @@ pub(super) fn apply_pending_git_results(world: &mut World) {
                                 pitui_git::sanitize_log_text(&summary, 4096),
                             );
                         }
+                        enqueue_refresh_plan(
+                            world,
+                            correlation_id,
+                            tracks_outcome,
+                            &command_data,
+                            refresh_after_apply,
+                        );
+                        complete_git_load(world, load_key, GitLoadStatus::Ready { request_id });
                     }
                     Err(failure) => {
+                        if tracks_outcome {
+                            world
+                                .resource_mut::<GitRequestOutcomes>()
+                                .set(correlation_id, GitRequestOutcome::Failed);
+                        }
                         let message = format!("dataset update failed: {failure:?}");
                         record_git_operation(
                             world,
@@ -333,18 +773,34 @@ pub(super) fn apply_pending_git_results(world: &mut World) {
                             "Dataset update failed",
                             format!("{}: {message}", command_data.command.operation_name()),
                         );
-                        world.resource_mut::<GitExecutionFailures>().0.push(
+                        push_git_failure(
+                            world,
                             GitExecutionFailure::Dataset {
+                                request_id,
+                                correlation_id,
                                 data: command_data,
                                 failure,
                                 started_at: result.started_at,
                                 duration: result.duration,
                             },
                         );
+                        complete_git_load(
+                            world,
+                            load_key,
+                            GitLoadStatus::Failed {
+                                request_id,
+                                message,
+                            },
+                        );
                     }
                 }
             }
             Err(failure) => {
+                if tracks_outcome {
+                    world
+                        .resource_mut::<GitRequestOutcomes>()
+                        .set(correlation_id, GitRequestOutcome::Failed);
+                }
                 let failure_message = if failure.stderr.is_empty() {
                     "command failed".into()
                 } else {
@@ -371,1140 +827,92 @@ pub(super) fn apply_pending_git_results(world: &mut World) {
                         failure_message
                     ),
                 );
-                world
-                    .resource_mut::<GitExecutionFailures>()
-                    .0
-                    .push(GitExecutionFailure::Git {
+                push_git_failure(
+                    world,
+                    GitExecutionFailure::Git {
+                        request_id,
+                        correlation_id,
                         data: command_data,
                         failure,
                         started_at: result.started_at,
                         duration: result.duration,
-                    })
+                    },
+                );
+                complete_git_load(
+                    world,
+                    load_key,
+                    GitLoadStatus::Failed {
+                        request_id,
+                        message: failure_message,
+                    },
+                );
             }
         }
     }
 }
 
-fn payload_summary(payload: &ParsedGitPayload) -> String {
-    match payload {
-        ParsedGitPayload::Repository(repository) => format!(
-            "branch={} staged={} modified={} untracked={} conflicted={}",
-            repository
-                .current_branch
-                .as_ref()
-                .map_or("detached", |branch| branch.0.as_str()),
-            repository.status.staged,
-            repository.status.modified,
-            repository.status.untracked,
-            repository.status.conflicted
-        ),
-        ParsedGitPayload::Branches(branches) => format!("branches={}", branches.len()),
-        ParsedGitPayload::Commits { branch, commits } => {
-            format!("branch={} commits={}", branch.0, commits.len())
-        }
-        ParsedGitPayload::CommitDetail(detail) => format!(
-            "commit={} files={}",
-            detail.commit.hash.short(),
-            detail.files.len()
-        ),
-        ParsedGitPayload::FileDiff(diff) => format!(
-            "path={} hunks={} binary={}",
-            diff.path,
-            diff.hunks.len(),
-            diff.is_binary
-        ),
-        ParsedGitPayload::Reflog(entries) => format!("entries={}", entries.len()),
-        ParsedGitPayload::WorkingTree(changes) => format!("changes={}", changes.len()),
-        ParsedGitPayload::WorkingTreeDiff(diff) => {
-            format!("path={} sections={}", diff.path, diff.sections.len())
-        }
-        ParsedGitPayload::CommandSucceeded { message } => message.clone(),
-        ParsedGitPayload::ConflictAborted { message, .. } => message.clone(),
-    }
-}
-
-struct GitOperationOutcome {
-    status: GitOperationStatus,
-    message: String,
-    abort_attempted: bool,
-    abort_result: Option<String>,
-}
-
-fn record_git_operation(
-    world: &mut World,
-    data: &GitCommandData,
-    started_at: SystemTime,
-    duration: Duration,
-    outcome: GitOperationOutcome,
-) {
-    let GitOperationOutcome {
-        status,
-        message,
-        abort_attempted,
-        abort_result,
-    } = outcome;
-    let repository = match world.get::<DatasetKey>(data.repository_dataset) {
-        Some(DatasetKey(DatasetIdentity::Repository(repository))) => repository.clone(),
-        _ => RepositoryKey::new(data.cwd.clone()),
-    };
-    world
-        .resource::<GitOperationLogSinkResource>()
-        .0
-        .record(&GitOperationRecord {
-            operation: data.command.operation_name().into(),
-            repository: repository.as_path().to_path_buf(),
-            started_at,
-            duration,
-            status: match status {
-                GitOperationStatus::Success => GitLogStatus::Success,
-                GitOperationStatus::Failure => GitLogStatus::Failure,
-                GitOperationStatus::ConflictAborted => GitLogStatus::ConflictAborted,
-            },
-            message: message.clone(),
-            abort_attempted,
-            abort_result: abort_result.clone(),
-        });
-
-    let Some(log) = world
-        .resource::<DatasetIndex>()
-        .get(&DatasetIdentity::GlobalGitOperationLog)
-    else {
+fn complete_git_load(world: &mut World, key: Option<GitLoadKey>, status: GitLoadStatus) {
+    let Some(key) = key else {
         return;
     };
-    let Some(template) = world
-        .resource::<DefaultDatasetTemplates>()
-        .get(DatasetKind::GitOperationLogEntry)
-        .cloned()
-    else {
-        return;
-    };
-    let sequence = {
-        let mut next = world.resource_mut::<NextGitOperationLogSequence>();
-        let sequence = next.0;
-        next.0 = next.0.wrapping_add(1);
-        sequence
-    };
-    let identity = DatasetIdentity::GitOperationLogEntry(sequence);
-    let Ok(entry) =
-        ensure_dataset_in_world(world, identity, DatasetKind::GitOperationLogEntry, template)
-    else {
-        return;
-    };
+    let retention = world
+        .resource::<GitRuntimeRetention>()
+        .completed_load_entries;
     world
-        .entity_mut(entry)
-        .insert(GitOperationLogEntryMetadata {
-            sequence,
-            operation: data.command.operation_name().into(),
-            repository,
-            started_at_utc: format_system_time_utc(started_at),
-            duration_ms: duration.as_millis(),
-            status,
-            message: pitui_git::sanitize_log_text(&message, 4096),
-            abort_attempted,
-            abort_result: abort_result.map(|result| pitui_git::sanitize_log_text(&result, 4096)),
-        });
-    let mut children = world
-        .get::<DatasetChildren>(log)
-        .map(|children| children.0.clone())
-        .unwrap_or_default();
-    children.insert(0, entry);
-    if replace_children_in_world(world, log, children, true).is_ok() {
-        let log_is_active = world
-            .get_resource::<ActiveUiContext>()
-            .is_some_and(|context| context.active_dataset == log);
-        if let Some(mut active) = world.get_mut::<pitui_data::DatasetActiveElement>(log)
-            && (!log_is_active || active.0.is_none())
-        {
-            active.0 = Some(entry);
-        }
-    }
+        .resource_mut::<GitLoadTracker>()
+        .complete(key, status, retention);
 }
 
-fn format_system_time_utc(time: SystemTime) -> String {
-    let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let seconds = duration.as_secs() as i64;
-    let millis = duration.subsec_millis();
-    let days = seconds.div_euclid(86_400);
-    let second_of_day = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let hour = second_of_day / 3_600;
-    let minute = second_of_day % 3_600 / 60;
-    let second = second_of_day % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
-}
-
-fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
-    let days = days_since_unix_epoch + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let day_of_era = days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    (year, month, day)
-}
-
-fn request_interaction_notice(world: &mut World, title: &str, message: String) {
-    world
-        .resource_mut::<Messages<InteractionNoticeRequest>>()
-        .write(InteractionNoticeRequest {
-            title: title.into(),
-            message,
-        });
-}
-
-#[derive(Clone, Debug)]
-struct PlannedNode {
-    identity: DatasetIdentity,
-    kind: DatasetKind,
-    template: DatasetTemplateId,
-}
-
-#[derive(Clone, Debug)]
-struct PlannedChildren {
-    parent: DatasetIdentity,
-    children: Vec<DatasetIdentity>,
-}
-
-#[derive(Clone, Debug)]
-enum MetadataUpdate {
-    Branch(DatasetIdentity, Branch),
-    Commit(DatasetIdentity, CommitMetadata),
-    CommitField(DatasetIdentity, CommitFieldMetadata),
-    File(DatasetIdentity, ChangedFile),
-    FileTreeDirectory(DatasetIdentity, GitPath),
-    FileChanges(DatasetIdentity, FileDiff),
-    WorkingTreeFile(DatasetIdentity, WorkingTreeChange),
-    WorkingTreeFileChanges(DatasetIdentity, WorkingTreeDiff),
-    ReflogEntry(DatasetIdentity, ReflogEntry),
-}
-
-#[derive(Clone, Debug, Default)]
-struct DatasetSnapshotPlan {
-    nodes: Vec<PlannedNode>,
-    children: Vec<PlannedChildren>,
-    metadata: Vec<MetadataUpdate>,
-    snapshots: Vec<DatasetIdentity>,
-    invalidated_snapshots: Vec<DatasetIdentity>,
-}
-
-impl DatasetSnapshotPlan {
-    fn add_node(
-        &mut self,
-        identity: DatasetIdentity,
-        kind: DatasetKind,
-        template: DatasetTemplateId,
-    ) {
-        self.nodes.push(PlannedNode {
-            identity,
-            kind,
-            template,
-        });
-    }
-
-    fn replace_children(&mut self, parent: DatasetIdentity, children: Vec<DatasetIdentity>) {
-        self.snapshots.push(parent.clone());
-        self.children.push(PlannedChildren { parent, children });
-    }
-
-    fn mark_snapshot(&mut self, identity: DatasetIdentity) {
-        self.snapshots.push(identity);
-    }
-
-    fn invalidate_snapshot(&mut self, identity: DatasetIdentity) {
-        self.invalidated_snapshots.push(identity);
-    }
-}
-
-fn apply_payload(
+fn enqueue_refresh_plan(
     world: &mut World,
-    data: &GitCommandData,
-    payload: ParsedGitPayload,
-) -> Result<(), GitDataError> {
-    require_dataset(world, data.repository_dataset)?;
-    let repository = repository_key(world, data.repository_dataset)?;
-    let plan = match (&data.command, payload) {
-        (
-            GitCommand::StagePaths { .. }
-            | GitCommand::UnstagePaths { .. }
-            | GitCommand::Commit { .. }
-            | GitCommand::CherryPick { .. }
-            | GitCommand::Reset { .. },
-            ParsedGitPayload::CommandSucceeded { message },
-        ) => {
-            world
-                .resource_mut::<GitMutationSuccesses>()
-                .0
-                .push(GitMutationSuccess {
-                    command: data.command.clone(),
-                    message,
-                });
-            return Ok(());
-        }
-        (GitCommand::CherryPick { .. }, ParsedGitPayload::ConflictAborted { .. }) => return Ok(()),
-        (GitCommand::LoadRepository, ParsedGitPayload::Repository(metadata)) => {
-            return apply_repository_metadata(world, data.repository_dataset, metadata);
-        }
-        (GitCommand::LoadBranches, ParsedGitPayload::Branches(branches)) => {
-            branches_plan(world, repository, branches)?
-        }
-        (
-            GitCommand::LoadCommits { branch, .. },
-            ParsedGitPayload::Commits {
-                branch: payload_branch,
-                commits,
-            },
-        ) if branch == &payload_branch => commits_plan(world, repository, payload_branch, commits)?,
-        (GitCommand::LoadCommitDetail { commit }, ParsedGitPayload::CommitDetail(detail))
-            if commit == &detail.commit.hash =>
-        {
-            commit_detail_plan(world, repository, detail)?
-        }
-        (GitCommand::LoadFileDiff { commit, path, .. }, ParsedGitPayload::FileDiff(diff))
-            if commit == &diff.commit && path == &diff.path =>
-        {
-            file_diff_plan(world, repository, diff)?
-        }
-        (GitCommand::LoadWorkingTree, ParsedGitPayload::WorkingTree(changes)) => {
-            working_tree_plan(world, repository, changes)?
-        }
-        (GitCommand::LoadReflog { .. }, ParsedGitPayload::Reflog(entries)) => {
-            reflog_plan(world, repository, entries)?
-        }
-        (
-            GitCommand::LoadWorkingTreeDiff {
-                path,
-                include_staged,
-                include_worktree,
-                untracked,
-                ..
-            },
-            ParsedGitPayload::WorkingTreeDiff(diff),
-        ) if path == &diff.path => {
-            let boundary = if *include_staged && !*include_worktree && !*untracked {
-                ChangeBoundary::Staged
-            } else if !*include_staged && (*include_worktree || *untracked) {
-                ChangeBoundary::Unstaged
-            } else {
-                return Err(GitDataError::PayloadDoesNotMatchCommand);
-            };
-            working_tree_diff_plan(world, repository, boundary, diff)?
-        }
-        _ => return Err(GitDataError::PayloadDoesNotMatchCommand),
-    };
-
-    validate_plan(world, &plan)?;
-    apply_plan(world, plan)
-}
-
-fn repository_key(world: &World, entity: Entity) -> Result<RepositoryKey, GitDataError> {
-    match world.get::<DatasetKey>(entity).map(|key| &key.0) {
-        Some(DatasetIdentity::Repository(repository)) => Ok(repository.clone()),
-        _ => Err(GitDataError::TargetIsNotRepository(entity)),
-    }
-}
-
-fn template_for(world: &World, kind: DatasetKind) -> Result<DatasetTemplateId, GitDataError> {
-    world
-        .resource::<DefaultDatasetTemplates>()
-        .get(kind)
-        .cloned()
-        .ok_or(GitDataError::MissingDefaultTemplate(kind))
-}
-
-fn existing_node(world: &World, entity: Entity) -> Result<PlannedNode, GitDataError> {
-    Ok(PlannedNode {
-        identity: world
-            .get::<DatasetKey>(entity)
-            .ok_or(KernelError::MissingDataset(entity))?
-            .0
-            .clone(),
-        kind: world
-            .get::<DatasetType>(entity)
-            .ok_or(KernelError::MissingDataset(entity))?
-            .0,
-        template: world
-            .get::<DatasetTemplateRef>(entity)
-            .ok_or(KernelError::MissingDataset(entity))?
-            .0
-            .clone(),
-    })
-}
-
-fn apply_repository_metadata(
-    world: &mut World,
-    repository_entity: Entity,
-    metadata: Repository,
-) -> Result<(), GitDataError> {
-    let old_identity = world
-        .get::<DatasetKey>(repository_entity)
-        .ok_or(KernelError::MissingDataset(repository_entity))?
-        .0
-        .clone();
-    let DatasetIdentity::Repository(old_repository) = &old_identity else {
-        return Err(GitDataError::TargetIsNotRepository(repository_entity));
-    };
-    let actual_repository = RepositoryKey::new(metadata.root.clone());
-    let actual_identity = DatasetIdentity::Repository(actual_repository.clone());
-    if let Some(existing) = world.resource::<DatasetIndex>().get(&actual_identity)
-        && existing != repository_entity
-    {
-        return Err(GitDataError::RepositoryIdentityCollision(actual_repository));
-    }
-
-    // All fallible checks finish before identity and metadata are committed.
-    if old_repository != &actual_repository {
-        let mut index = world.resource_mut::<DatasetIndex>();
-        index.by_key.remove(&old_identity);
-        index
-            .by_key
-            .insert(actual_identity.clone(), repository_entity);
-        world
-            .entity_mut(repository_entity)
-            .insert(DatasetKey(actual_identity));
-    }
-    world
-        .entity_mut(repository_entity)
-        .insert(RepositoryMetadata(metadata));
-    mark_snapshot(world, repository_entity);
-    Ok(())
-}
-
-fn branches_plan(
-    world: &World,
-    repository: RepositoryKey,
-    mut branches: Vec<Branch>,
-) -> Result<DatasetSnapshotPlan, GitDataError> {
-    let branch_template = template_for(world, DatasetKind::Branch)?;
-    let commits_template = template_for(world, DatasetKind::Commits)?;
-    let repository_identity = DatasetIdentity::Repository(repository.clone());
-    let repository_entity = world
-        .resource::<DatasetIndex>()
-        .get(&repository_identity)
-        .ok_or_else(|| GitDataError::MissingPlannedIdentity(repository_identity.clone()))?;
-    let repository_node = existing_node(world, repository_entity)?;
-    if let Some(metadata) = world.get::<RepositoryMetadata>(repository_entity)
-        && let Some(current) = &metadata.0.current_branch
-        && !branches.iter().any(|branch| &branch.name == current)
-    {
-        branches.insert(
-            0,
-            Branch {
-                name: current.clone(),
-                full_ref: format!("refs/heads/{current}"),
-                kind: BranchKind::Local,
-                head: metadata.0.head.clone(),
-                short_head: metadata.0.head.short().to_string(),
-                commit_date: String::new(),
-                subject: String::new(),
-                is_current: true,
-            },
-        );
-    }
-    let mut plan = DatasetSnapshotPlan::default();
-    plan.add_node(
-        repository_node.identity.clone(),
-        repository_node.kind,
-        repository_node.template,
-    );
-
-    let mut branch_ids = Vec::with_capacity(branches.len());
-    for branch in branches {
-        let branch_id = DatasetIdentity::Branch {
-            repository: repository.clone(),
-            name: branch.name.clone(),
-        };
-        let commits_id = DatasetIdentity::Commits {
-            repository: repository.clone(),
-            branch: branch.name.clone(),
-        };
-        plan.add_node(
-            branch_id.clone(),
-            DatasetKind::Branch,
-            branch_template.clone(),
-        );
-        plan.add_node(
-            commits_id.clone(),
-            DatasetKind::Commits,
-            commits_template.clone(),
-        );
-        plan.metadata
-            .push(MetadataUpdate::Branch(branch_id.clone(), branch));
-        plan.replace_children(branch_id.clone(), vec![commits_id]);
-        branch_ids.push(branch_id);
-    }
-    plan.replace_children(repository_identity, branch_ids);
-    Ok(plan)
-}
-
-fn commits_plan(
-    world: &World,
-    repository: RepositoryKey,
-    branch: pitui_core::BranchName,
-    commits: Vec<Commit>,
-) -> Result<DatasetSnapshotPlan, GitDataError> {
-    let commits_template = template_for(world, DatasetKind::Commits)?;
-    let commit_template = template_for(world, DatasetKind::Commit)?;
-    let commit_field_template = template_for(world, DatasetKind::CommitField)?;
-    let files_template = template_for(world, DatasetKind::Files)?;
-    let commits_id = DatasetIdentity::Commits {
-        repository: repository.clone(),
-        branch,
-    };
-    let mut plan = DatasetSnapshotPlan::default();
-    plan.add_node(commits_id.clone(), DatasetKind::Commits, commits_template);
-
-    let mut commit_ids = Vec::with_capacity(commits.len());
-    for commit in commits {
-        let commit_id = DatasetIdentity::Commit {
-            repository: repository.clone(),
-            hash: commit.hash.clone(),
-        };
-        let files_id = DatasetIdentity::Files {
-            repository: repository.clone(),
-            commit: commit.hash.clone(),
-        };
-        let tags = tags_from_decorations(&commit.decorations);
-        let message = world
-            .resource::<DatasetIndex>()
-            .get(&commit_id)
-            .and_then(|entity| world.get::<CommitMetadata>(entity))
-            .and_then(|metadata| metadata.message.clone());
-        plan.add_node(
-            commit_id.clone(),
-            DatasetKind::Commit,
-            commit_template.clone(),
-        );
-        plan.add_node(files_id.clone(), DatasetKind::Files, files_template.clone());
-        let metadata = CommitMetadata {
-            summary: commit,
-            message,
-            tags,
-        };
-        let mut commit_children =
-            append_commit_fields(&mut plan, &repository, &metadata, &commit_field_template);
-        commit_children.push(files_id);
-        plan.metadata
-            .push(MetadataUpdate::Commit(commit_id.clone(), metadata));
-        plan.replace_children(commit_id.clone(), commit_children);
-        commit_ids.push(commit_id);
-    }
-    plan.replace_children(commits_id, commit_ids);
-    Ok(plan)
-}
-
-/// Materializes Commit detail fields as independently addressable Dataset
-/// rows. The Commit remains their collection owner, while Files stays a sibling
-/// in the canonical ownership DAG and is filtered out by Commit's List Manager.
-fn append_commit_fields(
-    plan: &mut DatasetSnapshotPlan,
-    repository: &RepositoryKey,
-    metadata: &CommitMetadata,
-    template: &DatasetTemplateId,
-) -> Vec<DatasetIdentity> {
-    let value = |field| match field {
-        CommitFieldKind::Hash => Some(metadata.summary.hash.0.clone()),
-        CommitFieldKind::Author => Some(metadata.summary.author.clone()),
-        CommitFieldKind::AuthoredAt => Some(
-            metadata
-                .summary
-                .authored_at
-                .chars()
-                .take(16)
-                .collect::<String>()
-                .replace('T', " "),
-        ),
-        CommitFieldKind::Tags => (!metadata.tags.is_empty()).then(|| metadata.tags.join(", ")),
-        CommitFieldKind::Subject => Some(metadata.summary.subject.clone()),
-        CommitFieldKind::Message => metadata.message.clone().filter(|value| !value.is_empty()),
-    };
-
-    CommitFieldKind::ALL
-        .into_iter()
-        .filter_map(|field| {
-            let value = value(field).filter(|value| !value.is_empty())?;
-            let identity = DatasetIdentity::CommitField {
-                repository: repository.clone(),
-                commit: metadata.summary.hash.clone(),
-                field,
-            };
-            plan.add_node(identity.clone(), DatasetKind::CommitField, template.clone());
-            plan.metadata.push(MetadataUpdate::CommitField(
-                identity.clone(),
-                CommitFieldMetadata { field, value },
-            ));
-            Some(identity)
-        })
-        .collect()
-}
-
-#[derive(Default)]
-struct FileTreePlanState {
-    directory_ids: HashSet<DatasetIdentity>,
-    relations: HashMap<DatasetIdentity, Vec<DatasetIdentity>>,
-}
-
-fn attach_file_to_tree(
-    plan: &mut DatasetSnapshotPlan,
-    tree: &mut FileTreePlanState,
-    root: &DatasetIdentity,
-    file: DatasetIdentity,
-    path: &GitPath,
-    directory_template: &DatasetTemplateId,
-    directory_identity: impl Fn(GitPath) -> DatasetIdentity,
+    correlation_id: GitRequestId,
+    tracks_outcome: bool,
+    completed: &GitCommandData,
+    plan: GitRefreshPlan,
 ) {
-    let components = path
-        .as_bytes()
-        .split(|byte| *byte == b'/')
-        .filter(|component| !component.is_empty())
-        .collect::<Vec<_>>();
-    let mut parent = root.clone();
-    let mut directory_path = Vec::new();
-    for component in components.iter().take(components.len().saturating_sub(1)) {
-        if !directory_path.is_empty() {
-            directory_path.push(b'/');
-        }
-        directory_path.extend_from_slice(component);
-        let path = GitPath::from_bytes(directory_path.clone());
-        let directory = directory_identity(path.clone());
-        if tree.directory_ids.insert(directory.clone()) {
-            plan.add_node(
-                directory.clone(),
-                DatasetKind::FileTreeDirectory,
-                directory_template.clone(),
-            );
-            plan.metadata
-                .push(MetadataUpdate::FileTreeDirectory(directory.clone(), path));
-        }
-        tree.relations
-            .entry(parent)
-            .or_default()
-            .push(directory.clone());
-        tree.relations.entry(directory.clone()).or_default();
-        parent = directory;
+    if plan.is_empty() {
+        return;
     }
-    tree.relations.entry(parent).or_default().push(file);
-}
-
-fn apply_file_tree_relations(
-    plan: &mut DatasetSnapshotPlan,
-    relations: HashMap<DatasetIdentity, Vec<DatasetIdentity>>,
-) {
-    let mut relations = relations.into_iter().collect::<Vec<_>>();
-    relations.sort_by(|(left, _), (right, _)| left.cmp(right));
-    for (parent, mut children) in relations {
-        children.sort();
-        children.dedup();
-        plan.replace_children(parent, children);
-    }
-}
-
-fn commit_detail_plan(
-    world: &World,
-    repository: RepositoryKey,
-    detail: CommitDetail,
-) -> Result<DatasetSnapshotPlan, GitDataError> {
-    let commit_template = template_for(world, DatasetKind::Commit)?;
-    let commit_field_template = template_for(world, DatasetKind::CommitField)?;
-    let files_template = template_for(world, DatasetKind::Files)?;
-    let directory_template = template_for(world, DatasetKind::FileTreeDirectory)?;
-    let file_template = template_for(world, DatasetKind::File)?;
-    let changes_template = template_for(world, DatasetKind::FileChanges)?;
-    let commit_id = DatasetIdentity::Commit {
-        repository: repository.clone(),
-        hash: detail.commit.hash.clone(),
-    };
-    let files_id = DatasetIdentity::Files {
-        repository: repository.clone(),
-        commit: detail.commit.hash.clone(),
-    };
-    let tags = world
-        .resource::<DatasetIndex>()
-        .get(&commit_id)
-        .and_then(|entity| world.get::<CommitMetadata>(entity))
-        .map(|metadata| metadata.tags.clone())
-        .unwrap_or_default();
-
-    let mut plan = DatasetSnapshotPlan::default();
-    plan.add_node(commit_id.clone(), DatasetKind::Commit, commit_template);
-    plan.add_node(files_id.clone(), DatasetKind::Files, files_template);
-    let metadata = CommitMetadata {
-        summary: detail.commit.clone(),
-        message: Some(detail.message),
-        tags,
-    };
-    let mut commit_children =
-        append_commit_fields(&mut plan, &repository, &metadata, &commit_field_template);
-    plan.metadata
-        .push(MetadataUpdate::Commit(commit_id.clone(), metadata));
-
-    let mut tree = FileTreePlanState::default();
-    tree.relations.insert(files_id.clone(), Vec::new());
-    for file in detail.files {
-        let file_path = file.path.clone();
-        let file_id = DatasetIdentity::File {
-            repository: repository.clone(),
-            commit: detail.commit.hash.clone(),
-            path: file.path.clone(),
+    let mut queue = world.resource_mut::<GitRequestQueue>();
+    for target in plan.0 {
+        let command = match target {
+            GitRefreshTarget::Repository => GitCommand::LoadRepository,
+            GitRefreshTarget::Branches => GitCommand::LoadBranches,
+            GitRefreshTarget::Commits { branch, limit } => {
+                GitCommand::LoadCommits { branch, limit }
+            }
+            GitRefreshTarget::WorkingTree => GitCommand::LoadWorkingTree,
+            GitRefreshTarget::Reflog { limit } => GitCommand::LoadReflog { limit },
         };
-        let changes_id = DatasetIdentity::FileChanges {
-            repository: repository.clone(),
-            commit: detail.commit.hash.clone(),
-            path: file.path.clone(),
-        };
-        plan.add_node(file_id.clone(), DatasetKind::File, file_template.clone());
-        plan.add_node(
-            changes_id.clone(),
-            DatasetKind::FileChanges,
-            changes_template.clone(),
-        );
-        plan.metadata
-            .push(MetadataUpdate::File(file_id.clone(), file));
-        plan.replace_children(file_id.clone(), vec![changes_id]);
-        attach_file_to_tree(
-            &mut plan,
-            &mut tree,
-            &files_id,
-            file_id,
-            &file_path,
-            &directory_template,
-            |path| DatasetIdentity::FileDirectory {
-                repository: repository.clone(),
-                commit: detail.commit.hash.clone(),
-                path,
+        queue.enqueue_correlated(
+            GitCommandData {
+                repository_dataset: completed.repository_dataset,
+                cwd: completed.cwd.clone(),
+                command,
             },
+            correlation_id,
+            tracks_outcome,
         );
     }
-    apply_file_tree_relations(&mut plan, tree.relations);
-    commit_children.push(files_id);
-    plan.replace_children(commit_id, commit_children);
-    Ok(plan)
 }
 
-fn file_diff_plan(
-    world: &World,
-    repository: RepositoryKey,
-    diff: FileDiff,
-) -> Result<DatasetSnapshotPlan, GitDataError> {
-    let changes_template = template_for(world, DatasetKind::FileChanges)?;
-    let changes_id = DatasetIdentity::FileChanges {
-        repository,
-        commit: diff.commit.clone(),
-        path: diff.path.clone(),
-    };
-    let mut plan = DatasetSnapshotPlan::default();
-    plan.add_node(
-        changes_id.clone(),
-        DatasetKind::FileChanges,
-        changes_template,
+fn push_git_failure(world: &mut World, failure: GitExecutionFailure) {
+    let limit = world.resource::<GitRuntimeRetention>().failure_entries;
+    push_bounded(
+        &mut world.resource_mut::<GitExecutionFailures>().0,
+        failure,
+        limit,
     );
-    plan.metadata
-        .push(MetadataUpdate::FileChanges(changes_id.clone(), diff));
-    plan.mark_snapshot(changes_id);
-    Ok(plan)
 }
 
-fn working_tree_plan(
-    world: &World,
-    repository: RepositoryKey,
-    changes: Vec<WorkingTreeChange>,
-) -> Result<DatasetSnapshotPlan, GitDataError> {
-    let changes_template = template_for(world, DatasetKind::Changes)?;
-    let groups_template = template_for(world, DatasetKind::WorkingTreeFiles)?;
-    let directory_template = template_for(world, DatasetKind::FileTreeDirectory)?;
-    let file_template = template_for(world, DatasetKind::WorkingTreeFile)?;
-    let diff_template = template_for(world, DatasetKind::WorkingTreeFileChanges)?;
-    let changes_id = DatasetIdentity::GlobalChanges;
-    let staged_group = DatasetIdentity::WorkingTreeFiles {
-        repository: repository.clone(),
-        boundary: ChangeBoundary::Staged,
-    };
-    let unstaged_group = DatasetIdentity::WorkingTreeFiles {
-        repository: repository.clone(),
-        boundary: ChangeBoundary::Unstaged,
-    };
-    let mut plan = DatasetSnapshotPlan::default();
-    plan.add_node(changes_id.clone(), DatasetKind::Changes, changes_template);
-    for group in [&staged_group, &unstaged_group] {
-        plan.add_node(
-            group.clone(),
-            DatasetKind::WorkingTreeFiles,
-            groups_template.clone(),
-        );
+fn push_bounded<T>(history: &mut VecDeque<T>, value: T, limit: usize) {
+    if limit == 0 {
+        return;
     }
-
-    let mut tree = FileTreePlanState::default();
-    tree.relations.insert(staged_group.clone(), Vec::new());
-    tree.relations.insert(unstaged_group.clone(), Vec::new());
-    for change in changes {
-        for boundary in [ChangeBoundary::Staged, ChangeBoundary::Unstaged] {
-            let included = match boundary {
-                ChangeBoundary::Staged => change.has_staged_changes(),
-                ChangeBoundary::Unstaged => change.has_worktree_changes() || change.is_untracked(),
-            };
-            if !included {
-                continue;
-            }
-            let file_id = DatasetIdentity::WorkingTreeFile {
-                repository: repository.clone(),
-                boundary,
-                path: change.path.clone(),
-            };
-            let diff_id = DatasetIdentity::WorkingTreeFileChanges {
-                repository: repository.clone(),
-                boundary,
-                path: change.path.clone(),
-            };
-            plan.add_node(
-                file_id.clone(),
-                DatasetKind::WorkingTreeFile,
-                file_template.clone(),
-            );
-            plan.add_node(
-                diff_id.clone(),
-                DatasetKind::WorkingTreeFileChanges,
-                diff_template.clone(),
-            );
-            plan.invalidate_snapshot(diff_id.clone());
-            plan.metadata.push(MetadataUpdate::WorkingTreeFile(
-                file_id.clone(),
-                change.clone(),
-            ));
-            plan.replace_children(file_id.clone(), vec![diff_id]);
-            let root = match boundary {
-                ChangeBoundary::Staged => &staged_group,
-                ChangeBoundary::Unstaged => &unstaged_group,
-            };
-            attach_file_to_tree(
-                &mut plan,
-                &mut tree,
-                root,
-                file_id,
-                &change.path,
-                &directory_template,
-                |path| DatasetIdentity::WorkingTreeDirectory {
-                    repository: repository.clone(),
-                    boundary,
-                    path,
-                },
-            );
-        }
+    while history.len() >= limit {
+        history.pop_front();
     }
-    apply_file_tree_relations(&mut plan, tree.relations);
-    plan.replace_children(changes_id, vec![staged_group, unstaged_group]);
-    Ok(plan)
-}
-
-fn reflog_plan(
-    world: &World,
-    repository: RepositoryKey,
-    entries: Vec<ReflogEntry>,
-) -> Result<DatasetSnapshotPlan, GitDataError> {
-    let reflog_template = template_for(world, DatasetKind::Reflog)?;
-    let entry_template = template_for(world, DatasetKind::ReflogEntry)?;
-    let reflog_id = DatasetIdentity::Reflog(repository.clone());
-    let mut plan = DatasetSnapshotPlan::default();
-    plan.add_node(reflog_id.clone(), DatasetKind::Reflog, reflog_template);
-
-    let mut entry_ids = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let entry_id = DatasetIdentity::ReflogEntry {
-            repository: repository.clone(),
-            selector: entry.selector.clone(),
-        };
-        plan.add_node(
-            entry_id.clone(),
-            DatasetKind::ReflogEntry,
-            entry_template.clone(),
-        );
-        plan.metadata
-            .push(MetadataUpdate::ReflogEntry(entry_id.clone(), entry));
-        entry_ids.push(entry_id);
-    }
-    plan.replace_children(reflog_id, entry_ids);
-    Ok(plan)
-}
-
-fn working_tree_diff_plan(
-    world: &World,
-    repository: RepositoryKey,
-    boundary: ChangeBoundary,
-    diff: WorkingTreeDiff,
-) -> Result<DatasetSnapshotPlan, GitDataError> {
-    let template = template_for(world, DatasetKind::WorkingTreeFileChanges)?;
-    let identity = DatasetIdentity::WorkingTreeFileChanges {
-        repository,
-        boundary,
-        path: diff.path.clone(),
-    };
-    let mut plan = DatasetSnapshotPlan::default();
-    plan.add_node(
-        identity.clone(),
-        DatasetKind::WorkingTreeFileChanges,
-        template,
-    );
-    plan.metadata.push(MetadataUpdate::WorkingTreeFileChanges(
-        identity.clone(),
-        diff,
-    ));
-    plan.mark_snapshot(identity);
-    Ok(plan)
-}
-
-fn tags_from_decorations(decorations: &str) -> Vec<String> {
-    decorations
-        .split(',')
-        .map(str::trim)
-        .filter_map(|decoration| decoration.strip_prefix("tag: "))
-        .map(str::to_string)
-        .collect()
-}
-
-fn validate_plan(world: &World, plan: &DatasetSnapshotPlan) -> Result<(), GitDataError> {
-    let mut planned = HashMap::<DatasetIdentity, (&DatasetKind, &DatasetTemplateId)>::new();
-    for node in &plan.nodes {
-        if let Some((kind, template)) =
-            planned.insert(node.identity.clone(), (&node.kind, &node.template))
-            && (*kind != node.kind || *template != node.template)
-        {
-            return Err(GitDataError::DuplicatePlannedIdentity(
-                node.identity.clone(),
-            ));
-        }
-        let registered_kind = world
-            .resource::<DatasetTemplateRegistry>()
-            .get(&node.template)
-            .map(|template| template.kind)
-            .ok_or_else(|| KernelError::MissingTemplate(node.template.clone()))?;
-        if registered_kind != node.kind {
-            return Err(KernelError::TemplateKindMismatch {
-                template: node.template.clone(),
-                expected: node.kind,
-                actual: registered_kind,
-            }
-            .into());
-        }
-        if let Some(entity) = world.resource::<DatasetIndex>().get(&node.identity) {
-            let kind = world
-                .get::<DatasetType>(entity)
-                .ok_or(KernelError::MissingDataset(entity))?
-                .0;
-            let template = world
-                .get::<DatasetTemplateRef>(entity)
-                .ok_or(KernelError::MissingDataset(entity))?
-                .0
-                .clone();
-            if kind != node.kind {
-                return Err(KernelError::IdentityKindMismatch {
-                    identity: Box::new(node.identity.clone()),
-                    expected: node.kind,
-                    actual: kind,
-                }
-                .into());
-            }
-            if template != node.template {
-                return Err(KernelError::IdentityTemplateMismatch {
-                    identity: Box::new(node.identity.clone()),
-                    expected: node.template.clone(),
-                    actual: template,
-                }
-                .into());
-            }
-        }
-    }
-
-    let mut graph = current_identity_graph(world);
-    for relation in &plan.children {
-        if !planned.contains_key(&relation.parent)
-            && world
-                .resource::<DatasetIndex>()
-                .get(&relation.parent)
-                .is_none()
-        {
-            return Err(GitDataError::MissingPlannedIdentity(
-                relation.parent.clone(),
-            ));
-        }
-        let mut seen = HashSet::new();
-        for child in &relation.children {
-            if !seen.insert(child) {
-                return Err(GitDataError::DuplicatePlannedIdentity(child.clone()));
-            }
-            if !planned.contains_key(child) && world.resource::<DatasetIndex>().get(child).is_none()
-            {
-                return Err(GitDataError::MissingPlannedIdentity(child.clone()));
-            }
-        }
-        graph.insert(relation.parent.clone(), relation.children.clone());
-    }
-    if let Some(identity) = graph_cycle(&graph) {
-        return Err(GitDataError::PlannedCycle(identity));
-    }
-    Ok(())
-}
-
-fn current_identity_graph(world: &World) -> HashMap<DatasetIdentity, Vec<DatasetIdentity>> {
-    let index = world.resource::<DatasetIndex>();
-    let mut graph = HashMap::new();
-    for (identity, entity) in &index.by_key {
-        let children = world
-            .get::<DatasetChildren>(*entity)
-            .map(|children| {
-                children
-                    .0
-                    .iter()
-                    .filter_map(|child| world.get::<DatasetKey>(*child))
-                    .map(|key| key.0.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        graph.insert(identity.clone(), children);
-    }
-    graph
-}
-
-fn graph_cycle(graph: &HashMap<DatasetIdentity, Vec<DatasetIdentity>>) -> Option<DatasetIdentity> {
-    fn visit(
-        node: &DatasetIdentity,
-        graph: &HashMap<DatasetIdentity, Vec<DatasetIdentity>>,
-        visiting: &mut HashSet<DatasetIdentity>,
-        visited: &mut HashSet<DatasetIdentity>,
-    ) -> Option<DatasetIdentity> {
-        if visiting.contains(node) {
-            return Some(node.clone());
-        }
-        if !visited.insert(node.clone()) {
-            return None;
-        }
-        visiting.insert(node.clone());
-        if let Some(children) = graph.get(node) {
-            for child in children {
-                if let Some(cycle) = visit(child, graph, visiting, visited) {
-                    return Some(cycle);
-                }
-            }
-        }
-        visiting.remove(node);
-        None
-    }
-
-    let mut visited = HashSet::new();
-    for node in graph.keys() {
-        if let Some(cycle) = visit(node, graph, &mut HashSet::new(), &mut visited) {
-            return Some(cycle);
-        }
-    }
-    None
-}
-
-fn apply_plan(world: &mut World, plan: DatasetSnapshotPlan) -> Result<(), GitDataError> {
-    for node in &plan.nodes {
-        ensure_dataset_in_world(
-            world,
-            node.identity.clone(),
-            node.kind,
-            node.template.clone(),
-        )?;
-    }
-
-    for identity in &plan.invalidated_snapshots {
-        let entity = entity_for(world, identity)?;
-        world
-            .entity_mut(entity)
-            .remove::<WorkingTreeFileChangesMetadata>()
-            .insert(HasSnapshot(false));
-    }
-
-    for update in plan.metadata {
-        match update {
-            MetadataUpdate::Branch(identity, metadata) => {
-                let entity = entity_for(world, &identity)?;
-                world.entity_mut(entity).insert(BranchMetadata(metadata));
-            }
-            MetadataUpdate::Commit(identity, metadata) => {
-                let entity = entity_for(world, &identity)?;
-                world.entity_mut(entity).insert(metadata);
-            }
-            MetadataUpdate::CommitField(identity, metadata) => {
-                let entity = entity_for(world, &identity)?;
-                world.entity_mut(entity).insert(metadata);
-            }
-            MetadataUpdate::File(identity, metadata) => {
-                let entity = entity_for(world, &identity)?;
-                world.entity_mut(entity).insert(FileMetadata(metadata));
-            }
-            MetadataUpdate::FileTreeDirectory(identity, path) => {
-                let entity = entity_for(world, &identity)?;
-                world
-                    .entity_mut(entity)
-                    .insert(FileTreeDirectoryMetadata(path));
-            }
-            MetadataUpdate::FileChanges(identity, metadata) => {
-                let entity = entity_for(world, &identity)?;
-                world
-                    .entity_mut(entity)
-                    .insert(FileChangesMetadata(metadata));
-            }
-            MetadataUpdate::WorkingTreeFile(identity, metadata) => {
-                let entity = entity_for(world, &identity)?;
-                world
-                    .entity_mut(entity)
-                    .insert(WorkingTreeFileMetadata(metadata));
-            }
-            MetadataUpdate::WorkingTreeFileChanges(identity, metadata) => {
-                let entity = entity_for(world, &identity)?;
-                world
-                    .entity_mut(entity)
-                    .insert(WorkingTreeFileChangesMetadata(metadata));
-            }
-            MetadataUpdate::ReflogEntry(identity, metadata) => {
-                let entity = entity_for(world, &identity)?;
-                world
-                    .entity_mut(entity)
-                    .insert(ReflogEntryMetadata(metadata));
-            }
-        }
-    }
-
-    let relation_parents = plan
-        .children
-        .iter()
-        .map(|relation| relation.parent.clone())
-        .collect::<HashSet<_>>();
-    for relation in plan.children {
-        let parent = entity_for(world, &relation.parent)?;
-        let children = relation
-            .children
-            .iter()
-            .map(|identity| entity_for(world, identity))
-            .collect::<Result<Vec<_>, _>>()?;
-        replace_children_in_world(world, parent, children, true)?;
-    }
-    for identity in plan.snapshots {
-        if !relation_parents.contains(&identity) {
-            mark_snapshot(world, entity_for(world, &identity)?);
-        }
-    }
-    Ok(())
-}
-
-fn entity_for(world: &World, identity: &DatasetIdentity) -> Result<Entity, GitDataError> {
-    world
-        .resource::<DatasetIndex>()
-        .get(identity)
-        .ok_or_else(|| GitDataError::MissingPlannedIdentity(identity.clone()))
-}
-
-fn mark_snapshot(world: &mut World, entity: Entity) {
-    world.entity_mut(entity).insert(HasSnapshot(true));
-    world
-        .get_mut::<DatasetRevision>(entity)
-        .expect("validated Dataset must have a revision")
-        .0 += 1;
+    history.push_back(value);
 }
 
 #[cfg(test)]
@@ -1512,13 +920,104 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_queue_assigns_ids_and_keeps_typed_refresh_data() {
+        let mut queue = GitRequestQueue::default();
+        let repository = Entity::from_bits(42);
+        let first = queue.enqueue(GitCommandData {
+            repository_dataset: repository,
+            cwd: PathBuf::from("/repo"),
+            command: GitCommand::LoadRepository,
+        });
+        let second = queue.enqueue_with_refresh(
+            GitCommandData {
+                repository_dataset: repository,
+                cwd: PathBuf::from("/repo"),
+                command: GitCommand::Reset {
+                    target: pitui_core::CommitHash("abc".into()),
+                    mode: pitui_core::ResetMode::Mixed,
+                },
+            },
+            GitRefreshPlan::new([
+                GitRefreshTarget::Repository,
+                GitRefreshTarget::Repository,
+                GitRefreshTarget::WorkingTree,
+            ]),
+        );
+
+        assert_eq!(first, GitRequestId(1));
+        assert_eq!(second, GitRequestId(2));
+        let correlated = queue.enqueue_correlated(
+            GitCommandData {
+                repository_dataset: repository,
+                cwd: PathBuf::from("/repo"),
+                command: GitCommand::LoadWorkingTree,
+            },
+            second,
+            true,
+        );
+        assert_eq!(correlated, GitRequestId(3));
+        let jobs = queue.take_pending();
+        assert_eq!(jobs[0].correlation_id, first);
+        assert_eq!(jobs[1].correlation_id, second);
+        assert_eq!(jobs[2].correlation_id, second);
+        assert!(jobs[2].tracks_outcome);
+        assert_eq!(
+            jobs[0].load_key.as_ref().unwrap().target,
+            GitLoadTarget::Repository
+        );
+        assert_eq!(
+            jobs[1].refresh_after_apply.0,
+            vec![GitRefreshTarget::Repository, GitRefreshTarget::WorkingTree,]
+        );
+    }
+
+    #[test]
+    fn load_tracker_executes_only_the_latest_request_and_bounds_completed_state() {
+        let key = GitLoadKey {
+            repository_dataset: Entity::from_bits(7),
+            target: GitLoadTarget::WorkingTree,
+        };
+        let other = GitLoadKey {
+            repository_dataset: Entity::from_bits(7),
+            target: GitLoadTarget::Reflog,
+        };
+        let mut tracker = GitLoadTracker::default();
+        tracker.queue(key.clone(), GitRequestId(1));
+        tracker.queue(key.clone(), GitRequestId(2));
+        assert!(!tracker.start_if_current(&key, GitRequestId(1)));
+        assert!(tracker.start_if_current(&key, GitRequestId(2)));
+        tracker.complete(
+            key.clone(),
+            GitLoadStatus::Ready {
+                request_id: GitRequestId(2),
+            },
+            1,
+        );
+        tracker.queue(other.clone(), GitRequestId(3));
+        tracker.complete(
+            other.clone(),
+            GitLoadStatus::Ready {
+                request_id: GitRequestId(3),
+            },
+            1,
+        );
+        assert!(tracker.get(&key).is_none());
+        assert_eq!(
+            tracker.get(&other),
+            Some(&GitLoadStatus::Ready {
+                request_id: GitRequestId(3),
+            })
+        );
+    }
+
+    #[test]
     fn formats_log_timestamps_as_stable_utc_rfc3339() {
         assert_eq!(
-            format_system_time_utc(UNIX_EPOCH),
+            logging::format_system_time_utc(UNIX_EPOCH),
             "1970-01-01T00:00:00.000Z"
         );
         assert_eq!(
-            format_system_time_utc(
+            logging::format_system_time_utc(
                 UNIX_EPOCH + Duration::from_secs(946_684_800) + Duration::from_millis(123)
             ),
             "2000-01-01T00:00:00.123Z"

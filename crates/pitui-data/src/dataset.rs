@@ -151,3 +151,16 @@ impl DatasetIndex {
 /// additional runtime roots and are intentionally stored in their own data.
 #[derive(Resource, Clone, Debug, Default, Eq, PartialEq)]
 pub struct DatasetRoots(pub Vec<Entity>);
+
+/// Derived reverse edge index for the canonical `DatasetChildren` DAG. The
+/// ownership source remains the child list; this index lets dirty propagation
+/// and diagnostics reach every ancestor without repeatedly scanning the full
+/// World after each snapshot relation update.
+#[derive(Resource, Clone, Debug, Default, Eq, PartialEq)]
+pub struct DatasetParents(pub HashMap<Entity, Vec<Entity>>);
+
+impl DatasetParents {
+    pub fn parents(&self, child: Entity) -> &[Entity] {
+        self.0.get(&child).map_or(&[], Vec::as_slice)
+    }
+}

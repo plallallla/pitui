@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use bevy_ecs::prelude::{Entity, Message, Resource};
 
 use crate::{
-    AvailabilityRuleId, CommandId, DatasetKind, OperationId, RenderBindingId,
+    AvailabilityRuleId, CommandId, DatasetIdentity, DatasetKind, OperationId, RenderBindingId,
     ResolvedOperationSetId,
 };
 
@@ -316,6 +316,22 @@ pub struct OperationInvocation {
     pub command: CommandId,
     pub source_dataset: Entity,
     pub targets: Vec<Entity>,
+    pub source: InvocationSource,
+}
+
+/// An invocation retained across Context transitions without keeping
+/// generation-local ECS entity handles alive.
+///
+/// Input dispatch uses [`OperationInvocation`] because it is consumed in the
+/// same schedule. Palettes and confirmations can outlive snapshot replacement,
+/// so they retain canonical Dataset identities and resolve them immediately
+/// before execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StableOperationInvocation {
+    pub operation: OperationId,
+    pub command: CommandId,
+    pub source_dataset: DatasetIdentity,
+    pub targets: Vec<DatasetIdentity>,
     pub source: InvocationSource,
 }
 

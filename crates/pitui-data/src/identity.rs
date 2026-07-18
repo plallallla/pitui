@@ -107,7 +107,7 @@ pub enum DatasetIdentity {
         repository: RepositoryKey,
         name: String,
     },
-    GlobalChanges,
+    Changes(RepositoryKey),
     WorkingTreeFiles {
         repository: RepositoryKey,
         boundary: ChangeBoundary,
@@ -207,7 +207,7 @@ impl DatasetIdentity {
             }
             Self::File { .. } => DatasetKind::File,
             Self::FileChanges { .. } => DatasetKind::FileChanges,
-            Self::GlobalChanges => DatasetKind::Changes,
+            Self::Changes(_) => DatasetKind::Changes,
             Self::WorkingTreeFiles { .. } => DatasetKind::WorkingTreeFiles,
             Self::WorkingTreeFile { .. } => DatasetKind::WorkingTreeFile,
             Self::WorkingTreeFileChanges { .. } => DatasetKind::WorkingTreeFileChanges,

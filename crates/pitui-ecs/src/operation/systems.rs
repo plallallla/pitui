@@ -4,13 +4,23 @@
 
 use super::*;
 
+mod changes;
+mod copy;
+mod reset;
+mod viewport;
+
+pub use changes::*;
+pub use copy::*;
+pub use reset::*;
+pub use viewport::*;
+
 #[derive(Resource, Clone, Debug, Default)]
-pub struct PendingChangesActiveRelay(Option<ChangesActiveRelayRequest>);
+pub struct PendingChangesActiveRelays(VecDeque<ChangesActiveRelayRequest>);
 
 #[derive(Clone, Debug)]
 struct ChangesActiveRelayRequest {
     mutation: GitCommand,
-    success_index: usize,
+    request_id: GitRequestId,
     changes_revision: u64,
     target: ChangesActiveTarget,
     context: ChangesActiveContext,
@@ -88,11 +98,13 @@ pub fn open_help(
     OperationExecution::Completed
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn open_command_palette(
     In(_invocation): In<OperationInvocation>,
     context: Res<ActiveUiContext>,
     operations: Res<ResolvedOperationSet>,
     index: Res<DatasetIndex>,
+    keys: Query<&DatasetKey>,
     dataset_states: Query<(&DatasetActiveElement, &DatasetSelection)>,
     mut contexts: Query<&mut InteractionContextMetadata>,
     mut transitions: MessageWriter<ContextTransitionRequest>,
@@ -109,16 +121,21 @@ pub fn open_command_palette(
                 .iter()
                 .find(|operation| &operation.id == operation_id)?;
             let targets = resolve_operation_targets(operation, &context, &dataset_states)?;
-            Some(PaletteCommandEntry {
-                name: name.clone(),
-                label: operation.label.clone(),
-                invocation: OperationInvocation {
+            let invocation = stabilize_operation_invocation(
+                OperationInvocation {
                     operation: operation.id.clone(),
                     command: operation.command.clone(),
                     source_dataset: context.active_dataset,
                     targets,
                     source: InvocationSource::CommandPalette,
                 },
+                &keys,
+            )
+            .ok()?;
+            Some(PaletteCommandEntry {
+                name: name.clone(),
+                label: operation.label.clone(),
+                invocation,
             })
         })
         .collect::<Vec<_>>();
@@ -137,49 +154,92 @@ pub fn open_command_palette(
 
 pub fn open_changes(
     In(_invocation): In<OperationInvocation>,
-    context: Res<ActiveUiContext>,
-    index: Res<DatasetIndex>,
-    repositories: Query<&RepositoryMetadata>,
-    mut git: MessageWriter<GitCommandData>,
-    mut transitions: MessageWriter<ContextTransitionRequest>,
+    world: &mut World,
 ) -> OperationExecution {
-    let Some(changes) = index.get(&DatasetIdentity::GlobalChanges) else {
-        return OperationExecution::Rejected("global Changes Dataset is unavailable".into());
+    let Some(context) = world.get_resource::<ActiveUiContext>().cloned() else {
+        return OperationExecution::Rejected("active UI Context is unavailable".into());
     };
-    if context.active_dataset == changes {
-        return OperationExecution::Rejected("Changes is already active".into());
-    }
     let Some(repository) = context
         .render_bindings
         .get(&pitui_data::RenderBindingId::CurrentRepository)
     else {
         return OperationExecution::Rejected("no current Repository for Changes".into());
     };
-    let Ok(metadata) = repositories.get(repository) else {
+    let Some(metadata) = world.get::<RepositoryMetadata>(repository).cloned() else {
         return OperationExecution::Rejected("current Repository metadata is unavailable".into());
     };
-    git.write(GitCommandData {
-        repository_dataset: repository,
-        cwd: metadata.0.root.clone(),
-        command: GitCommand::LoadRepository,
-    });
-    git.write(GitCommandData {
-        repository_dataset: repository,
-        cwd: metadata.0.root.clone(),
-        command: GitCommand::LoadWorkingTree,
-    });
+    let Some(DatasetIdentity::Repository(repository_key)) =
+        world.get::<DatasetKey>(repository).map(|key| &key.0)
+    else {
+        return OperationExecution::Rejected("current Repository identity is unavailable".into());
+    };
+    let identity = DatasetIdentity::Changes(repository_key.clone());
+    if world
+        .get::<DatasetKey>(context.active_dataset)
+        .is_some_and(|key| key.0 == identity)
+    {
+        return OperationExecution::Rejected("Changes is already active".into());
+    }
+    let Some(template) = world
+        .resource::<DefaultDatasetTemplates>()
+        .get(pitui_data::DatasetKind::Changes)
+        .cloned()
+    else {
+        return OperationExecution::Rejected(
+            "default Changes Dataset template is unavailable".into(),
+        );
+    };
+    let changes = match ensure_dataset_in_world(
+        world,
+        identity,
+        pitui_data::DatasetKind::Changes,
+        template,
+    ) {
+        Ok(entity) => entity,
+        Err(error) => {
+            return OperationExecution::Rejected(format!(
+                "cannot create Changes Dataset: {error:?}"
+            ));
+        }
+    };
+    if !world
+        .resource::<pitui_data::DatasetRoots>()
+        .0
+        .contains(&changes)
+    {
+        world
+            .resource_mut::<pitui_data::DatasetRoots>()
+            .0
+            .push(changes);
+    }
+    world
+        .resource_mut::<GitRequestQueue>()
+        .enqueue(GitCommandData {
+            repository_dataset: repository,
+            cwd: metadata.0.root.clone(),
+            command: GitCommand::LoadRepository,
+        });
+    world
+        .resource_mut::<GitRequestQueue>()
+        .enqueue(GitCommandData {
+            repository_dataset: repository,
+            cwd: metadata.0.root.clone(),
+            command: GitCommand::LoadWorkingTree,
+        });
     let mut bindings = context.render_bindings.clone();
     bindings.bind(pitui_data::RenderBindingId::Changes, changes);
     bindings.unbind(&pitui_data::RenderBindingId::CurrentChangesFileChanges);
-    transitions.write(ContextTransitionRequest::Push {
-        active_dataset: changes,
-        render_mode: RenderModeId::from("changes.unified"),
-        render_bindings: bindings,
-    });
+    world
+        .resource_mut::<Messages<ContextTransitionRequest>>()
+        .write(ContextTransitionRequest::Push {
+            active_dataset: changes,
+            render_mode: RenderModeId::from("changes.unified"),
+            render_bindings: bindings,
+        });
     OperationExecution::Completed
 }
 
-/// Opens the repository-scoped Reflog Dataset and queues its synchronous Git
+/// Opens the repository-scoped Reflog Dataset and queues its Git
 /// snapshot refresh. Dataset creation, Git execution and the context change are
 /// all represented as World data; no renderer is called from this operation.
 pub fn open_reflog(
@@ -240,8 +300,8 @@ pub fn open_reflog(
         bindings.unbind(&pitui_data::RenderBindingId::CurrentReflogEntry);
     }
     world
-        .resource_mut::<Messages<GitCommandData>>()
-        .write(GitCommandData {
+        .resource_mut::<GitRequestQueue>()
+        .enqueue(GitCommandData {
             repository_dataset: repository_entity,
             cwd: repository.0.root,
             command: GitCommand::LoadReflog { limit: 500 },
@@ -297,7 +357,7 @@ pub fn refresh_active_context(
     repositories: Query<&RepositoryMetadata>,
     files: Query<&pitui_data::FileMetadata>,
     working_files: Query<&WorkingTreeFileMetadata>,
-    mut git: MessageWriter<GitCommandData>,
+    mut git: ResMut<GitRequestQueue>,
 ) -> OperationExecution {
     let Some(repository) = context
         .render_bindings
@@ -309,7 +369,7 @@ pub fn refresh_active_context(
         return OperationExecution::Rejected("current Repository metadata is unavailable".into());
     };
     let cwd = metadata.0.root.clone();
-    git.write(GitCommandData {
+    git.enqueue(GitCommandData {
         repository_dataset: repository,
         cwd: cwd.clone(),
         command: GitCommand::LoadRepository,
@@ -323,7 +383,7 @@ pub fn refresh_active_context(
             | pitui_data::DatasetKind::WorkingTreeFile
             | pitui_data::DatasetKind::WorkingTreeFileChanges,
         ) => {
-            git.write(GitCommandData {
+            git.enqueue(GitCommandData {
                 repository_dataset: repository,
                 cwd: cwd.clone(),
                 command: GitCommand::LoadWorkingTree,
@@ -333,7 +393,7 @@ pub fn refresh_active_context(
             if let Ok(DatasetKey(DatasetIdentity::Commits { branch, .. })) =
                 keys.get(context.active_dataset)
             {
-                git.write(GitCommandData {
+                git.enqueue(GitCommandData {
                     repository_dataset: repository,
                     cwd: cwd.clone(),
                     command: GitCommand::LoadCommits {
@@ -344,20 +404,20 @@ pub fn refresh_active_context(
             }
         }
         Some(pitui_data::DatasetKind::Reflog) => {
-            git.write(GitCommandData {
+            git.enqueue(GitCommandData {
                 repository_dataset: repository,
                 cwd: cwd.clone(),
                 command: GitCommand::LoadReflog { limit: 500 },
             });
         }
         _ => {
-            git.write(GitCommandData {
+            git.enqueue(GitCommandData {
                 repository_dataset: repository,
                 cwd: cwd.clone(),
                 command: GitCommand::LoadBranches,
             });
             if let Some(branch) = &metadata.0.current_branch {
-                git.write(GitCommandData {
+                git.enqueue(GitCommandData {
                     repository_dataset: repository,
                     cwd: cwd.clone(),
                     command: GitCommand::LoadCommits {
@@ -374,7 +434,7 @@ pub fn refresh_active_context(
         .get(&pitui_data::RenderBindingId::CurrentCommit)
         && let Ok(DatasetKey(DatasetIdentity::Commit { hash, .. })) = keys.get(commit)
     {
-        git.write(GitCommandData {
+        git.enqueue(GitCommandData {
             repository_dataset: repository,
             cwd: cwd.clone(),
             command: GitCommand::LoadCommitDetail {
@@ -404,7 +464,7 @@ fn enqueue_current_file_diff(
     keys: &Query<&DatasetKey>,
     files: &Query<&pitui_data::FileMetadata>,
     working_files: &Query<&WorkingTreeFileMetadata>,
-    git: &mut MessageWriter<GitCommandData>,
+    git: &mut GitRequestQueue,
 ) {
     if let Some(diff) = context
         .render_bindings
@@ -420,7 +480,7 @@ fn enqueue_current_file_diff(
             commit: commit.clone(),
             path: path.clone(),
         });
-        git.write(GitCommandData {
+        git.enqueue(GitCommandData {
             repository_dataset: repository_entity,
             cwd: cwd.into(),
             command: GitCommand::LoadFileDiff {
@@ -447,7 +507,7 @@ fn enqueue_current_file_diff(
             path: path.clone(),
         });
         let metadata = file.and_then(|file| working_files.get(file).ok());
-        git.write(GitCommandData {
+        git.enqueue(GitCommandData {
             repository_dataset: repository_entity,
             cwd: cwd.into(),
             command: GitCommand::LoadWorkingTreeDiff {
@@ -468,8 +528,8 @@ pub fn close_interaction(
     stack: Res<ContextStack>,
     mut transitions: MessageWriter<ContextTransitionRequest>,
 ) -> OperationExecution {
-    if stack.0.is_empty() {
-        return OperationExecution::Rejected("no previous Context to restore".into());
+    if !stack.top_is(UiContextFrameKind::Overlay) {
+        return OperationExecution::Rejected("no interaction Overlay to close".into());
     }
     transitions.write(ContextTransitionRequest::Pop);
     OperationExecution::Completed
@@ -505,10 +565,14 @@ pub fn confirmation_down(
 
 pub fn submit_confirmation(
     In(invocation): In<OperationInvocation>,
+    stack: Res<ContextStack>,
     contexts: Query<&InteractionContextMetadata>,
-    mut deferred: ResMut<DeferredOperationInvocations>,
+    mut deferred: ResMut<DeferredStableOperationInvocations>,
     mut transitions: MessageWriter<ContextTransitionRequest>,
 ) -> OperationExecution {
+    if !stack.top_is(UiContextFrameKind::Overlay) {
+        return OperationExecution::Rejected("Confirmation has no owning Overlay".into());
+    }
     let Ok(metadata) = contexts.get(invocation.source_dataset) else {
         return OperationExecution::Rejected("Confirmation Context is unavailable".into());
     };
@@ -535,10 +599,14 @@ pub fn submit_confirmation(
 
 pub fn submit_palette_command(
     In(invocation): In<OperationInvocation>,
+    stack: Res<ContextStack>,
     contexts: Query<&InteractionContextMetadata>,
-    mut deferred: ResMut<DeferredOperationInvocations>,
+    mut deferred: ResMut<DeferredStableOperationInvocations>,
     mut transitions: MessageWriter<ContextTransitionRequest>,
 ) -> OperationExecution {
+    if !stack.top_is(UiContextFrameKind::Overlay) {
+        return OperationExecution::Rejected("Command Palette has no owning Overlay".into());
+    }
     let Ok(metadata) = contexts.get(invocation.source_dataset) else {
         return OperationExecution::Rejected("Command Context is unavailable".into());
     };
@@ -664,7 +732,10 @@ pub fn transfer_active_left(
             binding_patch: RenderBindingPatch::default(),
         });
         OperationExecution::Completed
-    } else if !stack.0.is_empty() {
+    } else if matches!(
+        stack.top().map(|frame| frame.kind),
+        Some(UiContextFrameKind::View | UiContextFrameKind::ActiveHandoff { .. })
+    ) {
         transitions.write(ContextTransitionRequest::ActiveReturn {
             previous_active_dataset: context.active_dataset,
             previous_active_kind: kind.0,
@@ -774,6 +845,7 @@ pub fn cycle_collection_view(
     world
         .entity_mut(invocation.source_dataset)
         .insert(DatasetViewState(Some(template.views[next].id.clone())));
+    crate::collection::mark_collection_dirty(world, invocation.source_dataset);
     OperationExecution::Completed
 }
 
@@ -787,7 +859,7 @@ pub fn cherry_pick_selected(
     keys: Query<&DatasetKey>,
     collections: Query<&DatasetCollection>,
     repositories: Query<&RepositoryMetadata>,
-    mut git: MessageWriter<GitCommandData>,
+    mut git: ResMut<GitRequestQueue>,
 ) -> OperationExecution {
     let Ok(DatasetKey(DatasetIdentity::Commits {
         repository: source_repository,
@@ -856,733 +928,29 @@ pub fn cherry_pick_selected(
         );
     };
     let cwd = repository.0.root.clone();
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd: cwd.clone(),
-        command: GitCommand::CherryPick { commits },
-    });
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd: cwd.clone(),
-        command: GitCommand::LoadRepository,
-    });
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd: cwd.clone(),
-        command: GitCommand::LoadBranches,
-    });
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd: cwd.clone(),
-        command: GitCommand::LoadCommits {
+    let mut refresh = vec![
+        GitRefreshTarget::Repository,
+        GitRefreshTarget::Branches,
+        GitRefreshTarget::Commits {
             branch: current_branch.clone(),
             limit: 500,
         },
-    });
+        GitRefreshTarget::WorkingTree,
+    ];
     if source_branch != &current_branch {
-        git.write(GitCommandData {
-            repository_dataset: repository_entity,
-            cwd: cwd.clone(),
-            command: GitCommand::LoadCommits {
-                branch: source_branch.clone(),
-                limit: 500,
-            },
+        refresh.push(GitRefreshTarget::Commits {
+            branch: source_branch.clone(),
+            limit: 500,
         });
     }
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd,
-        command: GitCommand::LoadWorkingTree,
-    });
-    OperationExecution::Completed
-}
-
-pub fn request_hard_reset(
-    In(invocation): In<OperationInvocation>,
-    index: Res<DatasetIndex>,
-    keys: Query<&DatasetKey>,
-    reflog_entries: Query<&ReflogEntryMetadata>,
-    mut contexts: Query<&mut InteractionContextMetadata>,
-    mut transitions: MessageWriter<ContextTransitionRequest>,
-) -> OperationExecution {
-    let Ok((_, target)) = reset_target(&invocation, &keys, &reflog_entries) else {
-        return OperationExecution::Rejected(
-            "hard reset target must be one Commit or Reflog entry".into(),
-        );
-    };
-    let Some(interaction) = index.get(&DatasetIdentity::GlobalInteractionContext) else {
-        return OperationExecution::Rejected("global Interaction Context is unavailable".into());
-    };
-    let Ok(mut metadata) = contexts.get_mut(interaction) else {
-        return OperationExecution::Rejected("Interaction Context has no metadata".into());
-    };
-    let mut confirmed = invocation;
-    confirmed.operation = OperationId::from("reset.hard.confirmed");
-    confirmed.command = CommandId::from("reset.hard.confirmed");
-    metadata.kind = InteractionContextKind::Confirmation {
-        title: "Confirm hard reset".into(),
-        prompt: format!(
-            "Reset HEAD to {} and permanently discard tracked index/worktree changes?",
-            target.short()
-        ),
-        options: vec!["Cancel".into(), "Reset --hard".into()],
-        selected: 0,
-        pending: Box::new(confirmed),
-    };
-    request_interaction_overlay(interaction, &mut transitions);
-    OperationExecution::Completed
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn reset_soft(
-    In(invocation): In<OperationInvocation>,
-    context: Res<ActiveUiContext>,
-    keys: Query<&DatasetKey>,
-    reflog_entries: Query<&ReflogEntryMetadata>,
-    repositories: Query<&RepositoryMetadata>,
-    mut git: MessageWriter<GitCommandData>,
-) -> OperationExecution {
-    reset_to_target(
-        invocation,
-        ResetMode::Soft,
-        &context,
-        &keys,
-        &reflog_entries,
-        &repositories,
-        &mut git,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn reset_mixed(
-    In(invocation): In<OperationInvocation>,
-    context: Res<ActiveUiContext>,
-    keys: Query<&DatasetKey>,
-    reflog_entries: Query<&ReflogEntryMetadata>,
-    repositories: Query<&RepositoryMetadata>,
-    mut git: MessageWriter<GitCommandData>,
-) -> OperationExecution {
-    reset_to_target(
-        invocation,
-        ResetMode::Mixed,
-        &context,
-        &keys,
-        &reflog_entries,
-        &repositories,
-        &mut git,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn reset_hard_confirmed(
-    In(invocation): In<OperationInvocation>,
-    context: Res<ActiveUiContext>,
-    keys: Query<&DatasetKey>,
-    reflog_entries: Query<&ReflogEntryMetadata>,
-    repositories: Query<&RepositoryMetadata>,
-    mut git: MessageWriter<GitCommandData>,
-) -> OperationExecution {
-    reset_to_target(
-        invocation,
-        ResetMode::Hard,
-        &context,
-        &keys,
-        &reflog_entries,
-        &repositories,
-        &mut git,
-    )
-}
-
-fn reset_target(
-    invocation: &OperationInvocation,
-    keys: &Query<&DatasetKey>,
-    reflog_entries: &Query<&ReflogEntryMetadata>,
-) -> Result<(pitui_data::RepositoryKey, CommitHash), String> {
-    let [target] = invocation.targets.as_slice() else {
-        return Err("reset requires exactly one target".into());
-    };
-    match keys.get(*target).map(|key| &key.0) {
-        Ok(DatasetIdentity::Commit { repository, hash }) => Ok((repository.clone(), hash.clone())),
-        Ok(DatasetIdentity::ReflogEntry { repository, .. }) => {
-            let metadata = reflog_entries
-                .get(*target)
-                .map_err(|_| "Reflog target metadata is unavailable".to_owned())?;
-            Ok((repository.clone(), metadata.0.hash.clone()))
-        }
-        _ => Err("reset target is not a Commit or Reflog entry Dataset".into()),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn reset_to_target(
-    invocation: OperationInvocation,
-    mode: ResetMode,
-    context: &ActiveUiContext,
-    keys: &Query<&DatasetKey>,
-    reflog_entries: &Query<&ReflogEntryMetadata>,
-    repositories: &Query<&RepositoryMetadata>,
-    git: &mut MessageWriter<GitCommandData>,
-) -> OperationExecution {
-    let (target_repository, target) = match reset_target(&invocation, keys, reflog_entries) {
-        Ok(target) => target,
-        Err(error) => return OperationExecution::Rejected(error),
-    };
-    let Some(repository_entity) = context
-        .render_bindings
-        .get(&pitui_data::RenderBindingId::CurrentRepository)
-    else {
-        return OperationExecution::Rejected("current Repository binding is unavailable".into());
-    };
-    if !matches!(
-        keys.get(repository_entity).map(|key| &key.0),
-        Ok(DatasetIdentity::Repository(repository)) if repository == &target_repository
-    ) {
-        return OperationExecution::Rejected(
-            "reset target does not belong to the current Repository".into(),
-        );
-    }
-    let Ok(repository) = repositories.get(repository_entity) else {
-        return OperationExecution::Rejected("current Repository metadata is unavailable".into());
-    };
-    let source_branch = match keys.get(invocation.source_dataset).map(|key| &key.0) {
-        Ok(DatasetIdentity::Commits { repository, branch }) if repository == &target_repository => {
-            Some(branch.clone())
-        }
-        _ => None,
-    };
-    let current_branch = repository.0.current_branch.clone();
-    let cwd = repository.0.root.clone();
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd: cwd.clone(),
-        command: GitCommand::Reset { target, mode },
-    });
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd: cwd.clone(),
-        command: GitCommand::LoadRepository,
-    });
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd: cwd.clone(),
-        command: GitCommand::LoadBranches,
-    });
-    if let Some(current_branch) = &current_branch {
-        git.write(GitCommandData {
-            repository_dataset: repository_entity,
-            cwd: cwd.clone(),
-            command: GitCommand::LoadCommits {
-                branch: current_branch.clone(),
-                limit: 500,
-            },
-        });
-    }
-    if let Some(source_branch) = source_branch
-        && current_branch.as_ref() != Some(&source_branch)
-    {
-        git.write(GitCommandData {
-            repository_dataset: repository_entity,
-            cwd: cwd.clone(),
-            command: GitCommand::LoadCommits {
-                branch: source_branch,
-                limit: 500,
-            },
-        });
-    }
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd: cwd.clone(),
-        command: GitCommand::LoadWorkingTree,
-    });
-    if context
-        .render_bindings
-        .get(&pitui_data::RenderBindingId::CurrentReflog)
-        .is_some()
-    {
-        git.write(GitCommandData {
+    git.enqueue_with_refresh(
+        GitCommandData {
             repository_dataset: repository_entity,
             cwd,
-            command: GitCommand::LoadReflog { limit: 500 },
-        });
-    }
-    OperationExecution::Completed
-}
-
-pub fn toggle_changes_selection(
-    In(invocation): In<OperationInvocation>,
-    world: &mut World,
-) -> OperationExecution {
-    let Some(changes) = world.get_resource::<ActiveUiContext>().and_then(|context| {
-        context
-            .render_bindings
-            .get(&pitui_data::RenderBindingId::Changes)
-    }) else {
-        return OperationExecution::Rejected("Changes binding is unavailable".into());
-    };
-    if invocation.targets.iter().any(|target| {
-        !matches!(
-            world.get::<DatasetKey>(*target).map(|key| &key.0),
-            Some(
-                DatasetIdentity::WorkingTreeFiles { .. }
-                    | DatasetIdentity::WorkingTreeFile { .. }
-                    | DatasetIdentity::WorkingTreeDirectory { .. }
-            )
-        )
-    }) {
-        return OperationExecution::Rejected(
-            "only working-tree groups, files and directories can be selected".into(),
-        );
-    }
-    crate::collection::toggle_selection(world, changes, &invocation.targets)
-        .map_or_else(OperationExecution::Rejected, |()| {
-            OperationExecution::Completed
-        })
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn stage_changes(
-    In(invocation): In<OperationInvocation>,
-    context: Res<ActiveUiContext>,
-    keys: Query<&DatasetKey>,
-    children: Query<&DatasetChildren>,
-    repositories: Query<&RepositoryMetadata>,
-    revisions: Query<&DatasetRevision>,
-    successes: Res<GitMutationSuccesses>,
-    mut pending_relay: ResMut<PendingChangesActiveRelay>,
-    mut git: MessageWriter<GitCommandData>,
-) -> OperationExecution {
-    mutate_working_tree_paths(
-        invocation,
-        ChangeBoundary::Unstaged,
-        |paths| GitCommand::StagePaths { paths },
-        &context,
-        &keys,
-        &children,
-        &repositories,
-        &revisions,
-        &successes,
-        &mut pending_relay,
-        &mut git,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn unstage_changes(
-    In(invocation): In<OperationInvocation>,
-    context: Res<ActiveUiContext>,
-    keys: Query<&DatasetKey>,
-    children: Query<&DatasetChildren>,
-    repositories: Query<&RepositoryMetadata>,
-    revisions: Query<&DatasetRevision>,
-    successes: Res<GitMutationSuccesses>,
-    mut pending_relay: ResMut<PendingChangesActiveRelay>,
-    mut git: MessageWriter<GitCommandData>,
-) -> OperationExecution {
-    mutate_working_tree_paths(
-        invocation,
-        ChangeBoundary::Staged,
-        |paths| GitCommand::UnstagePaths { paths },
-        &context,
-        &keys,
-        &children,
-        &repositories,
-        &revisions,
-        &successes,
-        &mut pending_relay,
-        &mut git,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn mutate_working_tree_paths(
-    invocation: OperationInvocation,
-    expected_boundary: ChangeBoundary,
-    command: impl FnOnce(Vec<pitui_core::GitPath>) -> GitCommand,
-    context: &ActiveUiContext,
-    keys: &Query<&DatasetKey>,
-    children: &Query<&DatasetChildren>,
-    repositories: &Query<&RepositoryMetadata>,
-    revisions: &Query<&DatasetRevision>,
-    successes: &GitMutationSuccesses,
-    pending_relay: &mut PendingChangesActiveRelay,
-    git: &mut MessageWriter<GitCommandData>,
-) -> OperationExecution {
-    let Some(repository_entity) = context
-        .render_bindings
-        .get(&pitui_data::RenderBindingId::CurrentRepository)
-    else {
-        return OperationExecution::Rejected("current Repository binding is unavailable".into());
-    };
-    let Ok(repository_metadata) = repositories.get(repository_entity) else {
-        return OperationExecution::Rejected("current Repository metadata is unavailable".into());
-    };
-    let Ok(DatasetKey(DatasetIdentity::Repository(repository_key))) = keys.get(repository_entity)
-    else {
-        return OperationExecution::Rejected("current Repository identity is unavailable".into());
-    };
-
-    let mut seen = HashSet::new();
-    let mut paths = Vec::with_capacity(invocation.targets.len());
-    for target in &invocation.targets {
-        if let Err(error) = collect_working_tree_paths(
-            *target,
-            repository_key,
-            expected_boundary,
-            keys,
-            children,
-            &mut seen,
-            &mut paths,
-        ) {
-            return OperationExecution::Rejected(error);
-        }
-    }
-    if paths.is_empty() {
-        return OperationExecution::Rejected("no working-tree files were selected".into());
-    }
-
-    let Some(changes) = context
-        .render_bindings
-        .get(&pitui_data::RenderBindingId::Changes)
-    else {
-        return OperationExecution::Rejected("Changes binding is unavailable".into());
-    };
-    let Ok(changes_revision) = revisions.get(changes) else {
-        return OperationExecution::Rejected("Changes revision is unavailable".into());
-    };
-
-    let active_path = paths[0].clone();
-    let mutation = command(paths);
-    pending_relay.0 = Some(ChangesActiveRelayRequest {
-        mutation: mutation.clone(),
-        success_index: successes.0.len(),
-        changes_revision: changes_revision.0,
-        target: ChangesActiveTarget::Exact {
-            repository: repository_key.clone(),
-            path: active_path,
-            boundary: match expected_boundary {
-                ChangeBoundary::Staged => ChangeBoundary::Unstaged,
-                ChangeBoundary::Unstaged => ChangeBoundary::Staged,
-            },
+            command: GitCommand::CherryPick { commits },
         },
-        context: ChangesActiveContext::Active,
-        preserve_diff_active: context
-            .render_bindings
-            .get(&pitui_data::RenderBindingId::CurrentChangesFileChanges)
-            == Some(context.active_dataset),
-    });
-
-    let cwd = repository_metadata.0.root.clone();
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd: cwd.clone(),
-        command: mutation,
-    });
-    // The synchronous executor processes this message batch in order, so the
-    // read snapshots observe the mutation while Dataset replacement remains in
-    // the common Git result/apply path.
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd: cwd.clone(),
-        command: GitCommand::LoadRepository,
-    });
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd,
-        command: GitCommand::LoadWorkingTree,
-    });
-    OperationExecution::Completed
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_working_tree_paths(
-    target: Entity,
-    expected_repository: &pitui_data::RepositoryKey,
-    expected_boundary: ChangeBoundary,
-    keys: &Query<&DatasetKey>,
-    children: &Query<&DatasetChildren>,
-    seen: &mut HashSet<pitui_core::GitPath>,
-    paths: &mut Vec<pitui_core::GitPath>,
-) -> Result<(), String> {
-    match keys.get(target).map(|key| &key.0) {
-        Ok(DatasetIdentity::WorkingTreeFile {
-            repository,
-            boundary,
-            path,
-        }) => {
-            validate_working_tree_target(
-                repository,
-                *boundary,
-                expected_repository,
-                expected_boundary,
-            )?;
-            if seen.insert(path.clone()) {
-                paths.push(path.clone());
-            }
-            Ok(())
-        }
-        Ok(
-            DatasetIdentity::WorkingTreeFiles {
-                repository,
-                boundary,
-            }
-            | DatasetIdentity::WorkingTreeDirectory {
-                repository,
-                boundary,
-                ..
-            },
-        ) => {
-            validate_working_tree_target(
-                repository,
-                *boundary,
-                expected_repository,
-                expected_boundary,
-            )?;
-            let directory_children = children
-                .get(target)
-                .map_err(|_| "working-tree group contents are unavailable".to_owned())?;
-            for child in &directory_children.0 {
-                collect_working_tree_paths(
-                    *child,
-                    expected_repository,
-                    expected_boundary,
-                    keys,
-                    children,
-                    seen,
-                    paths,
-                )?;
-            }
-            Ok(())
-        }
-        _ => Err("target is not a working-tree group, file or directory Dataset".into()),
-    }
-}
-
-fn validate_working_tree_target(
-    repository: &pitui_data::RepositoryKey,
-    boundary: ChangeBoundary,
-    expected_repository: &pitui_data::RepositoryKey,
-    expected_boundary: ChangeBoundary,
-) -> Result<(), String> {
-    if repository != expected_repository {
-        return Err("working-tree target belongs to a different Repository".into());
-    }
-    if boundary != expected_boundary {
-        return Err(format!(
-            "working-tree target has the wrong change boundary: expected {expected_boundary:?}"
-        ));
-    }
-    Ok(())
-}
-
-pub fn reconcile_pending_changes_active(world: &mut World) {
-    let request = world.resource_mut::<PendingChangesActiveRelay>().0.take();
-    let Some(request) = request else {
-        return;
-    };
-    let mutation_succeeded = world
-        .resource::<GitMutationSuccesses>()
-        .0
-        .get(request.success_index)
-        .is_some_and(|success| success.command == request.mutation);
-    if !mutation_succeeded {
-        return;
-    }
-
-    let Some(changes) = world
-        .resource::<DatasetIndex>()
-        .get(&DatasetIdentity::GlobalChanges)
-    else {
-        return;
-    };
-    if world
-        .get::<DatasetRevision>(changes)
-        .is_none_or(|revision| revision.0 <= request.changes_revision)
-    {
-        return;
-    }
-    // A successful mutation replaces the selected boundary snapshot. Clear the
-    // old selection before relaying Active; otherwise the persistent empty
-    // Staged/Unstaged group would remain selected and create mixed-boundary
-    // targets on the next operation.
-    if let Some(mut selection) = world.get_mut::<DatasetSelection>(changes) {
-        selection.0.clear();
-    }
-    let Some(collection) = world.get::<DatasetCollection>(changes) else {
-        return;
-    };
-    let may_be_empty = matches!(&request.target, ChangesActiveTarget::FirstRemainingFile);
-    let file = match request.target {
-        ChangesActiveTarget::Exact {
-            repository,
-            path,
-            boundary,
-        } => world
-            .resource::<DatasetIndex>()
-            .get(&DatasetIdentity::WorkingTreeFile {
-                repository,
-                boundary,
-                path,
-            })
-            .filter(|file| collection.contains(*file)),
-        ChangesActiveTarget::FirstRemainingFile => collection.entities().find(|row| {
-            matches!(
-                world.get::<DatasetKey>(*row).map(|key| &key.0),
-                Some(DatasetIdentity::WorkingTreeFile { .. })
-            )
-        }),
-    };
-    let Some(file) = file else {
-        if may_be_empty {
-            match request.context {
-                ChangesActiveContext::Active => {
-                    if let Some(mut context) = world.get_resource_mut::<ActiveUiContext>() {
-                        context
-                            .render_bindings
-                            .unbind(&pitui_data::RenderBindingId::CurrentChangesFileChanges);
-                        context.active_dataset = changes;
-                        context.generation = context.generation.wrapping_add(1);
-                    }
-                }
-                ChangesActiveContext::Previous => {
-                    let mut stack = world.resource_mut::<ContextStack>();
-                    if let Some(snapshot) = stack.0.last_mut() {
-                        snapshot
-                            .render_bindings
-                            .unbind(&pitui_data::RenderBindingId::CurrentChangesFileChanges);
-                        snapshot.active_dataset = changes;
-                    }
-                }
-            }
-        }
-        return;
-    };
-    if let Some(mut active) = world.get_mut::<DatasetActiveElement>(changes) {
-        active.0 = Some(file);
-    }
-
-    let Some(diff) = world
-        .get::<pitui_data::DatasetChildren>(file)
-        .and_then(|children| children.0.first().copied())
-    else {
-        return;
-    };
-    match request.context {
-        ChangesActiveContext::Active => {
-            let Some(mut context) = world.get_resource_mut::<ActiveUiContext>() else {
-                return;
-            };
-            context
-                .render_bindings
-                .bind(pitui_data::RenderBindingId::CurrentChangesFileChanges, diff);
-            if request.preserve_diff_active {
-                context.active_dataset = diff;
-            }
-            context.generation = context.generation.wrapping_add(1);
-        }
-        ChangesActiveContext::Previous => {
-            let mut stack = world.resource_mut::<ContextStack>();
-            let Some(snapshot) = stack.0.last_mut() else {
-                return;
-            };
-            snapshot
-                .render_bindings
-                .bind(pitui_data::RenderBindingId::CurrentChangesFileChanges, diff);
-            if request.preserve_diff_active {
-                snapshot.active_dataset = diff;
-            }
-        }
-    }
-}
-
-pub fn open_commit_creation(
-    In(_invocation): In<OperationInvocation>,
-    world: &mut World,
-) -> OperationExecution {
-    let Some(context) = world.get_resource::<ActiveUiContext>().cloned() else {
-        return OperationExecution::Rejected("active UI Context is unavailable".into());
-    };
-    let Some(repository_entity) = context
-        .render_bindings
-        .get(&pitui_data::RenderBindingId::CurrentRepository)
-    else {
-        return OperationExecution::Rejected("current Repository binding is unavailable".into());
-    };
-    let Some(DatasetIdentity::Repository(repository)) =
-        world.get::<DatasetKey>(repository_entity).map(|key| &key.0)
-    else {
-        return OperationExecution::Rejected("current Repository identity is unavailable".into());
-    };
-    let repository = repository.clone();
-    let Some(changes) = context
-        .render_bindings
-        .get(&pitui_data::RenderBindingId::Changes)
-    else {
-        return OperationExecution::Rejected("Changes binding is unavailable".into());
-    };
-    let Some(revision) = world
-        .get::<DatasetRevision>(changes)
-        .map(|revision| revision.0)
-    else {
-        return OperationExecution::Rejected("Changes revision is unavailable".into());
-    };
-    let staged_paths = world
-        .get::<DatasetCollection>(changes)
-        .map(|collection| {
-            collection
-                .entities()
-                .filter_map(
-                    |entity| match world.get::<DatasetKey>(entity).map(|key| &key.0) {
-                        Some(DatasetIdentity::WorkingTreeFile {
-                            repository: target_repository,
-                            boundary: ChangeBoundary::Staged,
-                            path,
-                        }) if target_repository == &repository => Some(path.clone()),
-                        _ => None,
-                    },
-                )
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if staged_paths.is_empty() {
-        return OperationExecution::Rejected("there are no staged files to commit".into());
-    }
-    let Some(template) = world
-        .resource::<DefaultDatasetTemplates>()
-        .get(pitui_data::DatasetKind::CommitCreation)
-        .cloned()
-    else {
-        return OperationExecution::Rejected(
-            "default Commit Creation Dataset template is unavailable".into(),
-        );
-    };
-    let creation = match ensure_dataset_in_world(
-        world,
-        DatasetIdentity::CommitCreation(repository.clone()),
-        pitui_data::DatasetKind::CommitCreation,
-        template,
-    ) {
-        Ok(entity) => entity,
-        Err(error) => {
-            return OperationExecution::Rejected(format!(
-                "cannot create Commit Creation Dataset: {error:?}"
-            ));
-        }
-    };
-    world.entity_mut(creation).insert(CommitCreationMetadata {
-        repository,
-        message: String::new(),
-        error: None,
-        staged_revision: revision,
-        staged_paths,
-    });
-    world
-        .resource_mut::<Messages<ContextTransitionRequest>>()
-        .write(ContextTransitionRequest::PushOverlay {
-            active_dataset: creation,
-            render_mode: RenderModeId::from("commit-creation-overlay"),
-            proxy: RenderProxyId::from("commit-creation.editor"),
-            constraint: LayoutConstraint::Percentage(75),
-        });
+        GitRefreshPlan::new(refresh),
+    );
     OperationExecution::Completed
 }
 
@@ -1602,115 +970,6 @@ pub fn submit_text_input(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn submit_commit_creation(
-    In(invocation): In<OperationInvocation>,
-    stack: Res<ContextStack>,
-    keys: Query<&DatasetKey>,
-    revisions: Query<&DatasetRevision>,
-    repositories: Query<&RepositoryMetadata>,
-    mut creations: Query<&mut CommitCreationMetadata>,
-    successes: Res<GitMutationSuccesses>,
-    mut pending_relay: ResMut<PendingChangesActiveRelay>,
-    mut git: MessageWriter<GitCommandData>,
-    mut transitions: MessageWriter<ContextTransitionRequest>,
-) -> OperationExecution {
-    let (repository_key, message, staged_revision) = {
-        let Ok(mut creation) = creations.get_mut(invocation.source_dataset) else {
-            return OperationExecution::Rejected("Commit Creation Dataset is unavailable".into());
-        };
-        let message = creation.message.trim();
-        if message.is_empty() {
-            creation.error = Some("Commit message cannot be empty".into());
-            return OperationExecution::Rejected("commit message cannot be empty".into());
-        }
-        (
-            creation.repository.clone(),
-            message.to_owned(),
-            creation.staged_revision,
-        )
-    };
-
-    let Some(previous) = stack.0.last() else {
-        return OperationExecution::Rejected("no Changes Context to restore".into());
-    };
-    let Some(repository_entity) = previous
-        .render_bindings
-        .get(&pitui_data::RenderBindingId::CurrentRepository)
-    else {
-        return OperationExecution::Rejected("current Repository binding is unavailable".into());
-    };
-    if !matches!(
-        keys.get(repository_entity).map(|key| &key.0),
-        Ok(DatasetIdentity::Repository(repository)) if repository == &repository_key
-    ) {
-        return OperationExecution::Rejected(
-            "Commit Creation repository no longer matches the current Repository".into(),
-        );
-    }
-    let Ok(repository) = repositories.get(repository_entity) else {
-        return OperationExecution::Rejected("current Repository metadata is unavailable".into());
-    };
-    let Some(changes) = previous
-        .render_bindings
-        .get(&pitui_data::RenderBindingId::Changes)
-    else {
-        return OperationExecution::Rejected("Changes binding is unavailable".into());
-    };
-    let Ok(changes_revision) = revisions.get(changes) else {
-        return OperationExecution::Rejected("Changes revision is unavailable".into());
-    };
-    if changes_revision.0 != staged_revision {
-        if let Ok(mut creation) = creations.get_mut(invocation.source_dataset) {
-            creation.error = Some("The staged snapshot changed; reopen commit creation".into());
-        }
-        return OperationExecution::Rejected("the staged snapshot changed".into());
-    }
-
-    let cwd = repository.0.root.clone();
-    let current_branch = repository.0.current_branch.clone();
-    let mutation = GitCommand::Commit { message };
-    pending_relay.0 = Some(ChangesActiveRelayRequest {
-        mutation: mutation.clone(),
-        success_index: successes.0.len(),
-        changes_revision: changes_revision.0,
-        target: ChangesActiveTarget::FirstRemainingFile,
-        context: ChangesActiveContext::Previous,
-        preserve_diff_active: previous
-            .render_bindings
-            .get(&pitui_data::RenderBindingId::CurrentChangesFileChanges)
-            == Some(previous.active_dataset),
-    });
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd: cwd.clone(),
-        command: mutation,
-    });
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd: cwd.clone(),
-        command: GitCommand::LoadRepository,
-    });
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd: cwd.clone(),
-        command: GitCommand::LoadBranches,
-    });
-    if let Some(branch) = current_branch {
-        git.write(GitCommandData {
-            repository_dataset: repository_entity,
-            cwd: cwd.clone(),
-            command: GitCommand::LoadCommits { branch, limit: 500 },
-        });
-    }
-    git.write(GitCommandData {
-        repository_dataset: repository_entity,
-        cwd,
-        command: GitCommand::LoadWorkingTree,
-    });
-    transitions.write(ContextTransitionRequest::Pop);
-    OperationExecution::Completed
-}
-
 pub fn navigate_back(
     In(_invocation): In<OperationInvocation>,
     stack: Res<ContextStack>,
@@ -1722,312 +981,6 @@ pub fn navigate_back(
         transitions.write(ContextTransitionRequest::Pop);
         OperationExecution::Completed
     }
-}
-
-pub fn copy_commit_hashes(
-    In(invocation): In<OperationInvocation>,
-    keys: Query<&DatasetKey>,
-    mut clipboard: MessageWriter<ClipboardRequest>,
-) -> OperationExecution {
-    let hashes = invocation
-        .targets
-        .iter()
-        .filter_map(|entity| match keys.get(*entity).ok().map(|key| &key.0) {
-            Some(DatasetIdentity::Commit { hash, .. }) => Some(hash.0.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if hashes.len() != invocation.targets.len() || hashes.is_empty() {
-        return OperationExecution::Rejected("copy hash target is not a Commit Dataset".into());
-    }
-    clipboard.write(ClipboardRequest {
-        kind: ClipboardContentKind::CommitHashes,
-        text: hashes.join("\n"),
-        source_entities: invocation.targets,
-    });
-    OperationExecution::Completed
-}
-
-pub fn copy_reflog_hash(
-    In(invocation): In<OperationInvocation>,
-    entries: Query<&ReflogEntryMetadata>,
-    mut clipboard: MessageWriter<ClipboardRequest>,
-) -> OperationExecution {
-    let Some(target) = invocation.targets.first().copied() else {
-        return OperationExecution::Rejected("no Reflog entry target".into());
-    };
-    let Ok(metadata) = entries.get(target) else {
-        return OperationExecution::Rejected(
-            "copy hash target is not a Reflog entry Dataset".into(),
-        );
-    };
-    clipboard.write(ClipboardRequest {
-        kind: ClipboardContentKind::ReflogHash,
-        text: metadata.0.hash.0.clone(),
-        source_entities: vec![target],
-    });
-    OperationExecution::Completed
-}
-
-pub fn copy_commit_info(
-    In(invocation): In<OperationInvocation>,
-    commits: Query<&CommitMetadata>,
-    mut clipboard: MessageWriter<ClipboardRequest>,
-) -> OperationExecution {
-    let Some(target) = invocation.targets.first().copied() else {
-        return OperationExecution::Rejected("no Commit target".into());
-    };
-    let Ok(metadata) = commits.get(target) else {
-        return OperationExecution::Rejected("copy info target has no Commit metadata".into());
-    };
-    let mut refs = metadata.summary.decorations.clone();
-    if refs.is_empty() && !metadata.tags.is_empty() {
-        refs = metadata.tags.join(", ");
-    }
-    let refs = if refs.is_empty() {
-        String::new()
-    } else {
-        format!("\nRefs: {refs}")
-    };
-    let message = metadata
-        .message
-        .as_deref()
-        .unwrap_or(&metadata.summary.subject);
-    clipboard.write(ClipboardRequest {
-        kind: ClipboardContentKind::CommitInfo,
-        text: format!(
-            "commit {}\nAuthor: {}\nDate:   {}{}\n\n{}",
-            metadata.summary.hash.0,
-            metadata.summary.author,
-            metadata.summary.authored_at,
-            refs,
-            message
-        ),
-        source_entities: vec![target],
-    });
-    OperationExecution::Completed
-}
-
-pub fn copy_commit_message(
-    In(invocation): In<OperationInvocation>,
-    commits: Query<&CommitMetadata>,
-    mut clipboard: MessageWriter<ClipboardRequest>,
-) -> OperationExecution {
-    let Some(target) = invocation.targets.first().copied() else {
-        return OperationExecution::Rejected("no Commit target".into());
-    };
-    let Some(message) = commits
-        .get(target)
-        .ok()
-        .and_then(|metadata| metadata.message.clone())
-    else {
-        return OperationExecution::Rejected("full commit message is not loaded".into());
-    };
-    clipboard.write(ClipboardRequest {
-        kind: ClipboardContentKind::CommitMessage,
-        text: message,
-        source_entities: vec![target],
-    });
-    OperationExecution::Completed
-}
-
-pub fn copy_commit_field_values(
-    In(invocation): In<OperationInvocation>,
-    fields: Query<&CommitFieldMetadata>,
-    mut clipboard: MessageWriter<ClipboardRequest>,
-) -> OperationExecution {
-    let values = invocation
-        .targets
-        .iter()
-        .map(|target| fields.get(*target).cloned())
-        .collect::<Result<Vec<_>, _>>();
-    let Ok(values) = values else {
-        return OperationExecution::Rejected(
-            "copy value target is not a Commit field Dataset".into(),
-        );
-    };
-    if values.is_empty() {
-        return OperationExecution::Rejected("no Commit field target".into());
-    }
-    let text = if values.len() == 1 {
-        values[0].value.clone()
-    } else {
-        values
-            .iter()
-            .map(|metadata| format!("{}: {}", metadata.field.label(), metadata.value))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    clipboard.write(ClipboardRequest {
-        kind: ClipboardContentKind::CommitFieldValues,
-        text,
-        source_entities: invocation.targets,
-    });
-    OperationExecution::Completed
-}
-
-pub fn copy_file_name(
-    In(invocation): In<OperationInvocation>,
-    keys: Query<&DatasetKey>,
-    mut clipboard: MessageWriter<ClipboardRequest>,
-) -> OperationExecution {
-    copy_file_path(
-        invocation,
-        &keys,
-        ClipboardContentKind::FileName,
-        |_, path| {
-            PathBuf::from(path.to_os_string())
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        },
-        &mut clipboard,
-    )
-}
-
-pub fn copy_file_absolute_path(
-    In(invocation): In<OperationInvocation>,
-    keys: Query<&DatasetKey>,
-    mut clipboard: MessageWriter<ClipboardRequest>,
-) -> OperationExecution {
-    copy_file_path(
-        invocation,
-        &keys,
-        ClipboardContentKind::FileAbsolutePath,
-        |repository, path| {
-            Some(
-                repository
-                    .as_path()
-                    .join(PathBuf::from(path.to_os_string()))
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-        },
-        &mut clipboard,
-    )
-}
-
-pub fn copy_file_relative_path(
-    In(invocation): In<OperationInvocation>,
-    keys: Query<&DatasetKey>,
-    mut clipboard: MessageWriter<ClipboardRequest>,
-) -> OperationExecution {
-    copy_file_path(
-        invocation,
-        &keys,
-        ClipboardContentKind::FileRelativePath,
-        |_, path| Some(path.as_str().into()),
-        &mut clipboard,
-    )
-}
-
-fn copy_file_path(
-    invocation: OperationInvocation,
-    keys: &Query<&DatasetKey>,
-    kind: ClipboardContentKind,
-    value: impl FnOnce(&pitui_data::RepositoryKey, &pitui_core::GitPath) -> Option<String>,
-    clipboard: &mut MessageWriter<ClipboardRequest>,
-) -> OperationExecution {
-    let Some(target) = invocation.targets.first().copied() else {
-        return OperationExecution::Rejected("no File target".into());
-    };
-    let Ok(key) = keys.get(target) else {
-        return OperationExecution::Rejected("File target no longer exists".into());
-    };
-    let (repository, path) = match &key.0 {
-        DatasetIdentity::FileDirectory {
-            repository, path, ..
-        }
-        | DatasetIdentity::File {
-            repository, path, ..
-        }
-        | DatasetIdentity::WorkingTreeDirectory {
-            repository, path, ..
-        }
-        | DatasetIdentity::WorkingTreeFile {
-            repository, path, ..
-        } => (repository, path),
-        _ => {
-            return OperationExecution::Rejected(
-                "copy path target is not a file or directory Dataset".into(),
-            );
-        }
-    };
-    let Some(text) = value(repository, path) else {
-        return OperationExecution::Rejected("File path has no copyable name".into());
-    };
-    clipboard.write(ClipboardRequest {
-        kind,
-        text,
-        source_entities: vec![target],
-    });
-    OperationExecution::Completed
-}
-
-pub fn scroll_home(
-    In(invocation): In<OperationInvocation>,
-    mut viewports: Query<&mut DatasetViewport>,
-) -> OperationExecution {
-    update_scroll(
-        invocation.source_dataset,
-        ScrollAction::Home,
-        &mut viewports,
-    )
-}
-
-pub fn scroll_end(
-    In(invocation): In<OperationInvocation>,
-    mut viewports: Query<&mut DatasetViewport>,
-) -> OperationExecution {
-    update_scroll(invocation.source_dataset, ScrollAction::End, &mut viewports)
-}
-
-pub fn scroll_page_up(
-    In(invocation): In<OperationInvocation>,
-    mut viewports: Query<&mut DatasetViewport>,
-) -> OperationExecution {
-    update_scroll(
-        invocation.source_dataset,
-        ScrollAction::PageUp,
-        &mut viewports,
-    )
-}
-
-pub fn scroll_page_down(
-    In(invocation): In<OperationInvocation>,
-    mut viewports: Query<&mut DatasetViewport>,
-) -> OperationExecution {
-    update_scroll(
-        invocation.source_dataset,
-        ScrollAction::PageDown,
-        &mut viewports,
-    )
-}
-
-#[derive(Clone, Copy)]
-enum ScrollAction {
-    Home,
-    End,
-    PageUp,
-    PageDown,
-}
-
-fn update_scroll(
-    dataset: Entity,
-    action: ScrollAction,
-    viewports: &mut Query<&mut DatasetViewport>,
-) -> OperationExecution {
-    let Ok(mut viewport) = viewports.get_mut(dataset) else {
-        return OperationExecution::Rejected("active Dataset has no text viewport".into());
-    };
-    let page_size = viewport.page_size.max(1);
-    let max_offset = viewport.content_length.saturating_sub(page_size);
-    viewport.offset = match action {
-        ScrollAction::Home => 0,
-        ScrollAction::End => max_offset,
-        ScrollAction::PageUp => viewport.offset.saturating_sub(page_size),
-        ScrollAction::PageDown => viewport.offset.saturating_add(page_size).min(max_offset),
-    };
-    OperationExecution::Completed
 }
 
 fn shift_active_element(

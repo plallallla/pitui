@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 
-use bevy_ecs::prelude::{Entity, MessageReader, Query, Resource, World};
+use bevy_ecs::{
+    change_detection::DetectChanges,
+    prelude::{Changed, Entity, MessageReader, Query, Res, ResMut, Resource, World},
+};
 use pitui_core::{
     DiffHunk, DiffLine, DiffLineKind, WorkingTreeDiff, WorkingTreeDiffKind, side_by_side_rows,
 };
@@ -35,27 +38,155 @@ pub enum ProjectionDiagnostic {
 #[derive(Resource, Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProjectionDiagnostics(pub Vec<ProjectionDiagnostic>);
 
+#[derive(Resource, Clone, Debug, Default)]
+pub(super) struct ProjectionDependencies(HashSet<Entity>);
+
+/// Conservative invalidation state for the immutable `UiFrame` projection.
+/// Component change detection marks this resource; an idle schedule therefore
+/// does not rebuild large diff/list projections just to compare them with the
+/// previous frame.
+#[derive(Resource, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectionRuntimeState {
+    pub requested: bool,
+    pub build_count: u64,
+    pub skipped_count: u64,
+    /// Bitmask of the precise resource/component families that caused the
+    /// latest rebuild. Kept for diagnostics and performance tests.
+    pub last_invalidation_reasons: u64,
+    pending_invalidation_reasons: u64,
+}
+
+impl Default for ProjectionRuntimeState {
+    fn default() -> Self {
+        Self {
+            requested: true,
+            build_count: 0,
+            skipped_count: 0,
+            last_invalidation_reasons: 0,
+            pending_invalidation_reasons: 0,
+        }
+    }
+}
+
+pub(super) fn mark_projection_from_resources(
+    active: Option<Res<ActiveUiContext>>,
+    mode: Option<Res<ActiveRenderMode>>,
+    operations: Option<Res<ResolvedOperationSet>>,
+    proxies: Res<RenderProxyRegistry>,
+    mut state: ResMut<ProjectionRuntimeState>,
+) {
+    let changed = active.is_some_and(|value| value.is_changed())
+        || mode.is_some_and(|value| value.is_changed())
+        || operations.is_some_and(|value| value.is_changed())
+        || proxies.is_changed();
+    if changed {
+        state.requested = true;
+        state.pending_invalidation_reasons |= 1;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn mark_projection_from_dataset_state(
+    dependencies: Res<ProjectionDependencies>,
+    keys: Query<Entity, Changed<DatasetKey>>,
+    kinds: Query<Entity, Changed<DatasetType>>,
+    collections: Query<Entity, Changed<DatasetCollection>>,
+    active: Query<Entity, Changed<DatasetActiveElement>>,
+    selections: Query<Entity, Changed<DatasetSelection>>,
+    views: Query<Entity, Changed<DatasetViewState>>,
+    viewports: Query<Entity, Changed<DatasetViewport>>,
+    mut state: ResMut<ProjectionRuntimeState>,
+) {
+    let visible = |entity| dependencies.0.contains(&entity);
+    let reasons = u64::from(keys.iter().any(visible)) << 1
+        | u64::from(kinds.iter().any(visible)) << 2
+        | u64::from(collections.iter().any(visible)) << 3
+        | u64::from(active.iter().any(visible)) << 4
+        | u64::from(selections.iter().any(visible)) << 5
+        | u64::from(views.iter().any(visible)) << 6
+        | u64::from(viewports.iter().any(visible)) << 7;
+    if reasons != 0 {
+        state.requested = true;
+        state.pending_invalidation_reasons |= reasons;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn mark_projection_from_metadata_a(
+    dependencies: Res<ProjectionDependencies>,
+    repositories: Query<Entity, Changed<RepositoryMetadata>>,
+    branches: Query<Entity, Changed<BranchMetadata>>,
+    commits: Query<Entity, Changed<CommitMetadata>>,
+    commit_fields: Query<Entity, Changed<CommitFieldMetadata>>,
+    commit_creation: Query<Entity, Changed<CommitCreationMetadata>>,
+    files: Query<Entity, Changed<FileMetadata>>,
+    directories: Query<Entity, Changed<FileTreeDirectoryMetadata>>,
+    diffs: Query<Entity, Changed<FileChangesMetadata>>,
+    mut state: ResMut<ProjectionRuntimeState>,
+) {
+    let visible = |entity| dependencies.0.contains(&entity);
+    let reasons = u64::from(repositories.iter().any(visible)) << 8
+        | u64::from(branches.iter().any(visible)) << 9
+        | u64::from(commits.iter().any(visible)) << 10
+        | u64::from(commit_fields.iter().any(visible)) << 11
+        | u64::from(commit_creation.iter().any(visible)) << 12
+        | u64::from(files.iter().any(visible)) << 13
+        | u64::from(directories.iter().any(visible)) << 14
+        | u64::from(diffs.iter().any(visible)) << 15;
+    if reasons != 0 {
+        state.requested = true;
+        state.pending_invalidation_reasons |= reasons;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn mark_projection_from_metadata_b(
+    dependencies: Res<ProjectionDependencies>,
+    working_files: Query<Entity, Changed<WorkingTreeFileMetadata>>,
+    working_diffs: Query<Entity, Changed<WorkingTreeFileChangesMetadata>>,
+    reflog: Query<Entity, Changed<ReflogEntryMetadata>>,
+    remotes: Query<Entity, Changed<RemoteMetadata>>,
+    log_entries: Query<Entity, Changed<GitOperationLogEntryMetadata>>,
+    interactions: Query<Entity, Changed<InteractionContextMetadata>>,
+    mut state: ResMut<ProjectionRuntimeState>,
+) {
+    let visible = |entity| dependencies.0.contains(&entity);
+    let reasons = u64::from(working_files.iter().any(visible)) << 16
+        | u64::from(working_diffs.iter().any(visible)) << 17
+        | u64::from(reflog.iter().any(visible)) << 18
+        | u64::from(remotes.iter().any(visible)) << 19
+        | u64::from(log_entries.iter().any(visible)) << 20
+        | u64::from(interactions.iter().any(visible)) << 21;
+    if reasons != 0 {
+        state.requested = true;
+        state.pending_invalidation_reasons |= reasons;
+    }
+}
+
 pub(super) fn apply_viewport_measurements(
     mut measurements: MessageReader<ViewportMeasurement>,
     mut viewports: Query<&mut DatasetViewport>,
 ) {
     for measurement in measurements.read() {
         if let Ok(mut viewport) = viewports.get_mut(measurement.dataset) {
-            viewport.page_size = measurement.page_size.max(1);
-            let max_offset = viewport.content_length.saturating_sub(viewport.page_size);
-            viewport.offset = viewport.offset.min(max_offset);
+            let page_size = measurement.page_size.max(1);
+            let max_offset = viewport.content_length.saturating_sub(page_size);
+            let offset = viewport.offset.min(max_offset);
+            if viewport.page_size != page_size || viewport.offset != offset {
+                viewport.page_size = page_size;
+                viewport.offset = offset;
+            }
         }
     }
 }
 
 pub(super) fn update_dataset_viewports(world: &mut World) {
-    let entities = {
-        let mut query = world.query::<Entity>();
-        query
-            .iter(world)
-            .filter(|entity| world.get::<DatasetViewport>(*entity).is_some())
-            .collect::<Vec<_>>()
-    };
+    let mut entities = Vec::new();
+    if let Some(mode) = world.get_resource::<ActiveRenderMode>() {
+        mode.layout.dataset_entities(&mut entities);
+    }
+    entities.sort_unstable();
+    entities.dedup();
     for entity in entities {
         let content_length = dataset_content_length(world, entity);
         let active_element = world
@@ -67,19 +198,26 @@ pub(super) fn update_dataset_viewports(world: &mut World) {
                 .and_then(|collection| collection.position(active))
         });
         if let Some(mut viewport) = world.get_mut::<DatasetViewport>(entity) {
-            viewport.content_length = content_length;
             let page_size = viewport.page_size.max(1);
             let max_offset = content_length.saturating_sub(page_size);
-            viewport.offset = viewport.offset.min(max_offset);
+            let mut offset = viewport.offset.min(max_offset);
             if let Some(active_position) = active_position {
-                if active_position < viewport.offset {
-                    viewport.offset = active_position;
-                } else if active_position >= viewport.offset.saturating_add(page_size) {
-                    viewport.offset = active_position
+                if active_position < offset {
+                    offset = active_position;
+                } else if active_position >= offset.saturating_add(page_size) {
+                    offset = active_position
                         .saturating_add(1)
                         .saturating_sub(page_size)
                         .min(max_offset);
                 }
+            }
+            if viewport.content_length != content_length
+                || viewport.page_size != page_size
+                || viewport.offset != offset
+            {
+                viewport.content_length = content_length;
+                viewport.page_size = page_size;
+                viewport.offset = offset;
             }
         }
     }
@@ -143,6 +281,17 @@ fn dataset_content_length(world: &World, entity: Entity) -> usize {
 }
 
 pub(super) fn build_ui_frame(world: &mut World) {
+    if !world.resource::<ProjectionRuntimeState>().requested {
+        world.resource_mut::<ProjectionRuntimeState>().skipped_count += 1;
+        return;
+    }
+    {
+        let mut state = world.resource_mut::<ProjectionRuntimeState>();
+        state.requested = false;
+        state.build_count = state.build_count.wrapping_add(1);
+        state.last_invalidation_reasons = state.pending_invalidation_reasons;
+        state.pending_invalidation_reasons = 0;
+    }
     if !world.contains_resource::<ProjectionDiagnostics>() {
         world.init_resource::<ProjectionDiagnostics>();
     }
@@ -158,6 +307,26 @@ pub(super) fn build_ui_frame(world: &mut World) {
         .as_ref()
         .map(|layout| project_layout(world, layout, active, &mut diagnostics))
         .unwrap_or(UiLayoutProjection::Empty);
+
+    let mut dependencies = HashSet::new();
+    if let Some(layout) = &layout {
+        let mut panels = Vec::new();
+        layout.dataset_entities(&mut panels);
+        for panel in panels {
+            dependencies.insert(panel);
+            if let Some(collection) = world.get::<DatasetCollection>(panel) {
+                dependencies.extend(collection.entities());
+            }
+        }
+    }
+    if let Some(repository) = world.get_resource::<ActiveUiContext>().and_then(|context| {
+        context
+            .render_bindings
+            .get(&RenderBindingId::CurrentRepository)
+    }) {
+        dependencies.insert(repository);
+    }
+    world.resource_mut::<ProjectionDependencies>().0 = dependencies;
 
     let mut footer_bindings = world
         .get_resource::<ResolvedOperationSet>()

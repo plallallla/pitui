@@ -23,12 +23,12 @@ Pitui 是一个使用 Rust、`bevy_ecs`、ratatui 和 Git CLI 实现的 Data Dri
 - 复制 commit hash/info/message，以及文件名、绝对路径和仓库相对路径。
 - 查看会话 Git 操作日志，并可持久化为自动轮转的 JSONL 日志。
 - 每个 Dataset Template 的 Operation Set 拥有独立 Hotkey 表；快捷键、底部提示、Help 和 Command
-  Palette 共用当前唯一有效的解析结果。
+  Palette 共用当前唯一有效的解析结果；可在启动时用严格 profile 覆盖按键。
 - 只在数据发生变化或终端 resize 时重绘；Git 数据使用 `Ctrl+R` 手动刷新。
 
 当前尚未实现 remote 管理、fetch、pull、push、sync 和 rebase。相关未实现命令会明确拒绝，不会静默执行。
 语义功能使用编译期 Rust 实现；快捷键从 Operation 中分离，由 `pitui-config` 中每个 Dataset 的 Hotkey
-表独立绑定。外部快捷键文件加载尚未接入。
+表独立绑定。外部 profile 只能覆盖已声明 Operation 的 Hotkey，不能注入功能或 Git 命令。
 
 ## 运行
 
@@ -75,6 +75,29 @@ cargo run -- /repo/one /repo/two
 
 二级快捷键只会在输入第一级后展示第二级提示。
 
+## Hotkey 配置
+
+通过 `PITUI_HOTKEY_CONFIG` 在启动时指定严格 profile：
+
+```bash
+PITUI_HOTKEY_CONFIG=~/.config/pitui/hotkeys.toml cargo run -- /repo
+```
+
+```toml
+version = 1
+
+[global]
+"global.help" = ["h"]
+
+[datasets.commits]
+"copy.commit.hash" = ["ctrl+c h"]
+"copy.commit.info" = ["ctrl+c i"]
+```
+
+未列出的绑定保留默认值，空数组用于解绑。配置按副本校验后原子应用；未知 Dataset Template、未在该
+Dataset Operation Set 中声明的 Operation、空按键、重复或前缀歧义都会拒绝启动。当前不支持运行时
+reload。完整格式见 [`docs/hotkeys.md`](docs/hotkeys.md)。
+
 ## Data Driven + ECS 架构
 
 ```text
@@ -95,6 +118,9 @@ Terminal Event
 核心约束：
 
 - `DatasetIdentity` 是稳定业务身份，Bevy `Entity` 只是运行时句柄。
+- Git 请求拥有单调 request ID；成功后才生成 typed refresh jobs，所有 refresh 保留 root correlation ID。
+- Context Stack 帧区分 View、ActiveHandoff 和 Overlay；跨 Overlay 延迟的 Operation 使用稳定
+  `DatasetIdentity`，弹层关闭后再解析 Entity。
 - 一个 Render 同时只有一个 Active Dataset；每个 Dataset 最多保留一个 Active Element，空集合为
   `None`。只有 Active Dataset 的 Active Element 会高亮。
 - 同一时间只有一个 `ActiveRenderMode` 和一个 `ResolvedOperationSet`。
@@ -118,6 +144,8 @@ Terminal Event
   `file-diff` RenderMode并保留 Files 及当前 File，再次向右才把 Active Dataset 接力给 FileChanges。
   反向接力恢复上一份 Active Context。
 - Renderer 只能读取 `UiFrame`，不能访问或修改 ECS `World`。
+- Collection、GC、完整校验和 Projection 分层执行：普通输入只协调脏集合；Projection 只因当前可见
+  Dataset/row 或 Context/Operation Set 改变而失效。
 - Git effect 只能通过类型化 `GitCommand` 进入 `pitui-git`，不拼接 shell 命令字符串。
 - Help、footer、输入响应和 Command Palette 读取同一份已解析操作数据。
 

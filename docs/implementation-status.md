@@ -24,9 +24,9 @@ pitui         composition root、binary 与端到端验收
 
 - Repository、Branch、Commits、Commit、CommitField、Files、FileTreeDirectory、FileChanges Dataset
   纵向链路；Commit 的 hash/author/date/tags/subject/message 是独立字段 Dataset，可 Active、多选并复制值。
-- 稳定 `DatasetIdentity -> Entity` canonical index。
+- 稳定 `DatasetIdentity -> Entity` canonical index；Changes 使用 `Changes(RepositoryKey)`，多仓库快照互不覆盖。
 - Dataset DAG、显式 roots、Manager 生成的 Collection Element/depth、Active Element、selection、viewport 和
-  reachability GC。
+  `DatasetParents` 反向 DAG 索引、脏祖先传播和按请求执行的 reachability GC。
 - Dataset Template 配置驱动的 Collection Manager：Repositories/Branches、Files、Changes 和
   WorkingTreeFiles 共用 `TreeManager`；其他 Dataset 默认使用 `ListManager`。Tree 的可见/可选类型、
   sibling order 和 selection mode 都是数据，结构行不会误入操作目标。
@@ -34,12 +34,16 @@ pitui         composition root、binary 与端到端验收
   Collection Manager 与 Render Proxy。Files 默认 Tree View，可按 `v` 切换为只显示 File 后代的
   flat List View，再切回 Tree，期间不会重建或改写目录/文件实体关系。
 - 单一 `ActiveUiContext`、`ActiveRenderMode`、`ResolvedOperationSet`。
+- Context Stack 的每一帧都显式区分 `View`、`ActiveHandoff` 和 `Overlay`；Confirmation/Palette 跨帧保存
+  `DatasetIdentity`，执行前才重新解析 Entity，不长期持有代际句柄。
 - `pitui-tui` Input Listener 只解析终端事件；Operation Executor 从当前 Active Dataset 的
   `ResolvedOperationSet` 缓存查询绑定并构造调用上下文，未绑定输入直接忽略。
 - `OperationManager` 维护直接的 `OperationId -> Bevy SystemId` 编译期函数表；Dataset Template 绑定
   Operation，并拥有独立的 `OperationHotkeyTable`。Operation 语义不再携带按键；Command 仅保留命令
   名称/作用域元数据，System 通过 typed ECS 参数修改 Active、全局状态或发出 Git/Context/Clipboard 等数据。
 - Template/Proxy/Mode/Operation/Command/Availability 跨 Registry 启动校验。
+- 可选的严格外部 Hotkey profile：只允许原子覆盖已编译 Operation 的按键，空数组可解绑；未知
+  Dataset/Operation、错误按键和 profile 内歧义会阻止启动，不能注入 System 或 Git argv。
 - History、Commit、File Diff、Changes、Reflog、Git Operation Log Render Mode。
 - Commit 下的 Files、Changes 的 staged/unstaged 边界和 WorkingTreeFiles 使用共享 `PathTree`
   Proxy：Snapshot 按 Git 原始路径构建真实目录 Dataset DAG，`TreeManager` 再稳定展平并生成深度；
@@ -55,7 +59,12 @@ pitui         composition root、binary 与端到端验收
   Context，确认层 Pop 后才释放内部写 Operation，随后刷新 Repository、Branches、Commits、Changes 和 Reflog。
 - commits 多选和安全 cherry-pick；本次冲突自动尝试 abort。
 - session Git operation log Dataset 与可轮转持久 JSONL sink。
-- `UiFrame` generation 驱动重绘，不进行定时 Git 自动刷新。
+- Git effect 使用单调 `GitRequestId`、root correlation ID、成功后 typed refresh plan、latest-wins
+  `GitLoadTracker` 和独立 control-plane outcome；Changes 后续接力不依赖可清空的诊断历史。
+- failure/mutation/session log/load completion/Operation notice 等历史均有独立上限，持久 JSONL 不受会话上限影响。
+- Collection 只协调脏 Dataset/祖先；完整不变量校验默认按需，调试时可切换为每 Schedule。
+- `UiFrame` 使用可见 Dataset 依赖增量失效；隐藏 diff/log 的后台数据完成不会重建当前 Frame。
+  generation 驱动重绘，不进行定时 Git 自动刷新。
 
 ## 尚未实现
 
@@ -63,7 +72,7 @@ pitui         composition root、binary 与端到端验收
 - fetch、pull、push、sync。
 - safe rebase。
 - stash 浏览和操作。
-- 外部 Hotkey 配置文件加载、严格覆盖和运行时 reload；当前每个 Dataset 的 Hotkey 表使用编译期默认值。
+- Hotkey profile 运行时 reload；当前只在进程启动时加载。
 - 异步/后台 Git executor；当前同步执行可能阻塞 terminal event loop。
 - 用户可操作的 unified/side-by-side 模式切换。
 - Table Collection Manager；扩展位置已经收敛到 `CollectionManagerSpec`，本次不实现 Table。
@@ -108,11 +117,8 @@ cargo test --workspace --doc
 
 ## 后续优先级
 
-1. 在不改变 Operation Manager 边界的前提下，将 `operation/systems.rs` 再按 interaction、active、changes、
-   copy/scroll 拆为领域 System 模块。
-2. 将 `git_runtime.rs` 按 lifecycle/log、snapshot planning 和 payload adapter 拆分。
-3. 将根 `src/tests.rs` 拆为共享 fixture 与按语义分类的集成测试模块。
-4. 设计保持 typed data 边界的异步 Git task/result 通道。
-5. 依次实现 Remote、网络操作和 safe rebase，并补齐真实临时仓库测试。
-6. 只为各 Dataset 的 `OperationHotkeyTable` 增加严格外部覆盖，不把语义功能、Renderer 或 Git argv
-   暴露为运行时配置。
+1. 将剩余的 `operation/systems.rs` 按 interaction、active/context 和 repository action 继续拆分。
+2. 将根 `src/tests.rs` 拆为共享 fixture 与按语义分类的集成测试模块。
+3. 在现有 request/job/result/correlation 协议下替换为异步 Git task executor，不改 Operation 或 Projection。
+4. 依次实现 Remote、网络操作和 safe rebase，并补齐真实临时仓库测试。
+5. 为大型 diff 增加 panel 级 projection cache；当前已经避免不可见 Dataset 导致的整 Frame 重建。

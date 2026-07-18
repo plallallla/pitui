@@ -4,7 +4,34 @@
 use super::*;
 
 #[derive(Resource, Clone, Debug, Default)]
-pub struct DeferredOperationInvocations(pub(crate) Vec<OperationInvocation>);
+pub struct DeferredStableOperationInvocations(pub(crate) Vec<StableOperationInvocation>);
+
+pub fn stabilize_operation_invocation(
+    invocation: OperationInvocation,
+    keys: &Query<&DatasetKey>,
+) -> Result<StableOperationInvocation, String> {
+    let source_dataset = keys
+        .get(invocation.source_dataset)
+        .map_err(|_| "operation source has no stable Dataset identity")?
+        .0
+        .clone();
+    let targets = invocation
+        .targets
+        .iter()
+        .map(|target| {
+            keys.get(*target)
+                .map(|key| key.0.clone())
+                .map_err(|_| "operation target has no stable Dataset identity")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(StableOperationInvocation {
+        operation: invocation.operation,
+        command: invocation.command,
+        source_dataset,
+        targets,
+        source: invocation.source,
+    })
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn execute_operation_inputs(
@@ -241,8 +268,10 @@ pub fn collect_operation_invocations(
 pub fn release_deferred_invocations(
     context: Option<Res<ActiveUiContext>>,
     kinds: Query<&DatasetType>,
-    mut deferred: ResMut<DeferredOperationInvocations>,
+    index: Res<DatasetIndex>,
+    mut deferred: ResMut<DeferredStableOperationInvocations>,
     mut invocations: MessageWriter<OperationInvocation>,
+    mut notices: MessageWriter<OperationNotice>,
 ) {
     let Some(context) = context else {
         return;
@@ -253,8 +282,27 @@ pub fn release_deferred_invocations(
     {
         return;
     }
-    for invocation in std::mem::take(&mut deferred.0) {
-        invocations.write(invocation);
+    for stable in std::mem::take(&mut deferred.0) {
+        let Some(source_dataset) = index.get(&stable.source_dataset) else {
+            notices.write(OperationNotice::TargetUnavailable(stable.operation));
+            continue;
+        };
+        let targets = stable
+            .targets
+            .iter()
+            .map(|target| index.get(target))
+            .collect::<Option<Vec<_>>>();
+        let Some(targets) = targets else {
+            notices.write(OperationNotice::TargetUnavailable(stable.operation));
+            continue;
+        };
+        invocations.write(OperationInvocation {
+            operation: stable.operation,
+            command: stable.command,
+            source_dataset,
+            targets,
+            source: stable.source,
+        });
     }
 }
 

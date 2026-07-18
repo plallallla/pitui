@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 
-use bevy_ecs::prelude::{Entity, World};
+use bevy_ecs::prelude::{Entity, Resource, World};
 use pitui_data::{
     CollectionElement, CollectionManagerSpec, DatasetActiveElement, DatasetChildren,
-    DatasetCollection, DatasetKind, DatasetSelection, DatasetTemplateId, DatasetTemplateRef,
-    DatasetTemplateRegistry, DatasetType, DatasetViewState, FileMetadata,
+    DatasetCollection, DatasetKind, DatasetParents, DatasetSelection, DatasetTemplateId,
+    DatasetTemplateRef, DatasetTemplateRegistry, DatasetType, DatasetViewState, FileMetadata,
     FileTreeDirectoryMetadata, ListManagerSpec, ListSource, TreeManagerSpec, TreeSelectionMode,
     TreeSiblingOrder, WorkingTreeFileMetadata,
 };
@@ -14,17 +14,47 @@ pub(super) struct ManagedCollection {
     pub elements: Vec<CollectionElement>,
 }
 
-pub(super) fn rebuild_collections(world: &mut World) {
-    let datasets = {
-        let mut query = world.query::<(Entity, &DatasetChildren, &DatasetTemplateRef)>();
-        query
-            .iter(world)
-            .map(|(entity, children, template)| (entity, children.0.clone(), template.0.clone()))
-            .collect::<Vec<_>>()
-    };
+#[derive(Resource, Clone, Debug, Default)]
+struct DirtyCollections(HashSet<Entity>);
 
-    for (entity, children, template) in datasets {
-        let expected = expected_collection(world, entity, &template, &children);
+pub(super) fn initialize_collection_runtime(world: &mut World) {
+    world.init_resource::<DirtyCollections>();
+}
+
+pub(crate) fn mark_collection_dirty(world: &mut World, dataset: Entity) {
+    world.resource_mut::<DirtyCollections>().0.insert(dataset);
+}
+
+pub(crate) fn mark_collection_ancestors_dirty(world: &mut World, dataset: Entity) {
+    let ancestors = {
+        let parents = world.resource::<DatasetParents>();
+        let mut pending = vec![dataset];
+        let mut visited = HashSet::new();
+        while let Some(entity) = pending.pop() {
+            if !visited.insert(entity) {
+                continue;
+            }
+            pending.extend(parents.parents(entity).iter().copied());
+        }
+        visited
+    };
+    world.resource_mut::<DirtyCollections>().0.extend(ancestors);
+}
+
+/// Rebuilds and repairs only collections whose ownership/view source changed.
+/// Ordinary cursor movement and unrelated Git results no longer walk every
+/// Dataset in the World.
+pub(super) fn reconcile_dirty_collections(world: &mut World) {
+    let datasets = std::mem::take(&mut world.resource_mut::<DirtyCollections>().0);
+
+    for entity in datasets {
+        let Some(children) = world.get::<DatasetChildren>(entity).cloned() else {
+            continue;
+        };
+        let Some(template) = world.get::<DatasetTemplateRef>(entity).cloned() else {
+            continue;
+        };
+        let expected = expected_collection(world, entity, &template.0, &children.0);
         let changed = world
             .get::<DatasetCollection>(entity)
             .is_none_or(|collection| collection.0 != expected.elements);
@@ -33,6 +63,7 @@ pub(super) fn rebuild_collections(world: &mut World) {
                 .entity_mut(entity)
                 .insert(DatasetCollection(expected.elements));
         }
+        repair_active_element(world, entity);
     }
 }
 
@@ -203,65 +234,59 @@ fn path_sort_key(world: &World, entity: Entity) -> Option<Vec<u8>> {
     Some(path.as_bytes().to_vec())
 }
 
-pub(super) fn repair_active_elements(world: &mut World) {
-    let datasets = {
-        let mut query = world.query::<(
-            Entity,
-            &DatasetCollection,
-            &DatasetActiveElement,
-            &DatasetSelection,
-        )>();
-        query
-            .iter(world)
-            .map(|(entity, collection, active, selection)| {
-                (entity, collection.clone(), active.0, selection.0.clone())
-            })
-            .collect::<Vec<_>>()
+fn repair_active_element(world: &mut World, dataset: Entity) {
+    let Some(collection) = world.get::<DatasetCollection>(dataset).cloned() else {
+        return;
     };
-    for (dataset, collection, active, selection) in datasets {
-        let repaired_active = if active.is_none_or(|entity| !collection.contains(entity)) {
-            collection.first()
-        } else {
-            active
-        };
-        let mut selected = selection.into_iter().collect::<HashSet<_>>();
-        selected.retain(|row| collection.contains(*row));
-        if let Some(CollectionManagerSpec::Tree(spec)) = collection_manager(world, dataset)
-            && spec.selection == TreeSelectionMode::Cascade
-        {
-            let elements = collection.entities().collect::<Vec<_>>();
-            let element_set = elements.iter().copied().collect::<HashSet<_>>();
-            let selectable = spec
-                .selectable_kinds
-                .iter()
-                .copied()
-                .collect::<HashSet<_>>();
-            // A selected Tree parent semantically selects its selectable
-            // descendants even when selection data was restored directly or
-            // came back from a flat View. Then derive checked parents from the
-            // resulting complete descendant set.
-            for target in selected.iter().copied().collect::<Vec<_>>() {
-                selected.extend(collection_subtree(world, target, &element_set, &selectable));
-            }
-            normalize_tree_selection(world, &elements, &element_set, &selectable, &mut selected);
+    let active = world
+        .get::<DatasetActiveElement>(dataset)
+        .and_then(|active| active.0);
+    let selection = world
+        .get::<DatasetSelection>(dataset)
+        .map(|selection| selection.0.clone())
+        .unwrap_or_default();
+    let repaired_active = if active.is_none_or(|entity| !collection.contains(entity)) {
+        collection.first()
+    } else {
+        active
+    };
+    let mut selected = selection.into_iter().collect::<HashSet<_>>();
+    selected.retain(|row| collection.contains(*row));
+    if let Some(CollectionManagerSpec::Tree(spec)) = collection_manager(world, dataset)
+        && spec.selection == TreeSelectionMode::Cascade
+    {
+        let elements = collection.entities().collect::<Vec<_>>();
+        let element_set = elements.iter().copied().collect::<HashSet<_>>();
+        let selectable = spec
+            .selectable_kinds
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        // A selected Tree parent semantically selects its selectable
+        // descendants even when selection data was restored directly or came
+        // back from a flat View. Then derive checked parents from the complete
+        // descendant set.
+        for target in selected.iter().copied().collect::<Vec<_>>() {
+            selected.extend(collection_subtree(world, target, &element_set, &selectable));
         }
-        let repaired_selection = collection
-            .entities()
-            .filter(|row| selected.contains(row))
-            .collect::<Vec<_>>();
-        if active != repaired_active {
-            world
-                .entity_mut(dataset)
-                .insert(DatasetActiveElement(repaired_active));
-        }
-        if world
-            .get::<DatasetSelection>(dataset)
-            .is_none_or(|current| current.0 != repaired_selection)
-        {
-            world
-                .entity_mut(dataset)
-                .insert(DatasetSelection(repaired_selection));
-        }
+        normalize_tree_selection(world, &elements, &element_set, &selectable, &mut selected);
+    }
+    let repaired_selection = collection
+        .entities()
+        .filter(|row| selected.contains(row))
+        .collect::<Vec<_>>();
+    if active != repaired_active {
+        world
+            .entity_mut(dataset)
+            .insert(DatasetActiveElement(repaired_active));
+    }
+    if world
+        .get::<DatasetSelection>(dataset)
+        .is_none_or(|current| current.0 != repaired_selection)
+    {
+        world
+            .entity_mut(dataset)
+            .insert(DatasetSelection(repaired_selection));
     }
 }
 

@@ -3,7 +3,8 @@ use pitui_data::{
     ActiveRenderMode, ActiveUiContext, ContextStack, ContextTransitionRequest, Dataset,
     DatasetActiveElement, DatasetBinding, DatasetChildren, DatasetIdentity, DatasetIndex,
     DatasetKey, DatasetType, OperationNotice, RenderBindingId, RenderLayout, RenderModeRegistry,
-    RepositoryMetadata, ResolvedOperationSet, ResolvedRenderLayout,
+    RepositoryMetadata, ResolvedOperationSet, ResolvedRenderLayout, UiContextFrame,
+    UiContextFrameKind, UiContextSnapshot,
 };
 
 use crate::{KernelError, resolve_render_layout};
@@ -104,12 +105,12 @@ fn apply_context_transition(
             active_dataset,
             render_mode,
             render_bindings,
-            StackAction::Push,
+            StackAction::Push(UiContextFrameKind::View),
         ),
         ContextTransitionRequest::ActiveHandoff {
             previous_active_dataset,
             previous_active_kind,
-            direction: _,
+            direction,
             next_active_dataset,
             render_mode,
             render_bindings,
@@ -124,7 +125,7 @@ fn apply_context_transition(
                 next_active_dataset,
                 render_mode,
                 render_bindings,
-                StackAction::ActiveHandoff,
+                StackAction::Push(UiContextFrameKind::ActiveHandoff { direction }),
             )
         }
         ContextTransitionRequest::ActiveReturn {
@@ -138,12 +139,22 @@ fn apply_context_transition(
                 previous_active_dataset,
                 previous_active_kind,
             )?;
-            let snapshot = world
+            let frame = world
                 .resource::<ContextStack>()
                 .0
                 .last()
                 .cloned()
                 .ok_or(KernelError::ContextUnavailable)?;
+            if !matches!(
+                frame.kind,
+                UiContextFrameKind::View | UiContextFrameKind::ActiveHandoff { .. }
+            ) {
+                return Err(KernelError::ContextFrameKindMismatch {
+                    expected: UiContextFrameKind::View,
+                    actual: frame.kind,
+                });
+            }
+            let snapshot = frame.snapshot;
             (
                 snapshot.active_dataset,
                 snapshot.render_mode,
@@ -157,8 +168,7 @@ fn apply_context_transition(
         ContextTransitionRequest::Pop => {
             let snapshot = world
                 .resource::<ContextStack>()
-                .0
-                .last()
+                .top_snapshot()
                 .cloned()
                 .ok_or(KernelError::ContextUnavailable)?;
             (
@@ -180,14 +190,14 @@ fn apply_context_transition(
 
     match stack_action {
         StackAction::Keep => {}
-        StackAction::Push | StackAction::ActiveHandoff => world
-            .resource_mut::<ContextStack>()
-            .0
-            .push(pitui_data::UiContextSnapshot {
+        StackAction::Push(kind) => world.resource_mut::<ContextStack>().0.push(UiContextFrame {
+            kind,
+            snapshot: UiContextSnapshot {
                 active_dataset: current.active_dataset,
                 render_mode: current.render_mode,
                 render_bindings: current.render_bindings,
-            }),
+            },
+        }),
         StackAction::Pop => {
             world.resource_mut::<ContextStack>().0.pop();
         }
@@ -208,6 +218,7 @@ fn apply_context_transition(
         id: render_mode,
         layout,
     });
+    world.resource_mut::<crate::DatasetGcRequested>().0 = true;
     world
         .resource_mut::<RenderReconcileDiagnostics>()
         .last_transition_error = None;
@@ -243,8 +254,7 @@ fn validate_active_origin(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StackAction {
     Keep,
-    Push,
-    ActiveHandoff,
+    Push(UiContextFrameKind),
     Pop,
 }
 
@@ -278,14 +288,14 @@ pub(super) fn push_overlay_context(
     let layout = ResolvedRenderLayout::Overlay(vec![current_mode.layout, overlay]);
     validate_context_state(world, active_dataset, &bindings, &layout)?;
 
-    world
-        .resource_mut::<ContextStack>()
-        .0
-        .push(pitui_data::UiContextSnapshot {
+    world.resource_mut::<ContextStack>().0.push(UiContextFrame {
+        kind: UiContextFrameKind::Overlay,
+        snapshot: UiContextSnapshot {
             active_dataset: current.active_dataset,
             render_mode: current.render_mode,
             render_bindings: current.render_bindings,
-        });
+        },
+    });
     world.insert_resource(ActiveUiContext {
         active_dataset,
         render_mode: render_mode.clone(),
@@ -297,6 +307,7 @@ pub(super) fn push_overlay_context(
         id: render_mode,
         layout,
     });
+    world.resource_mut::<crate::DatasetGcRequested>().0 = true;
     world
         .resource_mut::<RenderReconcileDiagnostics>()
         .last_transition_error = None;
@@ -362,10 +373,13 @@ pub(super) fn update_dependent_render_bindings(world: &mut World) {
             .into_iter()
             .find_map(|(_, next)| next)
             .unwrap_or(context.active_dataset);
-        let mut context = world.resource_mut::<ActiveUiContext>();
-        context.render_bindings = bindings;
-        context.active_dataset = relayed_active;
-        context.generation = context.generation.wrapping_add(1);
+        {
+            let mut context = world.resource_mut::<ActiveUiContext>();
+            context.render_bindings = bindings;
+            context.active_dataset = relayed_active;
+            context.generation = context.generation.wrapping_add(1);
+        }
+        world.resource_mut::<crate::DatasetGcRequested>().0 = true;
     }
 }
 
@@ -463,11 +477,7 @@ fn reconcile_file_changes(world: &World, bindings: &mut pitui_data::RenderContex
 }
 
 fn reconcile_changes_file(world: &World, bindings: &mut pitui_data::RenderContextBindings) {
-    let changes = bindings.get(&RenderBindingId::Changes).or_else(|| {
-        world
-            .resource::<DatasetIndex>()
-            .get(&DatasetIdentity::GlobalChanges)
-    });
+    let changes = bindings.get(&RenderBindingId::Changes);
     let file_changes = changes
         .and_then(|changes| world.get::<DatasetActiveElement>(changes))
         .and_then(|active| active.0)

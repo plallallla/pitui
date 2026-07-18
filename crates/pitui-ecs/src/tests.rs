@@ -361,7 +361,7 @@ fn changes_tree_collection_reaches_third_level_files_without_exposing_diffs() {
     let repository = pitui_data::RepositoryKey::new("/repo");
     let root = runtime
         .ensure_dataset(
-            DatasetIdentity::GlobalChanges,
+            DatasetIdentity::Changes(repository.clone()),
             DatasetKind::Changes,
             changes_template,
         )
@@ -524,6 +524,15 @@ fn context_push_and_pop_restore_active_mode_and_bindings_atomically() {
         detail
     );
     assert_eq!(runtime.world().resource::<ContextStack>().0.len(), 1);
+    assert_eq!(
+        runtime
+            .world()
+            .resource::<ContextStack>()
+            .top()
+            .unwrap()
+            .kind,
+        pitui_data::UiContextFrameKind::View
+    );
 
     runtime.pop_context(history_layout, operations()).unwrap();
 
@@ -544,17 +553,14 @@ fn context_push_and_pop_restore_active_mode_and_bindings_atomically() {
 fn stable_dataset_identity_rejects_a_caller_selected_wrong_kind() {
     let mut runtime = DatasetRuntime::new();
     let template = register(&mut runtime, "commit", DatasetKind::Commit);
+    let identity = DatasetIdentity::Changes(pitui_data::RepositoryKey::new("/repo"));
     let error = runtime
-        .ensure_dataset(
-            DatasetIdentity::GlobalChanges,
-            DatasetKind::Commit,
-            template,
-        )
+        .ensure_dataset(identity.clone(), DatasetKind::Commit, template)
         .unwrap_err();
     assert_eq!(
         error,
         KernelError::IdentityKindMismatch {
-            identity: Box::new(DatasetIdentity::GlobalChanges),
+            identity: Box::new(identity),
             expected: DatasetKind::Changes,
             actual: DatasetKind::Commit,
         }

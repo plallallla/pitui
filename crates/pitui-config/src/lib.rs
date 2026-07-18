@@ -7,6 +7,10 @@
 
 #![forbid(unsafe_code)]
 
+mod hotkeys;
+
+pub use hotkeys::*;
+
 use std::{env, path::PathBuf, time::Duration};
 
 use pitui_data::{
@@ -42,6 +46,10 @@ pub struct GitLoggingConfig {
     pub flush_interval: Duration,
     pub buffer_capacity: usize,
     pub max_message_chars: usize,
+    pub session_log_entries: usize,
+    pub failure_history_entries: usize,
+    pub mutation_history_entries: usize,
+    pub completed_load_entries: usize,
     pub fail_on_open_error: bool,
 }
 
@@ -56,6 +64,10 @@ pub fn default_git_logging_config() -> GitLoggingConfig {
         flush_interval: Duration::from_secs(1),
         buffer_capacity: 16 * 1024,
         max_message_chars: 4096,
+        session_log_entries: 1_000,
+        failure_history_entries: 256,
+        mutation_history_entries: 256,
+        completed_load_entries: 2_048,
         fail_on_open_error: false,
     }
 }
@@ -619,7 +631,7 @@ fn changes_mode(id: &str, diff_proxy: &str) -> RenderModeSpec {
         id: RenderModeId::from(id),
         layout: RenderLayout::Row(vec![
             RenderLayout::Dataset {
-                dataset: DatasetBinding::Stable(DatasetIdentity::GlobalChanges),
+                dataset: DatasetBinding::Context(RenderBindingId::Changes),
                 proxy: RenderProxyId::from("changes.tree"),
                 constraint: LayoutConstraint::Percentage(40),
                 activatable: true,

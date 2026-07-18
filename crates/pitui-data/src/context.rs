@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use bevy_ecs::prelude::{Component, Entity, Message, Resource};
 
 use crate::{
-    DatasetKind, OperationInvocation, RenderModeId, RenderProxyId, ResolvedKeyBinding,
-    ResolvedOperationSetId,
+    DatasetKind, RenderModeId, RenderProxyId, ResolvedKeyBinding, ResolvedOperationSetId,
+    StableOperationInvocation,
 };
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -63,8 +63,62 @@ pub struct UiContextSnapshot {
     pub render_bindings: RenderContextBindings,
 }
 
+/// Why a previous UI Context is retained.
+///
+/// A Context stack frame is not an untyped navigation history entry. The
+/// boundary kind determines which operation is allowed to consume it: an
+/// Active return may cross a View or [`ActiveHandoff`](Self::ActiveHandoff)
+/// boundary, while an interaction/commit overlay mutates only its own
+/// [`Overlay`](Self::Overlay) underlay.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum UiContextFrameKind {
+    View,
+    ActiveHandoff { direction: ActiveDirection },
+    Overlay,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UiContextFrame {
+    pub kind: UiContextFrameKind,
+    pub snapshot: UiContextSnapshot,
+}
+
 #[derive(Resource, Clone, Debug, Default, Eq, PartialEq)]
-pub struct ContextStack(pub Vec<UiContextSnapshot>);
+pub struct ContextStack(pub Vec<UiContextFrame>);
+
+impl ContextStack {
+    pub fn top(&self) -> Option<&UiContextFrame> {
+        self.0.last()
+    }
+
+    pub fn top_mut(&mut self) -> Option<&mut UiContextFrame> {
+        self.0.last_mut()
+    }
+
+    pub fn top_snapshot(&self) -> Option<&UiContextSnapshot> {
+        self.top().map(|frame| &frame.snapshot)
+    }
+
+    pub fn top_snapshot_mut(&mut self) -> Option<&mut UiContextSnapshot> {
+        self.top_mut().map(|frame| &mut frame.snapshot)
+    }
+
+    pub fn top_is(&self, kind: UiContextFrameKind) -> bool {
+        self.top().is_some_and(|frame| frame.kind == kind)
+    }
+
+    pub fn top_overlay_snapshot(&self) -> Option<&UiContextSnapshot> {
+        self.top()
+            .filter(|frame| frame.kind == UiContextFrameKind::Overlay)
+            .map(|frame| &frame.snapshot)
+    }
+
+    pub fn top_overlay_snapshot_mut(&mut self) -> Option<&mut UiContextSnapshot> {
+        self.top_mut()
+            .filter(|frame| frame.kind == UiContextFrameKind::Overlay)
+            .map(|frame| &mut frame.snapshot)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum InteractionContextType {
@@ -85,7 +139,7 @@ pub struct ShortcutHelpEntry {
 pub struct PaletteCommandEntry {
     pub name: String,
     pub label: String,
-    pub invocation: OperationInvocation,
+    pub invocation: StableOperationInvocation,
 }
 
 impl PaletteCommandEntry {
@@ -124,7 +178,7 @@ pub enum InteractionContextKind {
         prompt: String,
         options: Vec<String>,
         selected: usize,
-        pending: Box<OperationInvocation>,
+        pending: Box<StableOperationInvocation>,
     },
     TextInput {
         title: String,
@@ -132,7 +186,7 @@ pub enum InteractionContextKind {
         purpose: TextInputPurpose,
         input: String,
         error: Option<String>,
-        pending: Option<Box<OperationInvocation>>,
+        pending: Option<Box<StableOperationInvocation>>,
     },
 }
 

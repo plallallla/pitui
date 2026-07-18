@@ -14,10 +14,35 @@ use pitui_data::{
 use pitui_ecs::{
     ClipboardRequests, GitExecutionFailures, GitMutationSuccesses, OperationExecution,
     OperationExecutionLog, OperationNotices, PendingInteractionNotices, ProjectionDiagnostics,
-    RenderReconcileDiagnostics,
+    ProjectionRuntimeState, RenderReconcileDiagnostics,
 };
 
 use super::*;
+
+fn single_repository_key(app: &App) -> pitui_data::RepositoryKey {
+    let [repository] = app.repositories() else {
+        panic!("test fixture must contain exactly one repository");
+    };
+    let DatasetIdentity::Repository(repository) = &app
+        .runtime()
+        .world()
+        .get::<DatasetKey>(*repository)
+        .expect("repository Dataset must have a stable identity")
+        .0
+    else {
+        panic!("repository root must use Repository identity");
+    };
+    repository.clone()
+}
+
+fn single_repository_changes(app: &App) -> Entity {
+    let repository = single_repository_key(app);
+    app.runtime()
+        .world()
+        .resource::<DatasetIndex>()
+        .get(&DatasetIdentity::Changes(repository))
+        .expect("repository-scoped Changes Dataset must exist")
+}
 
 #[test]
 fn repository_arguments_preserve_order_and_remove_duplicates() {
@@ -160,12 +185,23 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     );
 
     let generation = frame.generation;
+    let builds = app
+        .runtime()
+        .world()
+        .resource::<ProjectionRuntimeState>()
+        .build_count;
     app.runtime_mut().run_schedule();
     assert_eq!(
         app.runtime().world().resource::<UiFrame>().generation,
         generation,
         "an unchanged schedule must not create a new frame or cause flicker"
     );
+    let projection = app.runtime().world().resource::<ProjectionRuntimeState>();
+    assert_eq!(
+        projection.build_count, builds,
+        "idle projection was invalidated: {projection:?}"
+    );
+    assert!(projection.skipped_count > 0);
 
     let repository_tree_rows = app
         .runtime()
@@ -241,7 +277,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
             .world()
             .resource::<OperationExecutionLog>()
             .0
-            .last(),
+            .back(),
         Some((_, OperationExecution::Completed))
     ));
 
@@ -978,12 +1014,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     fs::write(repository.path().join("README.md"), "pitui working tree\n").unwrap();
     fs::write(repository.path().join("NEW.md"), "untracked\n").unwrap();
     app.dispatch_input(pitui_data::InputIntent::Key(KeyStroke::control('g')));
-    let changes = app
-        .runtime()
-        .world()
-        .resource::<DatasetIndex>()
-        .get(&DatasetIdentity::GlobalChanges)
-        .unwrap();
+    let changes = single_repository_changes(&app);
     assert_eq!(
         app.runtime()
             .world()
@@ -1518,14 +1549,14 @@ fn changes_supports_clean_repositories_and_committing_the_last_visible_file() {
     git(&["commit", "-m", "initial"]);
 
     let mut app = App::open_from(repository.path(), Vec::new()).unwrap();
-    let changes = app
-        .runtime()
-        .world()
-        .resource::<DatasetIndex>()
-        .get(&DatasetIdentity::GlobalChanges)
-        .unwrap();
-
+    app.runtime_mut()
+        .set_git_runtime_retention(pitui_ecs::GitRuntimeRetention {
+            mutation_entries: 0,
+            failure_entries: 0,
+            ..pitui_ecs::GitRuntimeRetention::default()
+        });
     app.dispatch_input(InputIntent::Key(KeyStroke::control('g')));
+    let changes = single_repository_changes(&app);
     assert_eq!(
         app.runtime()
             .world()
@@ -1610,6 +1641,144 @@ fn changes_supports_clean_repositories_and_committing_the_last_visible_file() {
 }
 
 #[test]
+fn changes_snapshots_are_isolated_and_retained_per_repository() {
+    let workspace = tempfile::tempdir().unwrap();
+    let repository_a = workspace.path().join("repository-a");
+    let repository_b = workspace.path().join("repository-b");
+    fs::create_dir_all(&repository_a).unwrap();
+    fs::create_dir_all(&repository_b).unwrap();
+    for (repository, file) in [(&repository_a, "a.txt"), (&repository_b, "b.txt")] {
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repository)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Pitui Test"]);
+        git(&["config", "user.email", "pitui@example.invalid"]);
+        fs::write(repository.join(file), "base\n").unwrap();
+        git(&["add", file]);
+        git(&["commit", "-m", "initial"]);
+    }
+
+    let mut app = App::open_from(
+        workspace.path(),
+        vec![repository_a.clone(), repository_b.clone()],
+    )
+    .unwrap();
+    let [repository_a_dataset, repository_b_dataset] = app.repositories() else {
+        panic!("two repository roots must be retained");
+    };
+    let repository_a_dataset = *repository_a_dataset;
+    let repository_b_dataset = *repository_b_dataset;
+    let repository_key = |app: &App, repository| {
+        let DatasetIdentity::Repository(key) = &app
+            .runtime()
+            .world()
+            .get::<DatasetKey>(repository)
+            .unwrap()
+            .0
+        else {
+            panic!("repository Dataset has the wrong identity");
+        };
+        key.clone()
+    };
+    let key_a = repository_key(&app, repository_a_dataset);
+    let key_b = repository_key(&app, repository_b_dataset);
+    let root = app.root_dataset();
+    fs::write(repository_a.join("a.txt"), "changed in a\n").unwrap();
+    fs::write(repository_b.join("b.txt"), "changed in b\n").unwrap();
+
+    app.runtime_mut()
+        .world_mut()
+        .get_mut::<DatasetActiveElement>(root)
+        .unwrap()
+        .0 = Some(repository_a_dataset);
+    app.runtime_mut().run_schedule();
+    app.dispatch_input(InputIntent::Key(KeyStroke::control('g')));
+    let changes_a = app
+        .runtime()
+        .world()
+        .resource::<DatasetIndex>()
+        .get(&DatasetIdentity::Changes(key_a.clone()))
+        .unwrap();
+    assert_eq!(
+        app.runtime()
+            .world()
+            .resource::<ActiveUiContext>()
+            .active_dataset,
+        changes_a
+    );
+    app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Escape)));
+
+    app.runtime_mut()
+        .world_mut()
+        .get_mut::<DatasetActiveElement>(root)
+        .unwrap()
+        .0 = Some(repository_b_dataset);
+    app.runtime_mut().run_schedule();
+    app.dispatch_input(InputIntent::Key(KeyStroke::control('g')));
+    let changes_b = app
+        .runtime()
+        .world()
+        .resource::<DatasetIndex>()
+        .get(&DatasetIdentity::Changes(key_b.clone()))
+        .unwrap();
+
+    assert_ne!(changes_a, changes_b);
+    assert_eq!(
+        app.runtime()
+            .world()
+            .resource::<ActiveUiContext>()
+            .active_dataset,
+        changes_b
+    );
+    assert!(
+        app.runtime()
+            .world()
+            .resource::<pitui_data::DatasetRoots>()
+            .0
+            .contains(&changes_a)
+    );
+    assert!(
+        app.runtime()
+            .world()
+            .resource::<pitui_data::DatasetRoots>()
+            .0
+            .contains(&changes_b)
+    );
+    for (changes, repository, path) in [(changes_a, key_a, "a.txt"), (changes_b, key_b, "b.txt")] {
+        assert!(
+            app.runtime()
+                .world()
+                .get::<DatasetCollection>(changes)
+                .unwrap()
+                .entities()
+                .any(|entity| matches!(
+                    app.runtime()
+                        .world()
+                        .get::<DatasetKey>(entity)
+                        .map(|key| &key.0),
+                    Some(DatasetIdentity::WorkingTreeFile {
+                        repository: owner,
+                        path: actual,
+                        ..
+                    }) if owner == &repository && actual.as_str() == path
+                ))
+        );
+    }
+    assert!(app.runtime_mut().validate().is_empty());
+}
+
+#[test]
 fn changes_multiselects_groups_and_directories_then_mutates_all_descendant_files() {
     let repository = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
@@ -1644,12 +1813,6 @@ fn changes_multiselects_groups_and_directories_then_mutates_all_descendant_files
 
     let mut app = App::open_from(repository.path(), Vec::new()).unwrap();
     app.dispatch_input(InputIntent::Key(KeyStroke::control('g')));
-    let changes = app
-        .runtime()
-        .world()
-        .resource::<DatasetIndex>()
-        .get(&DatasetIdentity::GlobalChanges)
-        .unwrap();
     let repository_key = match &app
         .runtime()
         .world()
@@ -1660,6 +1823,12 @@ fn changes_multiselects_groups_and_directories_then_mutates_all_descendant_files
         DatasetIdentity::Repository(repository) => repository.clone(),
         identity => panic!("expected Repository identity, got {identity:?}"),
     };
+    let changes = app
+        .runtime()
+        .world()
+        .resource::<DatasetIndex>()
+        .get(&DatasetIdentity::Changes(repository_key.clone()))
+        .unwrap();
     let group = |app: &App, boundary| {
         app.runtime()
             .world()
@@ -2031,12 +2200,7 @@ fn failed_commit_restores_changes_then_opens_a_redacted_notice_context() {
     let mut app = App::open_from(repository.path(), Vec::new()).unwrap();
     fs::write(repository.path().join("file.txt"), "changed\n").unwrap();
     app.dispatch_input(InputIntent::Key(KeyStroke::control('g')));
-    let changes = app
-        .runtime()
-        .world()
-        .resource::<DatasetIndex>()
-        .get(&DatasetIdentity::GlobalChanges)
-        .unwrap();
+    let changes = single_repository_changes(&app);
     app.dispatch_input(InputIntent::Key(KeyStroke::character('s')));
     app.dispatch_input(InputIntent::Key(KeyStroke::character('s')));
     app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Space)));
@@ -2327,7 +2491,7 @@ fn git_operation_log_is_a_collection_backed_two_column_context() {
 }
 
 #[test]
-fn injected_jsonl_sink_and_session_log_receive_the_same_git_results() {
+fn injected_jsonl_sink_keeps_full_history_while_session_log_is_bounded() {
     let repository = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
         let output = Command::new("git")
@@ -2358,9 +2522,18 @@ fn injected_jsonl_sink_and_session_log_receive_the_same_git_results() {
             max_message_chars: 4096,
         })
         .unwrap();
-    let app =
-        App::open_from_with_log_sink(repository.path(), Vec::new(), Arc::new(sink.clone()), None)
-            .unwrap();
+    let app = App::open_from_with_log_sink(
+        repository.path(),
+        Vec::new(),
+        Arc::new(sink.clone()),
+        None,
+        pitui_ecs::GitRuntimeRetention {
+            session_log_entries: 2,
+            ..pitui_ecs::GitRuntimeRetention::default()
+        },
+        None,
+    )
+    .unwrap();
     pitui_git::logging::GitOperationLogSink::flush(&sink);
 
     let log = app
@@ -2377,7 +2550,8 @@ fn injected_jsonl_sink_and_session_log_receive_the_same_git_results() {
         .0
         .len();
     let contents = fs::read_to_string(path).unwrap();
-    assert_eq!(contents.lines().count(), session_count);
+    assert_eq!(session_count, 2);
+    assert!(contents.lines().count() > session_count);
     assert!(contents.lines().all(|line| {
         line.starts_with('{')
             && line.ends_with('}')

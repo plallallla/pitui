@@ -35,6 +35,7 @@ pub enum AppError {
     BuiltinInteraction(String),
     BuiltinContract(Vec<RegistrationContractError>),
     GitLogOpen { path: PathBuf, error: io::Error },
+    HotkeyProfile(pitui_config::HotkeyProfileError),
     Invariant(Vec<InvariantViolation>),
 }
 
@@ -62,6 +63,12 @@ impl App {
     pub fn open(paths: Vec<PathBuf>) -> Result<Self, AppError> {
         let cwd = env::current_dir().map_err(AppError::CurrentDirectory)?;
         let config = pitui_config::default_git_logging_config();
+        let runtime_retention = pitui_ecs::GitRuntimeRetention {
+            failure_entries: config.failure_history_entries,
+            mutation_entries: config.mutation_history_entries,
+            session_log_entries: config.session_log_entries,
+            completed_load_entries: config.completed_load_entries,
+        };
         let (log_sink, startup_notice): (
             Arc<dyn pitui_git::logging::GitOperationLogSink>,
             Option<pitui_data::InteractionNoticeRequest>,
@@ -99,7 +106,18 @@ impl App {
         } else {
             (Arc::new(pitui_git::logging::NoopGitOperationLogSink), None)
         };
-        Self::open_from_with_log_sink(&cwd, paths, log_sink, startup_notice)
+        let hotkey_profile = pitui_config::hotkey_profile_path_from_env()
+            .map(|path| pitui_config::load_hotkey_profile(&path))
+            .transpose()
+            .map_err(AppError::HotkeyProfile)?;
+        Self::open_from_with_log_sink(
+            &cwd,
+            paths,
+            log_sink,
+            startup_notice,
+            runtime_retention,
+            hotkey_profile,
+        )
     }
 
     pub fn open_from(cwd: &Path, paths: Vec<PathBuf>) -> Result<Self, AppError> {
@@ -107,6 +125,8 @@ impl App {
             cwd,
             paths,
             Arc::new(pitui_git::logging::NoopGitOperationLogSink),
+            None,
+            pitui_ecs::GitRuntimeRetention::default(),
             None,
         )
     }
@@ -116,15 +136,24 @@ impl App {
         paths: Vec<PathBuf>,
         log_sink: Arc<dyn pitui_git::logging::GitOperationLogSink>,
         startup_notice: Option<pitui_data::InteractionNoticeRequest>,
+        runtime_retention: pitui_ecs::GitRuntimeRetention,
+        hotkey_profile: Option<pitui_config::HotkeyProfile>,
     ) -> Result<Self, AppError> {
         let mut runtime = DatasetRuntime::with_git_executor_and_log_sink(
             Arc::new(pitui_git::CliGitExecutor),
             log_sink,
         );
+        runtime.set_git_runtime_retention(runtime_retention);
         if let Some(notice) = startup_notice {
             runtime.enqueue_interaction_notice(notice);
         }
-        for template in pitui_config::builtin_dataset_templates() {
+        let mut templates = pitui_config::builtin_dataset_templates();
+        let mut global_operations = pitui_config::builtin_global_operation_set();
+        if let Some(profile) = &hotkey_profile {
+            pitui_config::apply_hotkey_profile(&mut templates, &mut global_operations, profile)
+                .map_err(AppError::HotkeyProfile)?;
+        }
+        for template in templates {
             let id = template.id.clone();
             runtime
                 .register_default_template(template)
@@ -157,7 +186,6 @@ impl App {
                 .register_operation(operation)
                 .map_err(|error| AppError::BuiltinInteraction(format!("{error:?}")))?;
         }
-        let global_operations = pitui_config::builtin_global_operation_set();
         runtime.set_global_operation_set(global_operations.operations, global_operations.hotkeys);
         runtime.set_active_handoffs(pitui_config::builtin_active_handoffs());
         runtime
@@ -184,12 +212,6 @@ impl App {
             .world_mut()
             .entity_mut(interaction_context)
             .insert(InteractionContextMetadata::default());
-        let changes = runtime.ensure_dataset(
-            DatasetIdentity::GlobalChanges,
-            DatasetKind::Changes,
-            DatasetTemplateId::from("changes"),
-        )?;
-        runtime.add_root(changes)?;
         let git_operation_log = runtime.ensure_dataset(
             DatasetIdentity::GlobalGitOperationLog,
             DatasetKind::GitOperationLog,

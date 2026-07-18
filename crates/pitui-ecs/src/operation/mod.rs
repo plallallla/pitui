@@ -34,14 +34,17 @@ use pitui_data::{
     OperationNotice, OperationRegistry, OperationSpec, PaletteCommandEntry, PendingChordState,
     QuitRequested, ReflogEntryMetadata, RenderBindingPatch, RenderModeId, RenderProxyId,
     RepositoryMetadata, ResolvedKeyAction, ResolvedKeyBinding, ResolvedOperation,
-    ResolvedOperationSet, ResolvedOperationSetId, ShortcutHelpEntry, TargetSource, TextEdit,
-    TextEditIntent, WorkingTreeFileMetadata,
+    ResolvedOperationSet, ResolvedOperationSetId, ShortcutHelpEntry, StableOperationInvocation,
+    TargetSource, TextEdit, TextEditIntent, UiContextFrameKind, WorkingTreeFileMetadata,
 };
 use pitui_git::GitCommand;
 
 use crate::{
     ensure_dataset_in_world,
-    git_runtime::{GitCommandData, GitMutationSuccesses},
+    git_runtime::{
+        GitCommandData, GitRefreshPlan, GitRefreshTarget, GitRequestId, GitRequestOutcome,
+        GitRequestOutcomes, GitRequestQueue,
+    },
 };
 
 mod executor;
@@ -63,11 +66,12 @@ pub fn initialize_operation_layer(world: &mut World) {
     world.init_resource::<OperationManager>();
     world.init_resource::<OperationExecutionLog>();
     world.init_resource::<OperationNotices>();
+    world.init_resource::<OperationRuntimeRetention>();
     world.init_resource::<ClipboardRequests>();
     world.init_resource::<PendingInteractionNotices>();
     world.init_resource::<PendingOperationInvocations>();
-    world.init_resource::<DeferredOperationInvocations>();
-    world.init_resource::<PendingChangesActiveRelay>();
+    world.init_resource::<DeferredStableOperationInvocations>();
+    world.init_resource::<PendingChangesActiveRelays>();
     world.init_resource::<QuitRequested>();
     world.init_resource::<Messages<InputIntent>>();
     world.init_resource::<Messages<OperationInvocation>>();

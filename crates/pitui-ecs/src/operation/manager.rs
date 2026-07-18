@@ -22,10 +22,25 @@ pub struct OperationManager(
 );
 
 #[derive(Resource, Clone, Debug, Default, Eq, PartialEq)]
-pub struct OperationExecutionLog(pub Vec<(OperationInvocation, OperationExecution)>);
+pub struct OperationExecutionLog(pub VecDeque<(OperationInvocation, OperationExecution)>);
 
 #[derive(Resource, Clone, Debug, Default, Eq, PartialEq)]
-pub struct OperationNotices(pub Vec<OperationNotice>);
+pub struct OperationNotices(pub VecDeque<OperationNotice>);
+
+#[derive(Resource, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationRuntimeRetention {
+    pub execution_entries: usize,
+    pub notice_entries: usize,
+}
+
+impl Default for OperationRuntimeRetention {
+    fn default() -> Self {
+        Self {
+            execution_entries: 512,
+            notice_entries: 256,
+        }
+    }
+}
 
 #[derive(Resource, Clone, Debug, Default, Eq, PartialEq)]
 pub struct ClipboardRequests(pub Vec<ClipboardRequest>);
@@ -220,18 +235,25 @@ pub fn dispatch_pending_operations(world: &mut World) {
                 },
             );
         }
-        world
-            .resource_mut::<OperationExecutionLog>()
-            .0
-            .push((invocation, execution));
+        let limit = world
+            .resource::<OperationRuntimeRetention>()
+            .execution_entries;
+        push_bounded(
+            &mut world.resource_mut::<OperationExecutionLog>().0,
+            (invocation, execution),
+            limit,
+        );
     }
 }
 
 pub fn collect_operation_notices(
     mut notices: MessageReader<OperationNotice>,
     mut collected: ResMut<OperationNotices>,
+    retention: Res<OperationRuntimeRetention>,
 ) {
-    collected.0.extend(notices.read().cloned());
+    for notice in notices.read().cloned() {
+        push_bounded(&mut collected.0, notice, retention.notice_entries);
+    }
 }
 
 pub fn collect_clipboard_requests(
@@ -320,4 +342,31 @@ fn write_notice(world: &mut World, notice: OperationNotice) {
     world
         .resource_mut::<Messages<OperationNotice>>()
         .write(notice);
+}
+
+fn push_bounded<T>(history: &mut VecDeque<T>, value: T, limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    while history.len() >= limit {
+        history.pop_front();
+    }
+    history.push_back(value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_bounded;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn diagnostic_history_discards_the_oldest_entries() {
+        let mut history = VecDeque::new();
+        for value in 0..4 {
+            push_bounded(&mut history, value, 2);
+        }
+        assert_eq!(history, VecDeque::from([2, 3]));
+        push_bounded(&mut history, 4, 0);
+        assert_eq!(history, VecDeque::from([2, 3]));
+    }
 }
