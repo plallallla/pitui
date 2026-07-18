@@ -3,12 +3,13 @@
 use std::{fs, process::Command};
 
 use pitui_data::{
-    ActiveRenderMode, ActiveUiContext, ClipboardContentKind, CommitCreationMetadata, ContextStack,
-    DatasetActiveElement, DatasetChildren, DatasetIdentity, DatasetKey, DatasetSelection, FieldId,
-    GitOperationLogEntryMetadata, GitOperationStatus, InteractionContextKind,
-    InteractionContextMetadata, KeyCode, KeyModifiers, KeyStroke, PendingChordState,
-    ReflogEntryMetadata, RenderContentProjection, RepositoryMetadata, ResolvedKeyAction,
-    ResolvedOperationSet, UiFrame, UiLayoutProjection,
+    ActiveRenderMode, ActiveUiContext, ClipboardContentKind, CommitCreationMetadata,
+    CommitFieldMetadata, ContextStack, DatasetActiveElement, DatasetChildren, DatasetCollection,
+    DatasetIdentity, DatasetKey, DatasetKind, DatasetSelection, DatasetType, DatasetViewId,
+    DatasetViewState, FieldId, GitOperationLogEntryMetadata, GitOperationStatus,
+    InteractionContextKind, InteractionContextMetadata, KeyCode, KeyModifiers, KeyStroke,
+    PendingChordState, ReflogEntryMetadata, RenderContentProjection, RepositoryMetadata,
+    ResolvedKeyAction, ResolvedOperationSet, UiFrame, UiLayoutProjection,
 };
 use pitui_ecs::{
     ClipboardRequests, CommandExecution, CommandExecutionLog, GitExecutionFailures,
@@ -533,6 +534,43 @@ fn composition_bootstraps_history_from_dataset_ecs() {
         "the same Commit row must remain highlighted after the mode change"
     );
     assert_eq!(app.runtime().world().resource::<ContextStack>().0.len(), 1);
+
+    let UiLayoutProjection::Column(commit_details) = &commit_mode_columns[1] else {
+        panic!("Commit mode must place Commit and Files in the right column");
+    };
+    let UiLayoutProjection::Dataset {
+        panel: commit_panel,
+        ..
+    } = &commit_details[0]
+    else {
+        panic!("standalone Commit must be its own Dataset panel");
+    };
+    assert_eq!(commit_panel.dataset, commit_dataset);
+    assert!(!commit_panel.active);
+    let RenderContentProjection::Rows(fields) = &commit_panel.content else {
+        panic!("Commit Dataset must expose independently actionable field rows");
+    };
+    assert!(fields.rows.iter().all(|row| {
+        app.runtime()
+            .world()
+            .get::<DatasetType>(row.entity)
+            .is_some_and(|kind| kind.0 == DatasetKind::CommitField)
+    }));
+    assert!(fields.rows.iter().any(|row| {
+        app.runtime()
+            .world()
+            .get::<CommitFieldMetadata>(row.entity)
+            .is_some_and(|metadata| metadata.field == pitui_data::CommitFieldKind::Hash)
+    }));
+    assert!(fields.rows.iter().any(|row| {
+        app.runtime()
+            .world()
+            .get::<CommitFieldMetadata>(row.entity)
+            .is_some_and(|metadata| metadata.field == pitui_data::CommitFieldKind::Author)
+    }));
+
+    // A second Right activates Commit itself without changing its selected
+    // Commit row in the Commits owner. W/S and Space now operate on fields.
     app.runtime_mut()
         .enqueue_input_intent(pitui_data::InputIntent::Key(KeyStroke::character('d')));
     app.runtime_mut().run_schedule();
@@ -541,12 +579,166 @@ fn composition_bootstraps_history_from_dataset_ecs() {
             .world()
             .resource::<ActiveUiContext>()
             .active_dataset,
-        files_dataset
+        commit_dataset
     );
     assert_eq!(
         app.runtime().world().resource::<ContextStack>().0.len(),
         1,
         "moving between activatable leaves must not push another context"
+    );
+
+    let hash_field = app
+        .runtime()
+        .world()
+        .get::<DatasetActiveElement>(commit_dataset)
+        .unwrap()
+        .0
+        .unwrap();
+    assert_eq!(
+        app.runtime()
+            .world()
+            .get::<CommitFieldMetadata>(hash_field)
+            .unwrap()
+            .field,
+        pitui_data::CommitFieldKind::Hash
+    );
+    app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Space)));
+    app.dispatch_input(InputIntent::Key(KeyStroke::character('s')));
+    let author_field = app
+        .runtime()
+        .world()
+        .get::<DatasetActiveElement>(commit_dataset)
+        .unwrap()
+        .0
+        .unwrap();
+    assert_eq!(
+        app.runtime()
+            .world()
+            .get::<CommitFieldMetadata>(author_field)
+            .unwrap()
+            .field,
+        pitui_data::CommitFieldKind::Author
+    );
+    app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Space)));
+    assert_eq!(
+        app.runtime()
+            .world()
+            .get::<DatasetSelection>(commit_dataset)
+            .unwrap()
+            .0,
+        vec![hash_field, author_field]
+    );
+    app.dispatch_input(InputIntent::Key(KeyStroke::control('c')));
+    let field_copy_chord = app.runtime().world().resource::<ResolvedOperationSet>();
+    assert_eq!(
+        field_copy_chord
+            .key_bindings
+            .keys()
+            .filter_map(|stroke| match stroke.code {
+                KeyCode::Character(character) => Some(character),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from(['v'])
+    );
+    app.dispatch_input(InputIntent::Key(KeyStroke::character('v')));
+    let copied_fields = app
+        .runtime()
+        .world()
+        .resource::<ClipboardRequests>()
+        .0
+        .last()
+        .unwrap();
+    assert_eq!(copied_fields.kind, ClipboardContentKind::CommitFieldValues);
+    assert!(copied_fields.text.starts_with("Hash: "));
+    assert!(copied_fields.text.contains("\nAuthor: Pitui Test"));
+
+    // A further Right relays Active from Commit to Files.
+    app.dispatch_input(InputIntent::Key(KeyStroke::character('d')));
+    assert_eq!(
+        app.runtime()
+            .world()
+            .resource::<ActiveUiContext>()
+            .active_dataset,
+        files_dataset
+    );
+
+    let file_dag_before = app
+        .runtime()
+        .world()
+        .get::<DatasetChildren>(files_dataset)
+        .unwrap()
+        .0
+        .clone();
+    assert_eq!(
+        app.runtime()
+            .world()
+            .get::<DatasetViewState>(files_dataset)
+            .unwrap()
+            .0,
+        Some(DatasetViewId::from("tree"))
+    );
+    app.dispatch_input(InputIntent::Key(KeyStroke::character('v')));
+    assert_eq!(
+        app.runtime()
+            .world()
+            .get::<DatasetViewState>(files_dataset)
+            .unwrap()
+            .0,
+        Some(DatasetViewId::from("list"))
+    );
+    assert_eq!(
+        app.runtime()
+            .world()
+            .get::<DatasetChildren>(files_dataset)
+            .unwrap()
+            .0,
+        file_dag_before,
+        "switching Files to List must keep the underlying tree DAG unchanged"
+    );
+    assert!(
+        app.runtime()
+            .world()
+            .get::<DatasetCollection>(files_dataset)
+            .unwrap()
+            .0
+            .iter()
+            .all(|element| {
+                element.depth == 0
+                    && app
+                        .runtime()
+                        .world()
+                        .get::<DatasetType>(element.entity)
+                        .is_some_and(|kind| kind.0 == DatasetKind::File)
+            })
+    );
+    let UiLayoutProjection::Row(columns) = &app.runtime().world().resource::<UiFrame>().layout
+    else {
+        panic!("Commit mode must remain a row after switching Files View");
+    };
+    let UiLayoutProjection::Column(details) = &columns[1] else {
+        panic!("Commit details must remain a column");
+    };
+    let UiLayoutProjection::Dataset { panel, .. } = &details[1] else {
+        panic!("Files must remain a Dataset panel");
+    };
+    assert_eq!(panel.proxy.0, "files.list");
+    app.dispatch_input(InputIntent::Key(KeyStroke::character('v')));
+    assert_eq!(
+        app.runtime()
+            .world()
+            .get::<DatasetViewState>(files_dataset)
+            .unwrap()
+            .0,
+        Some(DatasetViewId::from("tree"))
+    );
+    assert_eq!(
+        app.runtime()
+            .world()
+            .get::<DatasetChildren>(files_dataset)
+            .unwrap()
+            .0,
+        file_dag_before
     );
 
     app.runtime_mut()
@@ -755,6 +947,7 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     for expected in [
         (files_dataset, RenderModeId::from("file-diff.unified"), 2),
         (files_dataset, RenderModeId::from("commit"), 1),
+        (commit_dataset, RenderModeId::from("commit"), 1),
         (commits_dataset, RenderModeId::from("commit"), 1),
         (commits_dataset, RenderModeId::from("history"), 0),
         (app.root_dataset(), RenderModeId::from("history"), 0),
@@ -1417,7 +1610,7 @@ fn changes_supports_clean_repositories_and_committing_the_last_visible_file() {
 }
 
 #[test]
-fn changes_multiselects_directories_and_stages_or_unstages_all_descendant_files() {
+fn changes_multiselects_groups_and_directories_then_mutates_all_descendant_files() {
     let repository = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
         let output = Command::new("git")
@@ -1467,6 +1660,16 @@ fn changes_multiselects_directories_and_stages_or_unstages_all_descendant_files(
         DatasetIdentity::Repository(repository) => repository.clone(),
         identity => panic!("expected Repository identity, got {identity:?}"),
     };
+    let group = |app: &App, boundary| {
+        app.runtime()
+            .world()
+            .resource::<DatasetIndex>()
+            .get(&DatasetIdentity::WorkingTreeFiles {
+                repository: repository_key.clone(),
+                boundary,
+            })
+            .unwrap_or_else(|| panic!("missing {boundary:?} working-tree group"))
+    };
     let directory = |app: &App, boundary, path: &str| {
         app.runtime()
             .world()
@@ -1495,6 +1698,7 @@ fn changes_multiselects_directories_and_stages_or_unstages_all_descendant_files(
         stroke
     };
 
+    let unstaged_group = group(&app, pitui_data::ChangeBoundary::Unstaged);
     let docs = directory(&app, pitui_data::ChangeBoundary::Unstaged, "docs");
     let src = directory(&app, pitui_data::ChangeBoundary::Unstaged, "src");
     let nested = directory(&app, pitui_data::ChangeBoundary::Unstaged, "src/nested");
@@ -1504,6 +1708,33 @@ fn changes_multiselects_directories_and_stages_or_unstages_all_descendant_files(
         &app,
         pitui_data::ChangeBoundary::Unstaged,
         "src/nested/mod.rs",
+    );
+    app.runtime_mut()
+        .set_active_element(changes, Some(unstaged_group))
+        .unwrap();
+    app.runtime_mut().run_schedule();
+    app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Space)));
+    assert_eq!(
+        app.runtime()
+            .world()
+            .get::<DatasetSelection>(changes)
+            .unwrap()
+            .0
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([unstaged_group, docs, guide, src, nested, lib, module,]),
+        "selecting the Unstaged group must select every directory and file below it"
+    );
+    app.dispatch_input(InputIntent::Key(KeyStroke::plain(KeyCode::Space)));
+    assert!(
+        app.runtime()
+            .world()
+            .get::<DatasetSelection>(changes)
+            .unwrap()
+            .0
+            .is_empty(),
+        "toggling the selected Unstaged group must clear its complete subtree"
     );
     for target in [src, docs] {
         app.runtime_mut()
@@ -1521,7 +1752,7 @@ fn changes_multiselects_directories_and_stages_or_unstages_all_descendant_files(
             .iter()
             .copied()
             .collect::<std::collections::HashSet<_>>(),
-        std::collections::HashSet::from([docs, guide, src, nested, lib, module]),
+        std::collections::HashSet::from([unstaged_group, docs, guide, src, nested, lib, module,]),
         "selecting parent directories must select every descendant Dataset row"
     );
 
@@ -1555,6 +1786,7 @@ fn changes_multiselects_directories_and_stages_or_unstages_all_descendant_files(
         "staging selected directories must expand to every descendant file"
     );
 
+    let staged_group = group(&app, pitui_data::ChangeBoundary::Staged);
     let staged_docs = directory(&app, pitui_data::ChangeBoundary::Staged, "docs");
     let staged_src = directory(&app, pitui_data::ChangeBoundary::Staged, "src");
     for target in [staged_src, staged_docs] {
@@ -1571,8 +1803,16 @@ fn changes_multiselects_directories_and_stages_or_unstages_all_descendant_files(
             .unwrap()
             .0
             .len(),
-        6,
-        "staged parent selection must include nested directories and files"
+        7,
+        "staged parent selection must include the group, nested directories and files"
+    );
+    assert!(
+        app.runtime()
+            .world()
+            .get::<DatasetSelection>(changes)
+            .unwrap()
+            .0
+            .contains(&staged_group)
     );
     app.dispatch_input(InputIntent::Key(shifted('u')));
     assert!(

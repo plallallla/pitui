@@ -2,11 +2,12 @@ use std::{fs, path::Path, process::Command};
 
 use pitui_core::{BranchName, CommitHash, GitPath};
 use pitui_data::{
-    CellProjection, DatasetIdentity, DatasetIndex, DatasetKind, DatasetTemplateId, DatasetType,
-    DatasetViewport, DetailProjection, FieldId, InputIntent, KeyCode, KeyStroke, RenderBindingId,
-    RenderContentProjection, RenderContextBindings, RenderModeId, RendererKind,
-    ResolvedOperationSet, ResolvedOperationSetId, RowProjectionKind, SideBySideDiffProjection,
-    UiFrame, UiLayoutProjection, UnifiedDiffProjection, ViewportMeasurement,
+    CellProjection, DatasetChildren, DatasetIdentity, DatasetIndex, DatasetKind, DatasetTemplateId,
+    DatasetType, DatasetViewId, DatasetViewState, DatasetViewport, FieldId, InputIntent, KeyCode,
+    KeyStroke, RenderBindingId, RenderContentProjection, RenderContextBindings, RenderModeId,
+    RendererKind, ResolvedOperationSet, ResolvedOperationSetId, RowProjectionKind, RowsProjection,
+    SideBySideDiffProjection, UiFrame, UiLayoutProjection, UnifiedDiffProjection,
+    ViewportMeasurement,
 };
 use pitui_ecs::{DatasetRuntime, GitCommandData, ProjectionDiagnostics};
 use pitui_git::GitCommand;
@@ -77,14 +78,14 @@ fn configured_runtime() -> DatasetRuntime {
     runtime
 }
 
-fn detail_fields(layout: &UiLayoutProjection) -> &DetailProjection {
+fn row_fields(layout: &UiLayoutProjection) -> &RowsProjection {
     let UiLayoutProjection::Dataset { panel, .. } = layout else {
         panic!("expected Dataset projection");
     };
-    let RenderContentProjection::Detail(detail) = &panel.content else {
-        panic!("expected Detail projection");
+    let RenderContentProjection::Rows(rows) = &panel.content else {
+        panic!("expected Rows projection");
     };
-    detail
+    rows
 }
 
 fn cell(fields: &[CellProjection], id: FieldId) -> &str {
@@ -93,6 +94,15 @@ fn cell(fields: &[CellProjection], id: FieldId) -> &str {
         .find(|field| field.field == id)
         .unwrap_or_else(|| panic!("missing projected field {id:?}"))
         .text
+}
+
+fn commit_field<'a>(rows: &'a RowsProjection, label: &str) -> &'a str {
+    let row = rows
+        .rows
+        .iter()
+        .find(|row| cell(&row.cells, FieldId::CommitFieldLabel) == label)
+        .unwrap_or_else(|| panic!("missing Commit field {label}"));
+    cell(&row.cells, FieldId::CommitFieldValue)
 }
 
 #[test]
@@ -225,13 +235,10 @@ fn commit_and_file_diff_modes_project_complete_immutable_data() {
         panic!("commit detail and files must remain in the left column");
     };
     assert_eq!(left.len(), 2);
-    let detail = detail_fields(&left[0]);
-    assert_eq!(cell(&detail.fields, FieldId::CommitSubject), "second");
-    assert_eq!(
-        cell(&detail.fields, FieldId::CommitMessage),
-        "second\n\nbody"
-    );
-    assert_eq!(cell(&detail.fields, FieldId::CommitAuthoredAt).len(), 16);
+    let commit_rows = row_fields(&left[0]);
+    assert_eq!(commit_field(commit_rows, "Subject"), "second");
+    assert_eq!(commit_field(commit_rows, "Message"), "second ↵  ↵ body");
+    assert_eq!(commit_field(commit_rows, "Date").len(), 16);
     let UiLayoutProjection::Dataset {
         panel: files_panel, ..
     } = &left[1]
@@ -306,6 +313,82 @@ fn commit_and_file_diff_modes_project_complete_immutable_data() {
             .resource::<ProjectionDiagnostics>()
             .0
             .is_empty()
+    );
+
+    let ownership_before = runtime
+        .world()
+        .get::<DatasetChildren>(files)
+        .unwrap()
+        .0
+        .clone();
+    runtime.set_selection(files, vec![docs_directory]).unwrap();
+    runtime.run_schedule();
+    assert_eq!(
+        runtime
+            .world()
+            .get::<pitui_data::DatasetSelection>(files)
+            .unwrap()
+            .0
+            .len(),
+        2,
+        "Tree parent selection must include its File descendant"
+    );
+    runtime
+        .world_mut()
+        .entity_mut(files)
+        .insert(DatasetViewState(Some(DatasetViewId::from("list"))));
+    runtime.run_schedule();
+    let UiLayoutProjection::Row(columns) = &runtime.world().resource::<UiFrame>().layout else {
+        panic!("file diff mode must remain a row after switching Files View");
+    };
+    let UiLayoutProjection::Column(left) = &columns[0] else {
+        panic!("left side must retain Commit and Files");
+    };
+    let UiLayoutProjection::Dataset { panel, .. } = &left[1] else {
+        panic!("Files must remain a Dataset panel");
+    };
+    assert_eq!(panel.proxy.0, "files.list");
+    assert_eq!(panel.renderer, RendererKind::List);
+    let RenderContentProjection::Rows(rows) = &panel.content else {
+        panic!("flat Files View must project rows");
+    };
+    assert_eq!(rows.rows.len(), 4);
+    assert!(rows.rows.iter().all(|row| {
+        row.kind == RowProjectionKind::Item
+            && row.depth == 0
+            && runtime
+                .world()
+                .get::<DatasetType>(row.entity)
+                .is_some_and(|kind| kind.0 == DatasetKind::File)
+    }));
+    assert_eq!(
+        runtime
+            .world()
+            .get::<pitui_data::DatasetSelection>(files)
+            .unwrap()
+            .0
+            .len(),
+        1,
+        "List View must preserve the selected File while hiding its directory row"
+    );
+    assert_eq!(
+        runtime.world().get::<DatasetChildren>(files).unwrap().0,
+        ownership_before,
+        "switching Files View must not rewrite the ownership DAG"
+    );
+    runtime
+        .world_mut()
+        .entity_mut(files)
+        .insert(DatasetViewState(Some(DatasetViewId::from("tree"))));
+    runtime.run_schedule();
+    assert!(
+        runtime
+            .world()
+            .get::<pitui_data::DatasetSelection>(files)
+            .unwrap()
+            .0
+            .contains(&docs_directory),
+        "returning to Tree View must derive the selected parent from selected descendants"
     );
 
     runtime.enqueue_viewport_measurement(ViewportMeasurement {

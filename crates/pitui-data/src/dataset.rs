@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use bevy_ecs::prelude::{Bundle, Component, Entity, Resource};
 
-use crate::{DatasetIdentity, DatasetKind, DatasetTemplateId};
+use crate::{DatasetIdentity, DatasetKind, DatasetTemplateId, DatasetViewId};
 
 #[derive(Component, Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Dataset;
@@ -93,6 +93,11 @@ impl Default for DatasetViewport {
 #[derive(Component, Clone, Debug, Eq, PartialEq)]
 pub struct DatasetTemplateRef(pub DatasetTemplateId);
 
+/// Selected presentation of one Dataset. `None` means the Template has no
+/// switchable Views; otherwise the ID must resolve in that Template.
+#[derive(Component, Clone, Debug, Default, Eq, PartialEq)]
+pub struct DatasetViewState(pub Option<DatasetViewId>);
+
 #[derive(Component, Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HasSnapshot(pub bool);
 
@@ -108,6 +113,7 @@ pub struct DatasetBundle {
     pub selection: DatasetSelection,
     pub viewport: DatasetViewport,
     pub template: DatasetTemplateRef,
+    pub view: DatasetViewState,
     pub has_snapshot: HasSnapshot,
 }
 
@@ -124,6 +130,7 @@ impl DatasetBundle {
             selection: DatasetSelection::default(),
             viewport: DatasetViewport::default(),
             template: DatasetTemplateRef(template),
+            view: DatasetViewState::default(),
             has_snapshot: HasSnapshot::default(),
         }
     }

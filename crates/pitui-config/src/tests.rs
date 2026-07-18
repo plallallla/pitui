@@ -7,7 +7,7 @@ use super::*;
 #[test]
 fn builtins_cover_every_dataset_kind_once() {
     let templates = builtin_dataset_templates();
-    assert_eq!(templates.len(), 21);
+    assert_eq!(templates.len(), 22);
     let kinds = templates
         .iter()
         .map(|template| template.kind)
@@ -27,7 +27,7 @@ fn every_template_proxy_resolves_to_the_same_dataset_kind() {
         .into_iter()
         .map(|proxy| (proxy.id.clone(), proxy))
         .collect::<std::collections::HashMap<_, _>>();
-    assert_eq!(proxies.len(), 24);
+    assert_eq!(proxies.len(), 26);
 
     for template in builtin_dataset_templates() {
         for proxy_id in template.render_proxies {
@@ -40,7 +40,7 @@ fn every_template_proxy_resolves_to_the_same_dataset_kind() {
 }
 
 #[test]
-fn file_collection_proxies_are_path_trees() {
+fn file_collection_proxies_support_tree_and_flat_list() {
     let proxies = builtin_render_proxies()
         .into_iter()
         .map(|proxy| (proxy.id.clone(), proxy))
@@ -53,7 +53,10 @@ fn file_collection_proxies_are_path_trees() {
             "{id} must preserve directory structure instead of flattening Git paths"
         );
     }
-    assert!(!proxies.contains_key(&RenderProxyId::from("files.list")));
+    assert_eq!(
+        proxies[&RenderProxyId::from("files.list")].renderer,
+        RendererKind::List
+    );
     assert!(!proxies.contains_key(&RenderProxyId::from("working-tree-files.list")));
 }
 
@@ -82,6 +85,15 @@ fn collection_managers_are_declared_by_dataset_templates() {
                 .all(|kind| tree.visible_kinds.contains(kind))
         );
     }
+    let CollectionManagerSpec::Tree(changes) = &templates[&DatasetKind::Changes].collection else {
+        unreachable!("Changes was already verified as a Tree Manager")
+    };
+    assert!(
+        changes
+            .selectable_kinds
+            .contains(&DatasetKind::WorkingTreeFiles),
+        "the Staged/Unstaged group rows must select their complete subtrees"
+    );
     for kind in [
         DatasetKind::Commits,
         DatasetKind::Reflog,
@@ -90,10 +102,31 @@ fn collection_managers_are_declared_by_dataset_templates() {
     ] {
         assert_eq!(
             templates[&kind].collection,
-            CollectionManagerSpec::List,
+            CollectionManagerSpec::default(),
             "{kind:?} must keep independent List Manager semantics"
         );
     }
+
+    let files = &templates[&DatasetKind::Files];
+    assert_eq!(
+        files
+            .views
+            .iter()
+            .map(|view| view.id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tree", "list"]
+    );
+    assert!(matches!(
+        &files.views[0].collection,
+        CollectionManagerSpec::Tree(_)
+    ));
+    assert!(matches!(
+        &files.views[1].collection,
+        CollectionManagerSpec::List(ListManagerSpec {
+            source: ListSource::Descendants,
+            ..
+        })
+    ));
 }
 
 #[test]

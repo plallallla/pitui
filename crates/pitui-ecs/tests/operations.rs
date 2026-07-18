@@ -22,7 +22,8 @@ fn register_template(
         .register_template(DatasetTemplate {
             id: id.clone(),
             kind,
-            collection: pitui_data::CollectionManagerSpec::List,
+            collection: pitui_data::CollectionManagerSpec::default(),
+            views: Vec::new(),
             operations,
             render_proxies: vec![RenderProxyId::from("test")],
         })

@@ -6,18 +6,18 @@ use pitui_core::{
 };
 use pitui_data::{
     ActiveRenderMode, ActiveUiContext, BranchMetadata, CellProjection, ChangeBoundary,
-    CommitCreationMetadata, CommitMetadata, DatasetActiveElement, DatasetCollection,
-    DatasetIdentity, DatasetKey, DatasetKind, DatasetSelection, DatasetType, DatasetViewport,
-    DateTimePrecision, DetailProjection, FieldFormat, FieldId, FieldSpec, FileChangesMetadata,
-    FileMetadata, FileTreeDirectoryMetadata, FooterProjection, GitOperationLogEntryMetadata,
-    InteractionContextKind, InteractionContextMetadata, InteractionLineProjection,
-    InteractionProjection, ReflogEntryMetadata, RemoteMetadata, RenderBindingId,
-    RenderContentProjection, RenderProxyId, RenderProxyProjection, RenderProxyRegistry,
-    RenderProxySpec, RendererKind, RepositoryMetadata, ResolvedOperationSet, ResolvedRenderLayout,
-    RowProjection, RowProjectionKind, RowsProjection, SideBySideDiffProjection,
-    SideBySideHunkProjection, StatusProjection, UiFrame, UiLayoutProjection,
-    UnifiedDiffHunkProjection, UnifiedDiffProjection, ViewportMeasurement, ViewportProjection,
-    WorkingTreeFileChangesMetadata, WorkingTreeFileMetadata,
+    CommitCreationMetadata, CommitFieldMetadata, CommitMetadata, DatasetActiveElement,
+    DatasetCollection, DatasetIdentity, DatasetKey, DatasetKind, DatasetSelection, DatasetType,
+    DatasetViewState, DatasetViewport, DateTimePrecision, DetailProjection, FieldFormat, FieldId,
+    FieldSpec, FileChangesMetadata, FileMetadata, FileTreeDirectoryMetadata, FooterProjection,
+    GitOperationLogEntryMetadata, InteractionContextKind, InteractionContextMetadata,
+    InteractionLineProjection, InteractionProjection, ReflogEntryMetadata, RemoteMetadata,
+    RenderBindingId, RenderContentProjection, RenderProxyId, RenderProxyProjection,
+    RenderProxyRegistry, RenderProxySpec, RendererKind, RepositoryMetadata, ResolvedOperationSet,
+    ResolvedRenderLayout, RowProjection, RowProjectionKind, RowsProjection,
+    SideBySideDiffProjection, SideBySideHunkProjection, StatusProjection, UiFrame,
+    UiLayoutProjection, UnifiedDiffHunkProjection, UnifiedDiffProjection, ViewportMeasurement,
+    ViewportProjection, WorkingTreeFileChangesMetadata, WorkingTreeFileMetadata,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,13 +118,13 @@ fn dataset_content_length(world: &World, entity: Entity) -> usize {
             .map(|section| 1 + section.lines.len())
             .sum();
     }
-    if let Some(commit) = world.get::<CommitMetadata>(entity) {
-        return 5 + commit
-            .message
-            .as_deref()
-            .unwrap_or(&commit.summary.subject)
-            .lines()
-            .count();
+    if world
+        .get::<DatasetType>(entity)
+        .is_some_and(|kind| kind.0 == DatasetKind::Commit)
+    {
+        return world
+            .get::<DatasetCollection>(entity)
+            .map_or(0, |collection| collection.0.len());
     }
     if world.get::<FileMetadata>(entity).is_some()
         || world.get::<WorkingTreeFileMetadata>(entity).is_some()
@@ -277,7 +277,7 @@ fn project_dataset(
             &spec,
             active == Some(dataset),
         )),
-        RendererKind::Detail | RendererKind::CommitDetail => {
+        RendererKind::Detail => {
             RenderContentProjection::Detail(project_detail(world, dataset, &spec))
         }
         RendererKind::UnifiedDiff => project_unified_diff(world, dataset),
@@ -692,6 +692,12 @@ fn field_value(world: &World, entity: Entity, field: FieldId) -> Option<RawField
             .get::<CommitMetadata>(entity)
             .and_then(|metadata| metadata.message.clone())
             .map(RawFieldValue::Text),
+        Field::CommitFieldLabel => world
+            .get::<CommitFieldMetadata>(entity)
+            .map(|metadata| RawFieldValue::Text(metadata.field.label().into())),
+        Field::CommitFieldValue => world.get::<CommitFieldMetadata>(entity).map(|metadata| {
+            RawFieldValue::Text(metadata.value.lines().collect::<Vec<_>>().join(" ↵ "))
+        }),
         Field::CommitCreationStagedFiles => {
             world.get::<CommitCreationMetadata>(entity).map(|metadata| {
                 RawFieldValue::Many(
@@ -890,6 +896,9 @@ fn dataset_label(world: &World, entity: Entity) -> Option<String> {
     if let Some(metadata) = world.get::<BranchMetadata>(entity) {
         return Some(metadata.0.name.0.clone());
     }
+    if let Some(metadata) = world.get::<CommitFieldMetadata>(entity) {
+        return Some(metadata.field.label().into());
+    }
     if let Some(metadata) = world.get::<FileTreeDirectoryMetadata>(entity) {
         return Some(metadata.0.as_str().into());
     }
@@ -1058,7 +1067,13 @@ fn dataset_title(world: &World, dataset: Entity, kind: DatasetKind) -> String {
             Some(DatasetIdentity::Commit { hash, .. }) => format!("Commit · {}", hash.short()),
             _ => "Commit".into(),
         },
-        DatasetKind::Files => "Files".into(),
+        DatasetKind::CommitField => {
+            dataset_label(world, dataset).unwrap_or_else(|| "Commit Field".into())
+        }
+        DatasetKind::Files => world
+            .get::<DatasetViewState>(dataset)
+            .and_then(|state| state.0.as_ref())
+            .map_or_else(|| "Files".into(), |view| format!("Files · {}", view.0)),
         DatasetKind::FileTreeDirectory => {
             dataset_label(world, dataset).unwrap_or_else(|| "Directory".into())
         }

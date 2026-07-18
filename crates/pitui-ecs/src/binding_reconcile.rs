@@ -432,9 +432,13 @@ fn reconcile_commit_files(world: &World, bindings: &mut pitui_data::RenderContex
     set_or_clear(bindings, RenderBindingId::CurrentCommit, commit);
 
     let files = commit.and_then(|commit| {
-        world
-            .get::<DatasetChildren>(commit)
-            .and_then(|children| children.0.first().copied())
+        world.get::<DatasetChildren>(commit).and_then(|children| {
+            children.0.iter().copied().find(|child| {
+                world
+                    .get::<DatasetType>(*child)
+                    .is_some_and(|kind| kind.0 == pitui_data::DatasetKind::Files)
+            })
+        })
     });
     set_or_clear(bindings, RenderBindingId::CurrentFiles, files);
     if files.is_none() {

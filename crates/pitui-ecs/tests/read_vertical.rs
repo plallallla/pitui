@@ -32,7 +32,8 @@ fn register_default(runtime: &mut DatasetRuntime, id: &str, kind: DatasetKind) {
         .register_default_template(DatasetTemplate {
             id: DatasetTemplateId::from(id),
             kind,
-            collection: pitui_data::CollectionManagerSpec::List,
+            collection: pitui_data::CollectionManagerSpec::default(),
+            views: Vec::new(),
             operations: Vec::new(),
             render_proxies: Vec::new(),
         })
@@ -78,6 +79,7 @@ fn git_messages_build_the_canonical_dataset_chain_and_keep_cache_on_failure() {
         ("branch", DatasetKind::Branch),
         ("commits", DatasetKind::Commits),
         ("commit", DatasetKind::Commit),
+        ("commit-field", DatasetKind::CommitField),
         ("files", DatasetKind::Files),
         ("file-tree-directory", DatasetKind::FileTreeDirectory),
         ("file", DatasetKind::File),

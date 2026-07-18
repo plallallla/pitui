@@ -316,6 +316,7 @@ pub enum ClipboardContentKind {
     CommitHashes,
     CommitInfo,
     CommitMessage,
+    CommitFieldValues,
     ReflogHash,
     FileName,
     FileAbsolutePath,

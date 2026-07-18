@@ -4,7 +4,7 @@ use pitui_core::{
     WorkingTreeChange, WorkingTreeDiff,
 };
 
-use crate::RepositoryKey;
+use crate::{CommitFieldKind, RepositoryKey};
 
 #[derive(Component, Clone, Debug, Eq, PartialEq)]
 pub struct RepositoryMetadata(pub Repository);
@@ -17,6 +17,12 @@ pub struct CommitMetadata {
     pub summary: Commit,
     pub message: Option<String>,
     pub tags: Vec<String>,
+}
+
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+pub struct CommitFieldMetadata {
+    pub field: CommitFieldKind,
+    pub value: String,
 }
 
 #[derive(Component, Clone, Debug, Eq, PartialEq)]

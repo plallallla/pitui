@@ -18,12 +18,12 @@ use pitui_data::{
     CommandSpec, CommandSystemId, ContextStack, Dataset, DatasetActiveElement, DatasetBinding,
     DatasetBundle, DatasetChildren, DatasetCollection, DatasetIdentity, DatasetIndex, DatasetKey,
     DatasetKind, DatasetRevision, DatasetRoots, DatasetSelection, DatasetTemplate,
-    DatasetTemplateId, DatasetTemplateRef, DatasetTemplateRegistry, DatasetType,
-    DefaultDatasetTemplates, GlobalOperationSet, HasSnapshot, InputIntent, OperationId,
-    OperationRegistry, OperationRegistryError, OperationSpec, PendingChordState, QuitRequested,
-    RenderContextBindings, RenderLayout, RenderModeId, RenderModeRegistry, RenderModeSpec,
-    RenderProxyId, RenderProxyRegistry, RenderProxySpec, RenderRegistryError, ResolvedOperationSet,
-    ResolvedRenderLayout, UiContextSnapshot, UiFrame, ViewportMeasurement,
+    DatasetTemplateId, DatasetTemplateRef, DatasetTemplateRegistry, DatasetType, DatasetViewId,
+    DatasetViewState, DefaultDatasetTemplates, GlobalOperationSet, HasSnapshot, InputIntent,
+    OperationId, OperationRegistry, OperationRegistryError, OperationSpec, PendingChordState,
+    QuitRequested, RenderContextBindings, RenderLayout, RenderModeId, RenderModeRegistry,
+    RenderModeSpec, RenderProxyId, RenderProxyRegistry, RenderProxySpec, RenderRegistryError,
+    ResolvedOperationSet, ResolvedRenderLayout, UiContextSnapshot, UiFrame, ViewportMeasurement,
 };
 
 mod binding_reconcile;
@@ -148,6 +148,15 @@ pub enum RegistrationContractError {
         template: DatasetTemplateId,
         proxy: RenderProxyId,
     },
+    DuplicateTemplateView {
+        template: DatasetTemplateId,
+        view: DatasetViewId,
+    },
+    TemplateViewProxyNotDeclared {
+        template: DatasetTemplateId,
+        view: DatasetViewId,
+        proxy: RenderProxyId,
+    },
     DuplicateTreeVisibleKind {
         template: DatasetTemplateId,
         kind: DatasetKind,
@@ -233,6 +242,10 @@ pub enum InvariantViolation {
     DanglingRenderBinding(Entity),
     DanglingContextEntity(Entity),
     ActiveDatasetNotActivatable(Entity),
+    InvalidDatasetView {
+        dataset: Entity,
+        view: Option<DatasetViewId>,
+    },
 }
 
 /// Runtime owner for the Data Driven ECS world.
@@ -475,31 +488,23 @@ impl DatasetRuntime {
                     template.id.clone(),
                 ));
             }
-            if let CollectionManagerSpec::Tree(tree) = &template.collection {
-                let mut visible = HashSet::new();
-                for kind in &tree.visible_kinds {
-                    if !visible.insert(*kind) {
-                        errors.push(RegistrationContractError::DuplicateTreeVisibleKind {
-                            template: template.id.clone(),
-                            kind: *kind,
-                        });
-                    }
+            validate_collection_manager_contract(&template.id, &template.collection, &mut errors);
+            let mut seen_views = HashSet::new();
+            for view in &template.views {
+                if !seen_views.insert(view.id.clone()) {
+                    errors.push(RegistrationContractError::DuplicateTemplateView {
+                        template: template.id.clone(),
+                        view: view.id.clone(),
+                    });
                 }
-                let mut selectable = HashSet::new();
-                for kind in &tree.selectable_kinds {
-                    if !selectable.insert(*kind) {
-                        errors.push(RegistrationContractError::DuplicateTreeSelectableKind {
-                            template: template.id.clone(),
-                            kind: *kind,
-                        });
-                    }
-                    if !visible.contains(kind) {
-                        errors.push(RegistrationContractError::TreeSelectableKindNotVisible {
-                            template: template.id.clone(),
-                            kind: *kind,
-                        });
-                    }
+                if !template.render_proxies.contains(&view.render_proxy) {
+                    errors.push(RegistrationContractError::TemplateViewProxyNotDeclared {
+                        template: template.id.clone(),
+                        view: view.id.clone(),
+                        proxy: view.render_proxy.clone(),
+                    });
                 }
+                validate_collection_manager_contract(&template.id, &view.collection, &mut errors);
             }
             let mut seen_operations = HashSet::new();
             for operation_id in &template.operations {
@@ -667,6 +672,10 @@ impl DatasetRuntime {
             operation_runtime::toggle_selection,
         )?;
         self.register_command_system(
+            CommandSystemId::from("collection.view.next"),
+            operation_runtime::cycle_collection_view,
+        )?;
+        self.register_command_system(
             CommandSystemId::from("commits.cherry-pick"),
             operation_runtime::cherry_pick_selected,
         )?;
@@ -713,6 +722,10 @@ impl DatasetRuntime {
         self.register_command_system(
             CommandSystemId::from("copy.commit.message"),
             operation_runtime::copy_commit_message,
+        )?;
+        self.register_command_system(
+            CommandSystemId::from("copy.commit-field.values"),
+            operation_runtime::copy_commit_field_values,
         )?;
         self.register_command_system(
             CommandSystemId::from("copy.reflog.hash"),
@@ -1171,6 +1184,40 @@ fn validate_render_layout_contract(
     }
 }
 
+fn validate_collection_manager_contract(
+    template: &DatasetTemplateId,
+    manager: &CollectionManagerSpec,
+    errors: &mut Vec<RegistrationContractError>,
+) {
+    let CollectionManagerSpec::Tree(tree) = manager else {
+        return;
+    };
+    let mut visible = HashSet::new();
+    for kind in &tree.visible_kinds {
+        if !visible.insert(*kind) {
+            errors.push(RegistrationContractError::DuplicateTreeVisibleKind {
+                template: template.clone(),
+                kind: *kind,
+            });
+        }
+    }
+    let mut selectable = HashSet::new();
+    for kind in &tree.selectable_kinds {
+        if !selectable.insert(*kind) {
+            errors.push(RegistrationContractError::DuplicateTreeSelectableKind {
+                template: template.clone(),
+                kind: *kind,
+            });
+        }
+        if !visible.contains(kind) {
+            errors.push(RegistrationContractError::TreeSelectableKindNotVisible {
+                template: template.clone(),
+                kind: *kind,
+            });
+        }
+    }
+}
+
 pub(crate) fn ensure_dataset_in_world(
     world: &mut World,
     identity: DatasetIdentity,
@@ -1185,10 +1232,10 @@ pub(crate) fn ensure_dataset_in_world(
             actual: kind,
         });
     }
-    let template_kind = world
+    let (template_kind, template_views) = world
         .resource::<DatasetTemplateRegistry>()
         .get(&template)
-        .map(|definition| definition.kind)
+        .map(|definition| (definition.kind, definition.views.clone()))
         .ok_or_else(|| KernelError::MissingTemplate(template.clone()))?;
     if template_kind != kind {
         return Err(KernelError::TemplateKindMismatch {
@@ -1222,12 +1269,26 @@ pub(crate) fn ensure_dataset_in_world(
                 actual: actual_template,
             });
         }
+        let current_view = world
+            .get::<DatasetViewState>(entity)
+            .and_then(|state| state.0.clone());
+        let repaired_view = current_view
+            .filter(|selected| template_views.iter().any(|view| &view.id == selected))
+            .or_else(|| template_views.first().map(|view| view.id.clone()));
+        if world
+            .get::<DatasetViewState>(entity)
+            .is_none_or(|state| state.0 != repaired_view)
+        {
+            world
+                .entity_mut(entity)
+                .insert(DatasetViewState(repaired_view));
+        }
         return Ok(entity);
     }
 
-    let entity = world
-        .spawn(DatasetBundle::new(identity.clone(), kind, template))
-        .id();
+    let mut bundle = DatasetBundle::new(identity.clone(), kind, template);
+    bundle.view = DatasetViewState(template_views.first().map(|view| view.id.clone()));
+    let entity = world.spawn(bundle).id();
     world
         .resource_mut::<DatasetIndex>()
         .by_key
@@ -1296,9 +1357,23 @@ fn resolve_render_layout(
                     .get::<DatasetType>(entity)
                     .ok_or(KernelError::MissingDataset(entity))?
                     .0;
+                let proxy = world
+                    .get::<DatasetTemplateRef>(entity)
+                    .and_then(|template| {
+                        let template = world
+                            .resource::<DatasetTemplateRegistry>()
+                            .get(&template.0)?;
+                        let selected = world.get::<DatasetViewState>(entity)?.0.as_ref()?;
+                        template
+                            .views
+                            .iter()
+                            .find(|view| &view.id == selected)
+                            .map(|view| view.render_proxy.clone())
+                    })
+                    .unwrap_or_else(|| proxy.clone());
                 let spec = world
                     .resource::<RenderProxyRegistry>()
-                    .get(proxy)
+                    .get(&proxy)
                     .ok_or_else(|| KernelError::MissingRenderProxy(proxy.clone()))?;
                 if spec.dataset_kind != actual {
                     return Err(KernelError::RenderProxyKindMismatch {
@@ -1309,7 +1384,7 @@ fn resolve_render_layout(
                 }
                 Ok(Some(ResolvedRenderLayout::Dataset {
                     dataset: entity,
-                    proxy: proxy.clone(),
+                    proxy,
                     constraint: *constraint,
                     activatable: *activatable,
                 }))
@@ -1449,11 +1524,12 @@ fn validate_invariants(world: &mut World) -> Vec<InvariantViolation> {
             &DatasetActiveElement,
             &DatasetSelection,
             &DatasetTemplateRef,
+            &DatasetViewState,
         )>();
         query
             .iter(world)
             .map(
-                |(entity, key, kind, children, collection, active, selection, template)| {
+                |(entity, key, kind, children, collection, active, selection, template, view)| {
                     (
                         entity,
                         key.0.clone(),
@@ -1463,12 +1539,14 @@ fn validate_invariants(world: &mut World) -> Vec<InvariantViolation> {
                         active.0,
                         selection.0.clone(),
                         template.0.clone(),
+                        view.0.clone(),
                     )
                 },
             )
             .collect::<Vec<_>>()
     };
-    for (entity, identity, kind, children, elements, active, selection, template) in &datasets {
+    for (entity, identity, kind, children, elements, active, selection, template, view) in &datasets
+    {
         if index.get(identity) != Some(*entity) {
             violations.push(InvariantViolation::DatasetMissingFromIndex(
                 identity.clone(),
@@ -1512,7 +1590,28 @@ fn validate_invariants(world: &mut World) -> Vec<InvariantViolation> {
                 });
             }
         }
-        let expected = collection::expected_collection(world, template, children);
+        let valid_view = world
+            .resource::<DatasetTemplateRegistry>()
+            .get(template)
+            .is_some_and(|definition| {
+                if definition.views.is_empty() {
+                    view.is_none()
+                } else {
+                    view.as_ref().is_some_and(|selected| {
+                        definition
+                            .views
+                            .iter()
+                            .any(|candidate| candidate.id == *selected)
+                    })
+                }
+            });
+        if !valid_view {
+            violations.push(InvariantViolation::InvalidDatasetView {
+                dataset: *entity,
+                view: view.clone(),
+            });
+        }
+        let expected = collection::expected_collection(world, *entity, template, children);
         if elements != &expected.elements {
             violations.push(InvariantViolation::InvalidCollection(*entity));
         }

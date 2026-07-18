@@ -26,13 +26,14 @@ fn register(runtime: &mut DatasetRuntime, id: &str, kind: DatasetKind) -> Datase
             ],
             vec![DatasetKind::FileTreeDirectory, DatasetKind::WorkingTreeFile],
         ),
-        _ => pitui_data::CollectionManagerSpec::List,
+        _ => pitui_data::CollectionManagerSpec::default(),
     };
     runtime
         .register_template(DatasetTemplate {
             id: id.clone(),
             kind,
             collection,
+            views: Vec::new(),
             operations: Vec::new(),
             render_proxies: vec![RenderProxyId::from("test")],
         })
@@ -566,7 +567,8 @@ fn registration_contracts_reject_dangling_proxy_and_command_system_references() 
         .register_default_template(DatasetTemplate {
             id: DatasetTemplateId::from("changes"),
             kind: DatasetKind::Changes,
-            collection: pitui_data::CollectionManagerSpec::List,
+            collection: pitui_data::CollectionManagerSpec::default(),
+            views: Vec::new(),
             operations: Vec::new(),
             render_proxies: vec![RenderProxyId::from("missing.proxy")],
         })

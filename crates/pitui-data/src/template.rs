@@ -30,6 +30,7 @@ macro_rules! string_id {
 }
 
 string_id!(DatasetTemplateId);
+string_id!(DatasetViewId);
 string_id!(OperationId);
 string_id!(CommandId);
 string_id!(CommandSystemId);
@@ -40,15 +41,48 @@ string_id!(ResolvedOperationSetId);
 
 /// Data-selected manager for one Dataset's row collection.
 ///
-/// `List` exposes direct children with independent selection. `Tree` walks the
-/// Dataset DAG through configured visible kinds and owns hierarchical depth and
-/// selection semantics. A future `Table` manager can be added here without
-/// changing Dataset identity, command targeting or renderer ownership.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// `List` exposes configured direct children or flattens selected descendant
+/// kinds with independent selection. `Tree` walks the Dataset DAG through
+/// configured visible kinds and owns hierarchical depth and selection
+/// semantics. A future `Table` manager can be added here without changing
+/// Dataset identity, command targeting or renderer ownership.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CollectionManagerSpec {
-    #[default]
-    List,
+    List(ListManagerSpec),
     Tree(TreeManagerSpec),
+}
+
+impl Default for CollectionManagerSpec {
+    fn default() -> Self {
+        Self::List(ListManagerSpec::default())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListManagerSpec {
+    /// Direct lists expose only immediate children. Descendant lists flatten
+    /// the same ownership DAG without changing it, which lets a file tree and
+    /// flat file list share identical source entities.
+    pub source: ListSource,
+    /// Empty means every encountered kind is visible.
+    pub visible_kinds: Vec<DatasetKind>,
+    pub sibling_order: TreeSiblingOrder,
+}
+
+impl Default for ListManagerSpec {
+    fn default() -> Self {
+        Self {
+            source: ListSource::DirectChildren,
+            visible_kinds: Vec::new(),
+            sibling_order: TreeSiblingOrder::Source,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListSource {
+    DirectChildren,
+    Descendants,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,11 +107,24 @@ pub enum TreeSelectionMode {
     Cascade,
 }
 
+/// One selectable presentation of the same Dataset data. A View chooses both
+/// the Collection Manager and Render Proxy; switching it never rewrites the
+/// ownership DAG or semantic metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DatasetViewSpec {
+    pub id: DatasetViewId,
+    pub collection: CollectionManagerSpec,
+    pub render_proxy: RenderProxyId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatasetTemplate {
     pub id: DatasetTemplateId,
     pub kind: DatasetKind,
     pub collection: CollectionManagerSpec,
+    /// The first View is the default. Empty keeps the template's legacy
+    /// collection plus the RenderMode-selected Proxy.
+    pub views: Vec<DatasetViewSpec>,
     pub operations: Vec<OperationId>,
     pub render_proxies: Vec<RenderProxyId>,
 }

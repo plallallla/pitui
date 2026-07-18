@@ -26,10 +26,9 @@ pub enum RendererKind {
     /// File-specific presentation of Tree Manager rows, adding directory and
     /// path styling without owning hierarchy or selection behavior.
     PathTree,
-    /// Presentation for direct rows produced by a List Manager.
+    /// Presentation for flat rows produced by a List Manager.
     List,
     Detail,
-    CommitDetail,
     UnifiedDiff,
     SideBySideDiff,
     Confirmation,
@@ -58,6 +57,8 @@ pub enum FieldId {
     CommitTags,
     CommitSubject,
     CommitMessage,
+    CommitFieldLabel,
+    CommitFieldValue,
     CommitCreationStagedFiles,
     CommitCreationMessage,
     CommitCreationError,

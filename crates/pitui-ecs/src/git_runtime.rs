@@ -13,13 +13,13 @@ use pitui_core::{
     Repository, WorkingTreeChange, WorkingTreeDiff,
 };
 use pitui_data::{
-    ActiveUiContext, BranchMetadata, ChangeBoundary, CommitMetadata, DatasetChildren,
-    DatasetIdentity, DatasetIndex, DatasetKey, DatasetKind, DatasetRevision, DatasetTemplateId,
-    DatasetTemplateRef, DatasetTemplateRegistry, DatasetType, DefaultDatasetTemplates,
-    FileChangesMetadata, FileMetadata, FileTreeDirectoryMetadata, GitOperationLogEntryMetadata,
-    GitOperationStatus, HasSnapshot, InteractionNoticeRequest, ReflogEntryMetadata,
-    RenderBindingId, RepositoryKey, RepositoryMetadata, WorkingTreeFileChangesMetadata,
-    WorkingTreeFileMetadata,
+    ActiveUiContext, BranchMetadata, ChangeBoundary, CommitFieldKind, CommitFieldMetadata,
+    CommitMetadata, DatasetChildren, DatasetIdentity, DatasetIndex, DatasetKey, DatasetKind,
+    DatasetRevision, DatasetTemplateId, DatasetTemplateRef, DatasetTemplateRegistry, DatasetType,
+    DefaultDatasetTemplates, FileChangesMetadata, FileMetadata, FileTreeDirectoryMetadata,
+    GitOperationLogEntryMetadata, GitOperationStatus, HasSnapshot, InteractionNoticeRequest,
+    ReflogEntryMetadata, RenderBindingId, RepositoryKey, RepositoryMetadata,
+    WorkingTreeFileChangesMetadata, WorkingTreeFileMetadata,
 };
 use pitui_git::{
     CliGitExecutor, GitCommand, GitExecutor, GitFailure, ParsedGitPayload,
@@ -574,6 +574,7 @@ struct PlannedChildren {
 enum MetadataUpdate {
     Branch(DatasetIdentity, Branch),
     Commit(DatasetIdentity, CommitMetadata),
+    CommitField(DatasetIdentity, CommitFieldMetadata),
     File(DatasetIdentity, ChangedFile),
     FileTreeDirectory(DatasetIdentity, GitPath),
     FileChanges(DatasetIdentity, FileDiff),
@@ -847,6 +848,7 @@ fn commits_plan(
 ) -> Result<DatasetSnapshotPlan, GitDataError> {
     let commits_template = template_for(world, DatasetKind::Commits)?;
     let commit_template = template_for(world, DatasetKind::Commit)?;
+    let commit_field_template = template_for(world, DatasetKind::CommitField)?;
     let files_template = template_for(world, DatasetKind::Files)?;
     let commits_id = DatasetIdentity::Commits {
         repository: repository.clone(),
@@ -877,19 +879,66 @@ fn commits_plan(
             commit_template.clone(),
         );
         plan.add_node(files_id.clone(), DatasetKind::Files, files_template.clone());
-        plan.metadata.push(MetadataUpdate::Commit(
-            commit_id.clone(),
-            CommitMetadata {
-                summary: commit,
-                message,
-                tags,
-            },
-        ));
-        plan.replace_children(commit_id.clone(), vec![files_id]);
+        let metadata = CommitMetadata {
+            summary: commit,
+            message,
+            tags,
+        };
+        let mut commit_children =
+            append_commit_fields(&mut plan, &repository, &metadata, &commit_field_template);
+        commit_children.push(files_id);
+        plan.metadata
+            .push(MetadataUpdate::Commit(commit_id.clone(), metadata));
+        plan.replace_children(commit_id.clone(), commit_children);
         commit_ids.push(commit_id);
     }
     plan.replace_children(commits_id, commit_ids);
     Ok(plan)
+}
+
+/// Materializes Commit detail fields as independently addressable Dataset
+/// rows. The Commit remains their collection owner, while Files stays a sibling
+/// in the canonical ownership DAG and is filtered out by Commit's List Manager.
+fn append_commit_fields(
+    plan: &mut DatasetSnapshotPlan,
+    repository: &RepositoryKey,
+    metadata: &CommitMetadata,
+    template: &DatasetTemplateId,
+) -> Vec<DatasetIdentity> {
+    let value = |field| match field {
+        CommitFieldKind::Hash => Some(metadata.summary.hash.0.clone()),
+        CommitFieldKind::Author => Some(metadata.summary.author.clone()),
+        CommitFieldKind::AuthoredAt => Some(
+            metadata
+                .summary
+                .authored_at
+                .chars()
+                .take(16)
+                .collect::<String>()
+                .replace('T', " "),
+        ),
+        CommitFieldKind::Tags => (!metadata.tags.is_empty()).then(|| metadata.tags.join(", ")),
+        CommitFieldKind::Subject => Some(metadata.summary.subject.clone()),
+        CommitFieldKind::Message => metadata.message.clone().filter(|value| !value.is_empty()),
+    };
+
+    CommitFieldKind::ALL
+        .into_iter()
+        .filter_map(|field| {
+            let value = value(field).filter(|value| !value.is_empty())?;
+            let identity = DatasetIdentity::CommitField {
+                repository: repository.clone(),
+                commit: metadata.summary.hash.clone(),
+                field,
+            };
+            plan.add_node(identity.clone(), DatasetKind::CommitField, template.clone());
+            plan.metadata.push(MetadataUpdate::CommitField(
+                identity.clone(),
+                CommitFieldMetadata { field, value },
+            ));
+            Some(identity)
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -959,6 +1008,7 @@ fn commit_detail_plan(
     detail: CommitDetail,
 ) -> Result<DatasetSnapshotPlan, GitDataError> {
     let commit_template = template_for(world, DatasetKind::Commit)?;
+    let commit_field_template = template_for(world, DatasetKind::CommitField)?;
     let files_template = template_for(world, DatasetKind::Files)?;
     let directory_template = template_for(world, DatasetKind::FileTreeDirectory)?;
     let file_template = template_for(world, DatasetKind::File)?;
@@ -981,14 +1031,15 @@ fn commit_detail_plan(
     let mut plan = DatasetSnapshotPlan::default();
     plan.add_node(commit_id.clone(), DatasetKind::Commit, commit_template);
     plan.add_node(files_id.clone(), DatasetKind::Files, files_template);
-    plan.metadata.push(MetadataUpdate::Commit(
-        commit_id.clone(),
-        CommitMetadata {
-            summary: detail.commit.clone(),
-            message: Some(detail.message),
-            tags,
-        },
-    ));
+    let metadata = CommitMetadata {
+        summary: detail.commit.clone(),
+        message: Some(detail.message),
+        tags,
+    };
+    let mut commit_children =
+        append_commit_fields(&mut plan, &repository, &metadata, &commit_field_template);
+    plan.metadata
+        .push(MetadataUpdate::Commit(commit_id.clone(), metadata));
 
     let mut tree = FileTreePlanState::default();
     tree.relations.insert(files_id.clone(), Vec::new());
@@ -1028,7 +1079,8 @@ fn commit_detail_plan(
         );
     }
     apply_file_tree_relations(&mut plan, tree.relations);
-    plan.replace_children(commit_id, vec![files_id]);
+    commit_children.push(files_id);
+    plan.replace_children(commit_id, commit_children);
     Ok(plan)
 }
 
@@ -1373,6 +1425,10 @@ fn apply_plan(world: &mut World, plan: DatasetSnapshotPlan) -> Result<(), GitDat
                 world.entity_mut(entity).insert(BranchMetadata(metadata));
             }
             MetadataUpdate::Commit(identity, metadata) => {
+                let entity = entity_for(world, &identity)?;
+                world.entity_mut(entity).insert(metadata);
+            }
+            MetadataUpdate::CommitField(identity, metadata) => {
                 let entity = entity_for(world, &identity)?;
                 world.entity_mut(entity).insert(metadata);
             }

@@ -23,6 +23,38 @@ pub enum ChangeBoundary {
     Unstaged,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CommitFieldKind {
+    Hash,
+    Author,
+    AuthoredAt,
+    Tags,
+    Subject,
+    Message,
+}
+
+impl CommitFieldKind {
+    pub const ALL: [Self; 6] = [
+        Self::Hash,
+        Self::Author,
+        Self::AuthoredAt,
+        Self::Tags,
+        Self::Subject,
+        Self::Message,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Hash => "Hash",
+            Self::Author => "Author",
+            Self::AuthoredAt => "Date",
+            Self::Tags => "Tags",
+            Self::Subject => "Subject",
+            Self::Message => "Message",
+        }
+    }
+}
+
 /// Stable identity for every Dataset entity that may survive projection or
 /// be referred to by more than one parent collection.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -40,6 +72,11 @@ pub enum DatasetIdentity {
     Commit {
         repository: RepositoryKey,
         hash: CommitHash,
+    },
+    CommitField {
+        repository: RepositoryKey,
+        commit: CommitHash,
+        field: CommitFieldKind,
     },
     Files {
         repository: RepositoryKey,
@@ -103,6 +140,7 @@ pub enum DatasetKind {
     Branch,
     Commits,
     Commit,
+    CommitField,
     Files,
     FileTreeDirectory,
     File,
@@ -126,12 +164,13 @@ impl DatasetKind {
     /// default-template validation. Adding a new Dataset meaning requires
     /// extending this list, which makes missing Proxy/Operation contracts fail
     /// before the terminal starts.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::RepositoriesBranches,
         Self::Repository,
         Self::Branch,
         Self::Commits,
         Self::Commit,
+        Self::CommitField,
         Self::Files,
         Self::FileTreeDirectory,
         Self::File,
@@ -161,6 +200,7 @@ impl DatasetIdentity {
             Self::Branch { .. } => DatasetKind::Branch,
             Self::Commits { .. } => DatasetKind::Commits,
             Self::Commit { .. } => DatasetKind::Commit,
+            Self::CommitField { .. } => DatasetKind::CommitField,
             Self::Files { .. } => DatasetKind::Files,
             Self::FileDirectory { .. } | Self::WorkingTreeDirectory { .. } => {
                 DatasetKind::FileTreeDirectory

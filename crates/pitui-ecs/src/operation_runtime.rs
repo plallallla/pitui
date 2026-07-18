@@ -14,10 +14,10 @@ use pitui_data::{
     ActiveDirection, ActiveHandoffRegistry, ActiveHandoffTarget, ActiveRenderMode, ActiveUiContext,
     AvailabilityRule, AvailabilityRuleId, AvailabilityRuleRegistry, ChangeBoundary,
     ClipboardContentKind, ClipboardRequest, CommandId, CommandInvocation, CommandRegistry,
-    CommandSystemId, CommitCreationMetadata, CommitMetadata, ContextStack,
+    CommandSystemId, CommitCreationMetadata, CommitFieldMetadata, CommitMetadata, ContextStack,
     ContextTransitionRequest, DatasetActiveElement, DatasetChildren, DatasetCollection,
     DatasetIdentity, DatasetIndex, DatasetKey, DatasetRevision, DatasetSelection,
-    DatasetTemplateRef, DatasetTemplateRegistry, DatasetType, DatasetViewport,
+    DatasetTemplateRef, DatasetTemplateRegistry, DatasetType, DatasetViewState, DatasetViewport,
     DefaultDatasetTemplates, GlobalOperationSet, InputIntent, InteractionContextKind,
     InteractionContextMetadata, InteractionNoticeRequest, InvocationSource, KeyCode, KeySequence,
     LayoutConstraint, OperationId, OperationNotice, OperationRegistry, OperationSpec,
@@ -865,7 +865,8 @@ fn availability_matches(world: &World, active: Entity, rule: &AvailabilityRule) 
                     matches!(
                         world.get::<DatasetKey>(*target).map(|key| &key.0),
                         Some(
-                            DatasetIdentity::WorkingTreeFile { boundary, .. }
+                            DatasetIdentity::WorkingTreeFiles { boundary, .. }
+                                | DatasetIdentity::WorkingTreeFile { boundary, .. }
                                 | DatasetIdentity::WorkingTreeDirectory { boundary, .. }
                         )
                             if boundary == expected
@@ -1536,6 +1537,38 @@ pub fn toggle_selection(
         .map_or_else(CommandExecution::Rejected, |()| CommandExecution::Completed)
 }
 
+pub fn cycle_collection_view(
+    In(invocation): In<CommandInvocation>,
+    world: &mut World,
+) -> CommandExecution {
+    let Some(template_ref) = world
+        .get::<DatasetTemplateRef>(invocation.source_dataset)
+        .cloned()
+    else {
+        return CommandExecution::Rejected("Dataset Template is unavailable".into());
+    };
+    let Some(template) = world
+        .resource::<DatasetTemplateRegistry>()
+        .get(&template_ref.0)
+        .cloned()
+    else {
+        return CommandExecution::Rejected("Dataset Template is not registered".into());
+    };
+    if template.views.len() < 2 {
+        return CommandExecution::Rejected("Dataset has no alternate collection View".into());
+    }
+    let current = world
+        .get::<DatasetViewState>(invocation.source_dataset)
+        .and_then(|state| state.0.as_ref());
+    let next = current
+        .and_then(|current| template.views.iter().position(|view| &view.id == current))
+        .map_or(0, |index| (index + 1) % template.views.len());
+    world
+        .entity_mut(invocation.source_dataset)
+        .insert(DatasetViewState(Some(template.views[next].id.clone())));
+    CommandExecution::Completed
+}
+
 /// Cherry-pick is owned by the Commits Dataset Operation Set. Its targets are
 /// the Dataset's ordered Selection (never a queue and never an implicit
 /// active element), normalized to oldest-to-newest replay order before Git argv data is
@@ -1671,13 +1704,14 @@ pub fn toggle_changes_selection(
         !matches!(
             world.get::<DatasetKey>(*target).map(|key| &key.0),
             Some(
-                DatasetIdentity::WorkingTreeFile { .. }
+                DatasetIdentity::WorkingTreeFiles { .. }
+                    | DatasetIdentity::WorkingTreeFile { .. }
                     | DatasetIdentity::WorkingTreeDirectory { .. }
             )
         )
     }) {
         return CommandExecution::Rejected(
-            "only working-tree files and directories can be selected".into(),
+            "only working-tree groups, files and directories can be selected".into(),
         );
     }
     crate::collection::toggle_selection(world, changes, &invocation.targets)
@@ -1865,11 +1899,17 @@ fn collect_working_tree_paths(
             }
             Ok(())
         }
-        Ok(DatasetIdentity::WorkingTreeDirectory {
-            repository,
-            boundary,
-            ..
-        }) => {
+        Ok(
+            DatasetIdentity::WorkingTreeFiles {
+                repository,
+                boundary,
+            }
+            | DatasetIdentity::WorkingTreeDirectory {
+                repository,
+                boundary,
+                ..
+            },
+        ) => {
             validate_working_tree_target(
                 repository,
                 *boundary,
@@ -1878,7 +1918,7 @@ fn collect_working_tree_paths(
             )?;
             let directory_children = children
                 .get(target)
-                .map_err(|_| "working-tree directory contents are unavailable".to_owned())?;
+                .map_err(|_| "working-tree group contents are unavailable".to_owned())?;
             for child in &directory_children.0 {
                 collect_working_tree_paths(
                     *child,
@@ -1892,7 +1932,7 @@ fn collect_working_tree_paths(
             }
             Ok(())
         }
-        _ => Err("target is not a working-tree file or directory Dataset".into()),
+        _ => Err("target is not a working-tree group, file or directory Dataset".into()),
     }
 }
 
@@ -1938,6 +1978,13 @@ pub(super) fn reconcile_pending_changes_active(world: &mut World) {
         .is_none_or(|revision| revision.0 <= request.changes_revision)
     {
         return;
+    }
+    // A successful mutation replaces the selected boundary snapshot. Clear the
+    // old selection before relaying Active; otherwise the persistent empty
+    // Staged/Unstaged group would remain selected and create mixed-boundary
+    // targets on the next operation.
+    if let Some(mut selection) = world.get_mut::<DatasetSelection>(changes) {
+        selection.0.clear();
     }
     let Some(collection) = world.get::<DatasetCollection>(changes) else {
         return;
@@ -2357,6 +2404,41 @@ pub fn copy_commit_message(
         kind: ClipboardContentKind::CommitMessage,
         text: message,
         source_entities: vec![target],
+    });
+    CommandExecution::Completed
+}
+
+pub fn copy_commit_field_values(
+    In(invocation): In<CommandInvocation>,
+    fields: Query<&CommitFieldMetadata>,
+    mut clipboard: MessageWriter<ClipboardRequest>,
+) -> CommandExecution {
+    let values = invocation
+        .targets
+        .iter()
+        .map(|target| fields.get(*target).cloned())
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(values) = values else {
+        return CommandExecution::Rejected(
+            "copy value target is not a Commit field Dataset".into(),
+        );
+    };
+    if values.is_empty() {
+        return CommandExecution::Rejected("no Commit field target".into());
+    }
+    let text = if values.len() == 1 {
+        values[0].value.clone()
+    } else {
+        values
+            .iter()
+            .map(|metadata| format!("{}: {}", metadata.field.label(), metadata.value))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    clipboard.write(ClipboardRequest {
+        kind: ClipboardContentKind::CommitFieldValues,
+        text,
+        source_entities: invocation.targets,
     });
     CommandExecution::Completed
 }

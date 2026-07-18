@@ -13,10 +13,11 @@ use pitui_data::{
     ActiveDirection, ActiveHandoffRegistry, ActiveHandoffSpec, ActiveHandoffTarget,
     AvailabilityRule, AvailabilityRuleId, CollectionManagerSpec, CommandId, CommandScope,
     CommandSpec, CommandSystemId, DatasetBinding, DatasetIdentity, DatasetKind, DatasetTemplate,
-    DatasetTemplateId, DateTimePrecision, FieldFormat, FieldId, FieldSpec, InteractionContextType,
-    KeyCode, KeySequence, KeyStroke, LayoutConstraint, OperationId, OperationSpec, RenderBindingId,
-    RenderLayout, RenderModeId, RenderModeSpec, RenderProxyId, RenderProxySpec, RendererKind,
-    StyleSpec, TargetSource, TreeManagerSpec, TreeSelectionMode, TreeSiblingOrder,
+    DatasetTemplateId, DatasetViewId, DatasetViewSpec, DateTimePrecision, FieldFormat, FieldId,
+    FieldSpec, InteractionContextType, KeyCode, KeySequence, KeyStroke, LayoutConstraint,
+    ListManagerSpec, ListSource, OperationId, OperationSpec, RenderBindingId, RenderLayout,
+    RenderModeId, RenderModeSpec, RenderProxyId, RenderProxySpec, RendererKind, StyleSpec,
+    TargetSource, TreeManagerSpec, TreeSelectionMode, TreeSiblingOrder,
 };
 
 /// Version of the Data Driven configuration schema.
@@ -103,6 +104,7 @@ pub fn builtin_dataset_templates() -> Vec<DatasetTemplate> {
         (Kind::Branch, "branch"),
         (Kind::Commits, "commits"),
         (Kind::Commit, "commit"),
+        (Kind::CommitField, "commit-field"),
         (Kind::Files, "files"),
         (Kind::FileTreeDirectory, "file-tree-directory"),
         (Kind::File, "file"),
@@ -125,6 +127,7 @@ pub fn builtin_dataset_templates() -> Vec<DatasetTemplate> {
         id: DatasetTemplateId::from(name),
         kind,
         collection: collection_manager_for(kind),
+        views: dataset_views_for(kind),
         operations: operations_for_dataset(kind),
         render_proxies: builtin_proxies(kind),
     })
@@ -153,13 +156,22 @@ fn collection_manager_for(kind: DatasetKind) -> CollectionManagerSpec {
             vec![Kind::FileTreeDirectory, Kind::File],
             TreeSiblingOrder::Path,
         ),
+        Kind::Commit => CollectionManagerSpec::List(ListManagerSpec {
+            source: ListSource::DirectChildren,
+            visible_kinds: vec![Kind::CommitField],
+            sibling_order: TreeSiblingOrder::Source,
+        }),
         Kind::Changes => tree(
             vec![
                 Kind::WorkingTreeFiles,
                 Kind::FileTreeDirectory,
                 Kind::WorkingTreeFile,
             ],
-            vec![Kind::FileTreeDirectory, Kind::WorkingTreeFile],
+            vec![
+                Kind::WorkingTreeFiles,
+                Kind::FileTreeDirectory,
+                Kind::WorkingTreeFile,
+            ],
             TreeSiblingOrder::Path,
         ),
         Kind::WorkingTreeFiles => tree(
@@ -172,8 +184,32 @@ fn collection_manager_for(kind: DatasetKind) -> CollectionManagerSpec {
             vec![Kind::FileTreeDirectory, Kind::File, Kind::WorkingTreeFile],
             TreeSiblingOrder::Path,
         ),
-        _ => CollectionManagerSpec::List,
+        _ => CollectionManagerSpec::List(ListManagerSpec::default()),
     }
+}
+
+fn dataset_views_for(kind: DatasetKind) -> Vec<DatasetViewSpec> {
+    use DatasetKind as Kind;
+
+    if kind != Kind::Files {
+        return Vec::new();
+    }
+    vec![
+        DatasetViewSpec {
+            id: DatasetViewId::from("tree"),
+            collection: collection_manager_for(Kind::Files),
+            render_proxy: RenderProxyId::from("files.tree"),
+        },
+        DatasetViewSpec {
+            id: DatasetViewId::from("list"),
+            collection: CollectionManagerSpec::List(ListManagerSpec {
+                source: ListSource::Descendants,
+                visible_kinds: vec![Kind::File],
+                sibling_order: TreeSiblingOrder::Path,
+            }),
+            render_proxy: RenderProxyId::from("files.list"),
+        },
+    ]
 }
 
 /// Built-in render interpretations. Dataset templates only reference these IDs;
@@ -236,20 +272,36 @@ pub fn builtin_render_proxies() -> Vec<RenderProxySpec> {
         proxy(
             "commit.detail",
             Kind::Commit,
-            Renderer::CommitDetail,
+            Renderer::List,
             vec![
-                labeled(Field::CommitHash, "Commit"),
-                labeled(Field::CommitAuthor, "Author"),
-                labeled_datetime(Field::CommitAuthoredAt, "Date", DateTimePrecision::Minute),
-                labeled(Field::CommitTags, "Tags"),
-                labeled(Field::CommitSubject, "Subject"),
-                labeled(Field::CommitMessage, "Message"),
+                plain(Field::CommitFieldLabel),
+                plain(Field::CommitFieldValue),
+            ],
+        ),
+        proxy(
+            "commit-field.detail",
+            Kind::CommitField,
+            Renderer::Detail,
+            vec![
+                labeled(Field::CommitFieldLabel, "Field"),
+                labeled(Field::CommitFieldValue, "Value"),
             ],
         ),
         proxy(
             "files.tree",
             Kind::Files,
             Renderer::PathTree,
+            vec![
+                plain(Field::FileStatus),
+                plain(Field::FilePath),
+                plain(Field::FileAdditions),
+                plain(Field::FileDeletions),
+            ],
+        ),
+        proxy(
+            "files.list",
+            Kind::Files,
+            Renderer::List,
             vec![
                 plain(Field::FileStatus),
                 plain(Field::FilePath),
@@ -450,7 +502,7 @@ pub fn builtin_render_modes() -> Vec<RenderModeSpec> {
                         dataset: DatasetBinding::Context(RenderBindingId::CurrentCommit),
                         proxy: RenderProxyId::from("commit.detail"),
                         constraint: LayoutConstraint::Percentage(40),
-                        activatable: false,
+                        activatable: true,
                     },
                     RenderLayout::Dataset {
                         dataset: DatasetBinding::Context(RenderBindingId::CurrentFiles),
@@ -643,6 +695,10 @@ pub fn builtin_availability_rules() -> Vec<(AvailabilityRuleId, AvailabilityRule
             AvailabilityRule::Any(vec![
                 AvailabilityRule::ContextActiveElementKind(
                     RenderBindingId::Changes,
+                    DatasetKind::WorkingTreeFiles,
+                ),
+                AvailabilityRule::ContextActiveElementKind(
+                    RenderBindingId::Changes,
                     DatasetKind::WorkingTreeFile,
                 ),
                 AvailabilityRule::ContextActiveElementKind(
@@ -699,11 +755,13 @@ pub fn builtin_command_specs() -> Vec<CommandSpec> {
         ("copy.commit.hash", "copy-commit-hash"),
         ("copy.commit.info", "copy-commit-info"),
         ("copy.commit.message", "copy-commit-message"),
+        ("copy.commit-field.values", "copy-commit-field-values"),
         ("copy.reflog.hash", "copy-reflog-hash"),
         ("commits.cherry-pick", "cherry-pick"),
         ("copy.file.name", "copy-file-name"),
         ("copy.file.absolute", "copy-file-absolute-path"),
         ("copy.file.relative", "copy-file-relative-path"),
+        ("collection.view.next", "next-collection-view"),
         ("scroll.home", "home"),
         ("scroll.end", "end"),
         ("scroll.page-up", "page-up"),
@@ -1019,6 +1077,14 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
             active_element.clone(),
         ),
         operation(
+            "copy.commit-field.values",
+            "Copy selected value",
+            "copy.commit-field.values",
+            vec![copy_chord('v')],
+            TargetSource::SelectionOrActiveElement,
+            selected_or_active.clone(),
+        ),
+        operation(
             "copy.reflog.hash",
             "Copy hash",
             "copy.reflog.hash",
@@ -1057,6 +1123,14 @@ pub fn builtin_operation_specs() -> Vec<OperationSpec> {
             vec![copy_chord('r')],
             TargetSource::ContextSelectionOrActiveElement(RenderBindingId::CurrentFiles),
             current_file,
+        ),
+        operation(
+            "collection.view.next",
+            "Switch tree/list view",
+            "collection.view.next",
+            vec![single(KeyStroke::character('v'))],
+            TargetSource::ActiveDataset,
+            always.clone(),
         ),
         operation(
             "scroll.home",
@@ -1217,11 +1291,12 @@ fn operations_for_dataset(kind: DatasetKind) -> Vec<OperationId> {
             "commits.cherry-pick",
         ],
         Kind::Commit => &[
+            "active.up",
+            "active.down",
             "active.left",
             "active.right",
-            "copy.commit.hash",
-            "copy.commit.info",
-            "copy.commit.message",
+            "selection.toggle",
+            "copy.commit-field.values",
             "scroll.home",
             "scroll.end",
             "scroll.page-up",
@@ -1236,6 +1311,7 @@ fn operations_for_dataset(kind: DatasetKind) -> Vec<OperationId> {
             "copy.file.name",
             "copy.file.absolute",
             "copy.file.relative",
+            "collection.view.next",
         ],
         Kind::Changes => &[
             "active.up",
@@ -1307,6 +1383,7 @@ fn operations_for_dataset(kind: DatasetKind) -> Vec<OperationId> {
         ],
         Kind::Repository
         | Kind::Branch
+        | Kind::CommitField
         | Kind::FileTreeDirectory
         | Kind::ReflogEntry
         | Kind::Remote
@@ -1332,7 +1409,8 @@ fn builtin_proxies(kind: DatasetKind) -> Vec<RenderProxyId> {
         Kind::Branch => &["branch.detail"],
         Kind::Commits => &["commits.compact", "commits.detailed"],
         Kind::Commit => &["commit.detail"],
-        Kind::Files => &["files.tree"],
+        Kind::CommitField => &["commit-field.detail"],
+        Kind::Files => &["files.tree", "files.list"],
         Kind::FileTreeDirectory => &["file-tree-directory.detail"],
         Kind::File => &["file.detail"],
         Kind::FileChanges => &["file-changes.unified", "file-changes.side-by-side"],

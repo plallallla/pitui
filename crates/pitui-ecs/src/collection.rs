@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 
-use bevy_ecs::prelude::{Entity, Query, World};
+use bevy_ecs::prelude::{Entity, World};
 use pitui_data::{
     CollectionElement, CollectionManagerSpec, DatasetActiveElement, DatasetChildren,
     DatasetCollection, DatasetKind, DatasetSelection, DatasetTemplateId, DatasetTemplateRef,
-    DatasetTemplateRegistry, DatasetType, FileMetadata, FileTreeDirectoryMetadata, TreeManagerSpec,
-    TreeSelectionMode, TreeSiblingOrder, WorkingTreeFileMetadata,
+    DatasetTemplateRegistry, DatasetType, DatasetViewState, FileMetadata,
+    FileTreeDirectoryMetadata, ListManagerSpec, ListSource, TreeManagerSpec, TreeSelectionMode,
+    TreeSiblingOrder, WorkingTreeFileMetadata,
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -23,7 +24,7 @@ pub(super) fn rebuild_collections(world: &mut World) {
     };
 
     for (entity, children, template) in datasets {
-        let expected = expected_collection(world, &template, &children);
+        let expected = expected_collection(world, entity, &template, &children);
         let changed = world
             .get::<DatasetCollection>(entity)
             .is_none_or(|collection| collection.0 != expected.elements);
@@ -37,27 +38,94 @@ pub(super) fn rebuild_collections(world: &mut World) {
 
 pub(super) fn expected_collection(
     world: &World,
+    dataset: Entity,
     template: &DatasetTemplateId,
     children: &[Entity],
 ) -> ManagedCollection {
-    let manager = world
-        .resource::<DatasetTemplateRegistry>()
-        .get(template)
-        .map(|template| template.collection.clone())
-        .unwrap_or_default();
+    let manager = collection_manager(world, dataset).unwrap_or_else(|| {
+        world
+            .resource::<DatasetTemplateRegistry>()
+            .get(template)
+            .map(|template| template.collection.clone())
+            .unwrap_or_default()
+    });
     match manager {
-        CollectionManagerSpec::List => list_collection(children),
+        CollectionManagerSpec::List(spec) => list_collection(world, children, &spec),
         CollectionManagerSpec::Tree(spec) => tree_collection(world, children, &spec),
     }
 }
 
-fn list_collection(children: &[Entity]) -> ManagedCollection {
-    ManagedCollection {
-        elements: children
-            .iter()
-            .copied()
-            .map(|entity| CollectionElement { entity, depth: 0 })
-            .collect(),
+/// Resolves the Collection Manager selected by ordinary Dataset data. A
+/// switchable View overrides the Template fallback but never changes the
+/// Dataset ownership DAG.
+pub(super) fn collection_manager(world: &World, dataset: Entity) -> Option<CollectionManagerSpec> {
+    let template_id = world.get::<DatasetTemplateRef>(dataset)?;
+    let template = world
+        .resource::<DatasetTemplateRegistry>()
+        .get(&template_id.0)?;
+    let selected = world.get::<DatasetViewState>(dataset)?.0.as_ref();
+    selected
+        .and_then(|selected| template.views.iter().find(|view| &view.id == selected))
+        .map(|view| view.collection.clone())
+        .or_else(|| Some(template.collection.clone()))
+}
+
+fn list_collection(
+    world: &World,
+    children: &[Entity],
+    spec: &ListManagerSpec,
+) -> ManagedCollection {
+    let visible = spec.visible_kinds.iter().copied().collect::<HashSet<_>>();
+    let mut collection = ManagedCollection::default();
+    let mut visited = HashSet::new();
+    match spec.source {
+        ListSource::DirectChildren => flatten_list(
+            world,
+            children,
+            spec,
+            &visible,
+            false,
+            &mut visited,
+            &mut collection,
+        ),
+        ListSource::Descendants => flatten_list(
+            world,
+            children,
+            spec,
+            &visible,
+            true,
+            &mut visited,
+            &mut collection,
+        ),
+    }
+    collection
+}
+
+fn flatten_list(
+    world: &World,
+    siblings: &[Entity],
+    spec: &ListManagerSpec,
+    visible: &HashSet<DatasetKind>,
+    recurse: bool,
+    visited: &mut HashSet<Entity>,
+    collection: &mut ManagedCollection,
+) {
+    for entity in ordered_siblings(world, siblings, spec.sibling_order) {
+        if !visited.insert(entity) {
+            continue;
+        }
+        let kind = world.get::<DatasetType>(entity).map(|kind| kind.0);
+        if kind.is_some_and(|kind| visible.is_empty() || visible.contains(&kind)) {
+            collection
+                .elements
+                .push(CollectionElement { entity, depth: 0 });
+        }
+        if recurse && let Some(children) = world.get::<DatasetChildren>(entity) {
+            // Invisible directory/structural nodes are traversal edges in a
+            // descendant List, not rows. This is what lets Files reuse its
+            // directory DAG while exposing only flat File elements.
+            flatten_list(world, &children.0, spec, visible, true, visited, collection);
+        }
     }
 }
 
@@ -135,23 +203,65 @@ fn path_sort_key(world: &World, entity: Entity) -> Option<Vec<u8>> {
     Some(path.as_bytes().to_vec())
 }
 
-pub(super) fn repair_active_elements(
-    mut datasets: Query<(
-        &DatasetCollection,
-        &mut DatasetActiveElement,
-        &mut DatasetSelection,
-    )>,
-) {
-    for (collection, mut active, mut selection) in &mut datasets {
-        if active.0.is_none_or(|entity| !collection.contains(entity)) {
-            active.0 = collection.first();
+pub(super) fn repair_active_elements(world: &mut World) {
+    let datasets = {
+        let mut query = world.query::<(
+            Entity,
+            &DatasetCollection,
+            &DatasetActiveElement,
+            &DatasetSelection,
+        )>();
+        query
+            .iter(world)
+            .map(|(entity, collection, active, selection)| {
+                (entity, collection.clone(), active.0, selection.0.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    for (dataset, collection, active, selection) in datasets {
+        let repaired_active = if active.is_none_or(|entity| !collection.contains(entity)) {
+            collection.first()
+        } else {
+            active
+        };
+        let mut selected = selection.into_iter().collect::<HashSet<_>>();
+        selected.retain(|row| collection.contains(*row));
+        if let Some(CollectionManagerSpec::Tree(spec)) = collection_manager(world, dataset)
+            && spec.selection == TreeSelectionMode::Cascade
+        {
+            let elements = collection.entities().collect::<Vec<_>>();
+            let element_set = elements.iter().copied().collect::<HashSet<_>>();
+            let selectable = spec
+                .selectable_kinds
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            // A selected Tree parent semantically selects its selectable
+            // descendants even when selection data was restored directly or
+            // came back from a flat View. Then derive checked parents from the
+            // resulting complete descendant set.
+            for target in selected.iter().copied().collect::<Vec<_>>() {
+                selected.extend(collection_subtree(world, target, &element_set, &selectable));
+            }
+            normalize_tree_selection(world, &elements, &element_set, &selectable, &mut selected);
         }
-
-        let selected = selection.0.iter().copied().collect::<HashSet<_>>();
-        selection.0 = collection
+        let repaired_selection = collection
             .entities()
             .filter(|row| selected.contains(row))
-            .collect();
+            .collect::<Vec<_>>();
+        if active != repaired_active {
+            world
+                .entity_mut(dataset)
+                .insert(DatasetActiveElement(repaired_active));
+        }
+        if world
+            .get::<DatasetSelection>(dataset)
+            .is_none_or(|current| current.0 != repaired_selection)
+        {
+            world
+                .entity_mut(dataset)
+                .insert(DatasetSelection(repaired_selection));
+        }
     }
 }
 
@@ -168,10 +278,7 @@ pub(super) fn toggle_selection(
     if targets.iter().any(|target| !elements.contains(target)) {
         return Err("selection target is outside the Dataset".into());
     }
-    let manager = world
-        .get::<DatasetTemplateRef>(dataset)
-        .and_then(|template| world.resource::<DatasetTemplateRegistry>().get(&template.0))
-        .map(|template| template.collection.clone())
+    let manager = collection_manager(world, dataset)
         .ok_or_else(|| "Dataset Collection Manager is unavailable".to_owned())?;
     let mut selected = world
         .get::<DatasetSelection>(dataset)
@@ -182,7 +289,7 @@ pub(super) fn toggle_selection(
         .collect::<HashSet<_>>();
 
     match manager {
-        CollectionManagerSpec::List => toggle_independent(targets, &mut selected),
+        CollectionManagerSpec::List(_) => toggle_independent(targets, &mut selected),
         CollectionManagerSpec::Tree(spec) => {
             let selectable = spec
                 .selectable_kinds
