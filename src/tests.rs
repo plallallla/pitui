@@ -6,10 +6,10 @@ use pitui_data::{
     ActiveRenderMode, ActiveUiContext, ClipboardContentKind, CommitCreationMetadata,
     CommitFieldMetadata, ContextStack, DatasetActiveElement, DatasetChildren, DatasetCollection,
     DatasetIdentity, DatasetKey, DatasetKind, DatasetSelection, DatasetType, DatasetViewId,
-    DatasetViewState, FieldId, GitOperationLogEntryMetadata, GitOperationStatus,
-    InteractionContextKind, InteractionContextMetadata, KeyCode, KeyModifiers, KeyStroke,
-    OperationId, PendingChordState, ReflogEntryMetadata, RenderContentProjection,
-    RepositoryMetadata, ResolvedKeyAction, ResolvedOperationSet, UiFrame, UiLayoutProjection,
+    DatasetViewState, GitOperationLogEntryMetadata, GitOperationStatus, InteractionContextKind,
+    InteractionContextMetadata, KeyCode, KeyModifiers, KeyStroke, OperationId, PendingChordState,
+    ReflogEntryMetadata, RenderContentProjection, RepositoryMetadata, ResolvedKeyAction,
+    ResolvedOperationSet, UiFrame, UiLayoutProjection,
 };
 use pitui_ecs::{
     ClipboardRequests, GitExecutionFailures, GitMutationSuccesses, OperationExecution,
@@ -152,30 +152,33 @@ fn composition_bootstraps_history_from_dataset_ecs() {
     assert!(commit_rows.rows.iter().all(|row| {
         row.cells
             .iter()
-            .any(|cell| cell.field == FieldId::CommitAuthor)
+            .any(|c| c.text.chars().all(|ch| ch.is_ascii_hexdigit()) && c.text.len() == 8)
     }));
     assert!(commit_rows.rows.iter().all(|row| {
         row.cells
             .iter()
-            .find(|cell| cell.field == FieldId::CommitAuthoredAt)
-            .is_some_and(|cell| cell.text.len() == 16 && cell.text.contains(' '))
+            .any(|cell| cell.text.len() == 16 && cell.text.contains(' '))
     }));
+    assert!(
+        commit_rows
+            .rows
+            .iter()
+            .all(|row| { row.cells.iter().any(|cell| !cell.text.is_empty()) })
+    );
     assert_eq!(
         commit_rows
             .rows
             .iter()
-            .filter(|row| row
-                .cells
-                .iter()
-                .any(|cell| cell.field == FieldId::CommitTags))
+            .filter(|row| row.cells.iter().any(|c| c.text == "v1.0.0"))
             .count(),
         1
     );
-    assert!(commit_rows.rows.iter().any(|row| {
-        row.cells
+    assert!(
+        commit_rows
+            .rows
             .iter()
-            .any(|cell| cell.field == FieldId::CommitTags && cell.text == "v1.0.0")
-    }));
+            .any(|row| { row.cells.iter().any(|c| c.text == "v1.0.0") })
+    );
     assert!(
         app.runtime()
             .world()
@@ -1315,7 +1318,6 @@ fn composition_bootstraps_history_from_dataset_ecs() {
         panic!("Commit Creation overlay must bind its own Render Proxy");
     };
     assert_eq!(panel.proxy, RenderProxyId::from("commit-creation.editor"));
-    assert_eq!(panel.renderer, pitui_data::RendererKind::CommitCreation);
     assert!(matches!(
         panel.content,
         RenderContentProjection::Interaction(_)
@@ -2453,8 +2455,8 @@ fn git_operation_log_is_a_collection_backed_two_column_context() {
     assert!(
         rows.rows[0]
             .cells
-            .iter()
-            .any(|cell| cell.field == FieldId::GitOperationName)
+            .get(2)
+            .is_some_and(|c| !c.text.is_empty())
     );
     let UiLayoutProjection::Dataset { panel: detail, .. } = &columns[1] else {
         panic!("right log column must be a Dataset detail panel");

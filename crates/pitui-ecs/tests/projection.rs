@@ -2,12 +2,11 @@ use std::{fs, path::Path, process::Command};
 
 use pitui_core::{BranchName, CommitHash, GitPath};
 use pitui_data::{
-    CellProjection, DatasetChildren, DatasetIdentity, DatasetIndex, DatasetKind, DatasetTemplateId,
-    DatasetType, DatasetViewId, DatasetViewport, FieldId, InputIntent, KeyCode, KeyStroke,
-    RenderBindingId, RenderContentProjection, RenderContextBindings, RenderModeId, RendererKind,
-    ResolvedOperationSet, ResolvedOperationSetId, RowProjectionKind, RowsProjection,
-    SideBySideDiffProjection, UiFrame, UiLayoutProjection, UnifiedDiffProjection,
-    ViewportMeasurement,
+    DatasetChildren, DatasetIdentity, DatasetIndex, DatasetKind, DatasetTemplateId, DatasetType,
+    DatasetViewId, DatasetViewport, InputIntent, KeyCode, KeyStroke, RenderBindingId,
+    RenderContentProjection, RenderContextBindings, RenderModeId, ResolvedOperationSet,
+    ResolvedOperationSetId, RowProjectionKind, RowsProjection, SideBySideDiffProjection, UiFrame,
+    UiLayoutProjection, UnifiedDiffProjection, ViewportMeasurement,
 };
 use pitui_ecs::{DatasetRuntime, GitCommandData, ProjectionDiagnostics};
 use pitui_git::GitCommand;
@@ -89,21 +88,16 @@ fn row_fields(layout: &UiLayoutProjection) -> &RowsProjection {
     rows
 }
 
-fn cell(fields: &[CellProjection], id: FieldId) -> &str {
-    &fields
-        .iter()
-        .find(|field| field.field == id)
-        .unwrap_or_else(|| panic!("missing projected field {id:?}"))
-        .text
-}
-
 fn commit_field<'a>(rows: &'a RowsProjection, label: &str) -> &'a str {
     let row = rows
         .rows
         .iter()
-        .find(|row| cell(&row.cells, FieldId::CommitFieldLabel) == label)
+        .find(|row| row.cells.first().is_some_and(|c| c.text == label))
         .unwrap_or_else(|| panic!("missing Commit field {label}"));
-    cell(&row.cells, FieldId::CommitFieldValue)
+    &row.cells
+        .get(1)
+        .unwrap_or_else(|| panic!("missing value cell for {label}"))
+        .text
 }
 
 #[test]
@@ -248,7 +242,6 @@ fn commit_and_file_diff_modes_project_complete_immutable_data() {
     };
     assert!(!files_panel.active);
     assert_eq!(files_panel.proxy.0, "files.tree");
-    assert_eq!(files_panel.renderer, RendererKind::PathTree);
     let RenderContentProjection::Rows(file_rows) = &files_panel.content else {
         panic!("Files below Commit must project as a path tree");
     };
@@ -258,8 +251,7 @@ fn commit_and_file_diff_modes_project_complete_immutable_data() {
         .map(|row| {
             let label = row
                 .cells
-                .iter()
-                .find(|cell| cell.field == FieldId::FilePath)
+                .get(1)
                 .map(|cell| cell.text.as_str())
                 .unwrap_or_default();
             (row.kind, row.depth, label, row.active)
@@ -348,7 +340,6 @@ fn commit_and_file_diff_modes_project_complete_immutable_data() {
         panic!("Files must remain a Dataset panel");
     };
     assert_eq!(panel.proxy.0, "files.list");
-    assert_eq!(panel.renderer, RendererKind::List);
     let RenderContentProjection::Rows(rows) = &panel.content else {
         panic!("flat Files View must project rows");
     };
@@ -580,7 +571,6 @@ fn changes_proxy_builds_a_path_tree_inside_each_boundary() {
     let UiLayoutProjection::Dataset { panel, .. } = &columns[0] else {
         panic!("left column must be Changes");
     };
-    assert_eq!(panel.renderer, RendererKind::PathTree);
     let RenderContentProjection::Rows(rows) = &panel.content else {
         panic!("Changes must project rows");
     };
@@ -590,8 +580,7 @@ fn changes_proxy_builds_a_path_tree_inside_each_boundary() {
         .map(|row| {
             let label = row
                 .cells
-                .iter()
-                .find(|cell| cell.field == FieldId::DatasetLabel)
+                .last()
                 .map(|cell| cell.text.as_str())
                 .unwrap_or_default();
             (row.kind, row.depth, label)

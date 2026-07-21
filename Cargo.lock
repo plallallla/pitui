@@ -913,7 +913,6 @@ version = "0.1.0"
 dependencies = [
  "bevy_ecs",
  "crossterm",
- "pitui-core",
  "pitui-data",
  "ratatui",
  "unicode-width",

@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use bevy_ecs::prelude::{Entity, Message, Resource};
-use pitui_core::{DiffLine, SideBySideRow};
 
 use crate::{
     DatasetIdentity, DatasetKind, KeyStroke, LayoutConstraint, RenderBindingId, RenderModeId,
@@ -268,7 +267,6 @@ pub enum UiLayoutProjection {
 pub struct RenderProxyProjection {
     pub dataset: Entity,
     pub proxy: RenderProxyId,
-    pub renderer: RendererKind,
     pub active: bool,
     pub title: String,
     pub style: StyleSpec,
@@ -329,7 +327,6 @@ pub enum RowProjectionKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CellProjection {
-    pub field: FieldId,
     pub label: Option<String>,
     pub text: String,
 }
@@ -353,6 +350,40 @@ pub struct ViewportMeasurement {
     pub page_size: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiffLineKindProjection {
+    Context,
+    Addition,
+    Deletion,
+    Metadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiffLineProjection {
+    pub old_line_no: Option<u32>,
+    pub new_line_no: Option<u32>,
+    pub kind: DiffLineKindProjection,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiffCellKindProjection {
+    Added,
+    Deleted,
+    Modified,
+    Context,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SideBySideRowProjection {
+    pub left_line_no: Option<u32>,
+    pub right_line_no: Option<u32>,
+    pub left_text: Option<String>,
+    pub right_text: Option<String>,
+    pub left_kind: DiffCellKindProjection,
+    pub right_kind: DiffCellKindProjection,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnifiedDiffProjection {
     pub path: String,
@@ -365,7 +396,7 @@ pub struct UnifiedDiffProjection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnifiedDiffHunkProjection {
     pub header: String,
-    pub lines: Vec<DiffLine>,
+    pub lines: Vec<DiffLineProjection>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -380,7 +411,7 @@ pub struct SideBySideDiffProjection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SideBySideHunkProjection {
     pub header: String,
-    pub rows: Vec<SideBySideRow>,
+    pub rows: Vec<SideBySideRowProjection>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

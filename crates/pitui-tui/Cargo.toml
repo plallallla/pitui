@@ -8,7 +8,6 @@ description = "Terminal input and pure UiFrame presentation adapter for Pitui"
 
 [dependencies]
 crossterm.workspace = true
-pitui-core.workspace = true
 pitui-data.workspace = true
 ratatui.workspace = true
 unicode-width.workspace = true

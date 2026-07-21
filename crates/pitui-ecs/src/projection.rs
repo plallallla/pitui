@@ -4,23 +4,23 @@ use bevy_ecs::{
     change_detection::DetectChanges,
     prelude::{Changed, Entity, MessageReader, Query, Res, ResMut, Resource, World},
 };
-use pitui_core::{
-    DiffHunk, DiffLine, DiffLineKind, WorkingTreeDiff, WorkingTreeDiffKind, side_by_side_rows,
-};
+use pitui_core::{DiffHunk, DiffLineKind, WorkingTreeDiff, WorkingTreeDiffKind, side_by_side_rows};
 use pitui_data::{
     ActiveRenderMode, ActiveUiContext, BranchMetadata, CellProjection, ChangeBoundary,
     CommitCreationMetadata, CommitFieldMetadata, CommitMetadata, DatasetActiveElement,
     DatasetCollection, DatasetIdentity, DatasetKey, DatasetKind, DatasetSelection, DatasetType,
-    DatasetViewState, DatasetViewport, DateTimePrecision, DetailProjection, FieldFormat, FieldId,
-    FieldSpec, FileChangesMetadata, FileMetadata, FileTreeDirectoryMetadata, FooterProjection,
+    DatasetViewState, DatasetViewport, DateTimePrecision, DetailProjection, DiffCellKindProjection,
+    DiffLineKindProjection, DiffLineProjection, FieldFormat, FieldId, FieldSpec,
+    FileChangesMetadata, FileMetadata, FileTreeDirectoryMetadata, FooterProjection,
     GitOperationLogEntryMetadata, InteractionContextKind, InteractionContextMetadata,
     InteractionLineProjection, InteractionProjection, ReflogEntryMetadata, RemoteMetadata,
     RenderBindingId, RenderContentProjection, RenderProxyId, RenderProxyProjection,
     RenderProxyRegistry, RenderProxySpec, RendererKind, RepositoryMetadata, ResolvedOperationSet,
     ResolvedRenderLayout, RowProjection, RowProjectionKind, RowsProjection,
-    SideBySideDiffProjection, SideBySideHunkProjection, StatusProjection, UiFrame,
-    UiLayoutProjection, UnifiedDiffHunkProjection, UnifiedDiffProjection, ViewportMeasurement,
-    ViewportProjection, WorkingTreeFileChangesMetadata, WorkingTreeFileMetadata,
+    SideBySideDiffProjection, SideBySideHunkProjection, SideBySideRowProjection, StatusProjection,
+    UiFrame, UiLayoutProjection, UnifiedDiffHunkProjection, UnifiedDiffProjection,
+    ViewportMeasurement, ViewportProjection, WorkingTreeFileChangesMetadata,
+    WorkingTreeFileMetadata,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -458,7 +458,6 @@ fn project_dataset(
     RenderProxyProjection {
         dataset,
         proxy: spec.id,
-        renderer: spec.renderer,
         active: active == Some(dataset),
         title: interaction_title(world, dataset)
             .unwrap_or_else(|| dataset_title(world, dataset, kind)),
@@ -627,7 +626,6 @@ fn empty_panel(dataset: Entity, proxy: RenderProxyId, active: bool) -> RenderPro
     RenderProxyProjection {
         dataset,
         proxy,
-        renderer: RendererKind::Detail,
         active,
         title: String::new(),
         style: pitui_data::StyleSpec::default(),
@@ -691,12 +689,14 @@ fn project_path_tree(
         .map(|selection| selection.0.iter().copied().collect::<HashSet<_>>())
         .unwrap_or_default();
     let entries = path_tree_entries(world, dataset);
-    let directory_field = spec
+    let path_field_indices: Vec<usize> = spec
         .fields
         .iter()
-        .map(|field| field.field)
-        .find(|field| matches!(field, FieldId::FilePath | FieldId::DatasetLabel))
-        .unwrap_or(FieldId::FilePath);
+        .enumerate()
+        .filter_map(|(index, field)| {
+            matches!(field.field, FieldId::FilePath | FieldId::DatasetLabel).then_some(index)
+        })
+        .collect();
 
     RowsProjection {
         rows: entries
@@ -710,15 +710,14 @@ fn project_path_tree(
                         name.push('/');
                     }
                     let mut replaced = false;
-                    for cell in &mut cells {
-                        if matches!(cell.field, FieldId::FilePath | FieldId::DatasetLabel) {
+                    for &index in &path_field_indices {
+                        if let Some(cell) = cells.get_mut(index) {
                             cell.text.clone_from(&name);
                             replaced = true;
                         }
                     }
                     if !replaced {
                         cells.push(CellProjection {
-                            field: directory_field,
                             label: None,
                             text: name,
                         });
@@ -797,7 +796,6 @@ fn project_fields(world: &World, entity: Entity, specs: &[FieldSpec]) -> Vec<Cel
         .filter_map(|spec| {
             field_value(world, entity, spec.field).and_then(|value| {
                 format_value(value, &spec.format).map(|text| CellProjection {
-                    field: spec.field,
                     label: spec.label.clone(),
                     text,
                 })
@@ -1128,7 +1126,16 @@ fn project_unified_diff(world: &World, dataset: Entity) -> RenderContentProjecti
             .into_iter()
             .map(|hunk| UnifiedDiffHunkProjection {
                 header: hunk.header,
-                lines: hunk.lines,
+                lines: hunk
+                    .lines
+                    .into_iter()
+                    .map(|line| DiffLineProjection {
+                        old_line_no: line.old_line_no,
+                        new_line_no: line.new_line_no,
+                        kind: map_diff_line_kind(line.kind),
+                        text: line.text,
+                    })
+                    .collect(),
             })
             .collect(),
         viewport: viewport_projection(world, dataset),
@@ -1162,11 +1169,41 @@ fn project_side_by_side_diff(world: &World, dataset: Entity) -> RenderContentPro
             .iter()
             .map(|hunk| SideBySideHunkProjection {
                 header: hunk.header.clone(),
-                rows: side_by_side_rows(hunk),
+                rows: side_by_side_rows(hunk)
+                    .into_iter()
+                    .map(|row| SideBySideRowProjection {
+                        left_line_no: row.left_line_no,
+                        right_line_no: row.right_line_no,
+                        left_text: row.left_text,
+                        right_text: row.right_text,
+                        left_kind: map_diff_cell_kind(row.left_kind),
+                        right_kind: map_diff_cell_kind(row.right_kind),
+                    })
+                    .collect(),
             })
             .collect(),
         viewport: viewport_projection(world, dataset),
     })
+}
+
+fn map_diff_line_kind(kind: DiffLineKind) -> DiffLineKindProjection {
+    match kind {
+        DiffLineKind::Context => DiffLineKindProjection::Context,
+        DiffLineKind::Addition => DiffLineKindProjection::Addition,
+        DiffLineKind::Deletion => DiffLineKindProjection::Deletion,
+        DiffLineKind::Metadata => DiffLineKindProjection::Metadata,
+    }
+}
+
+fn map_diff_cell_kind(kind: pitui_core::DiffCellKind) -> DiffCellKindProjection {
+    match kind {
+        pitui_core::DiffCellKind::Added => DiffCellKindProjection::Added,
+        pitui_core::DiffCellKind::Deleted => DiffCellKindProjection::Deleted,
+        pitui_core::DiffCellKind::Modified => DiffCellKindProjection::Modified,
+        pitui_core::DiffCellKind::Empty | pitui_core::DiffCellKind::Context => {
+            DiffCellKindProjection::Context
+        }
+    }
 }
 
 fn working_tree_hunks(diff: &WorkingTreeDiff) -> Vec<DiffHunk> {
@@ -1197,7 +1234,7 @@ fn working_tree_hunks(diff: &WorkingTreeDiff) -> Vec<DiffHunk> {
                     } else {
                         (DiffLineKind::Metadata, line.as_str())
                     };
-                    DiffLine {
+                    pitui_core::DiffLine {
                         old_line_no: None,
                         new_line_no: None,
                         kind,

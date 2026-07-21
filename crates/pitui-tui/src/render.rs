@@ -1,8 +1,8 @@
-use pitui_core::{DiffCellKind, DiffLineKind};
 use pitui_data::{
-    CellProjection, KeyCode, KeyStroke, LayoutConstraint, RenderContentProjection,
-    RenderProxyProjection, ResolvedKeyAction, RowProjection, RowProjectionKind, UiFrame,
-    UiLayoutProjection, ViewportMeasurement, ViewportProjection,
+    CellProjection, DiffCellKindProjection, DiffLineKindProjection, KeyCode, KeyStroke,
+    LayoutConstraint, RenderContentProjection, RenderProxyProjection, ResolvedKeyAction,
+    RowProjection, RowProjectionKind, UiFrame, UiLayoutProjection, ViewportMeasurement,
+    ViewportProjection,
 };
 use ratatui::{
     Frame,
@@ -184,10 +184,10 @@ fn render_panel(
                 ));
                 for line in &hunk.lines {
                     let (marker, color) = match line.kind {
-                        DiffLineKind::Addition => ('+', Color::Green),
-                        DiffLineKind::Deletion => ('-', Color::Red),
-                        DiffLineKind::Context => (' ', Color::Reset),
-                        DiffLineKind::Metadata => ('\\', Color::DarkGray),
+                        DiffLineKindProjection::Addition => ('+', Color::Green),
+                        DiffLineKindProjection::Deletion => ('-', Color::Red),
+                        DiffLineKindProjection::Context => (' ', Color::Reset),
+                        DiffLineKindProjection::Metadata => ('\\', Color::DarkGray),
                     };
                     lines.push(Line::styled(
                         format!(
@@ -225,8 +225,12 @@ fn render_panel(
                     let right =
                         format_diff_cell(row.right_line_no, row.right_text.as_deref(), half);
                     let color = match (row.left_kind, row.right_kind) {
-                        (DiffCellKind::Deleted | DiffCellKind::Modified, _) => Color::Red,
-                        (_, DiffCellKind::Added | DiffCellKind::Modified) => Color::Green,
+                        (DiffCellKindProjection::Deleted | DiffCellKindProjection::Modified, _) => {
+                            Color::Red
+                        }
+                        (_, DiffCellKindProjection::Added | DiffCellKindProjection::Modified) => {
+                            Color::Green
+                        }
                         _ => Color::Reset,
                     };
                     lines.push(Line::styled(
@@ -473,9 +477,8 @@ fn terminal_safe(value: &str) -> String {
 mod tests {
     use bevy_ecs::prelude::Entity;
     use pitui_data::{
-        CellProjection, FieldId, FooterProjection, InteractionLineProjection,
-        InteractionProjection, RenderProxyId, RendererKind, ResolvedKeyBinding, RowsProjection,
-        StatusProjection, StyleSpec,
+        CellProjection, FooterProjection, InteractionLineProjection, InteractionProjection,
+        RenderProxyId, ResolvedKeyBinding, RowsProjection, StatusProjection, StyleSpec,
     };
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -497,7 +500,6 @@ mod tests {
                 panel: Box::new(RenderProxyProjection {
                     dataset,
                     proxy: RenderProxyId::from("test"),
-                    renderer: RendererKind::List,
                     active: true,
                     title: "Commits".into(),
                     style: StyleSpec::default(),
@@ -507,7 +509,6 @@ mod tests {
                             kind: RowProjectionKind::Item,
                             depth: 0,
                             cells: vec![CellProjection {
-                                field: FieldId::CommitSubject,
                                 label: None,
                                 text: "safe\u{1b}[31m subject".into(),
                             }],
@@ -560,7 +561,6 @@ mod tests {
                 panel: Box::new(RenderProxyProjection {
                     dataset: files,
                     proxy: RenderProxyId::from("files.tree"),
-                    renderer: RendererKind::PathTree,
                     active: true,
                     title: "Files".into(),
                     style: StyleSpec::default(),
@@ -571,7 +571,6 @@ mod tests {
                                 kind: RowProjectionKind::Directory,
                                 depth: 0,
                                 cells: vec![CellProjection {
-                                    field: FieldId::FilePath,
                                     label: None,
                                     text: "src/".into(),
                                 }],
@@ -583,7 +582,6 @@ mod tests {
                                 kind: RowProjectionKind::Item,
                                 depth: 1,
                                 cells: vec![CellProjection {
-                                    field: FieldId::FilePath,
                                     label: None,
                                     text: "main.rs".into(),
                                 }],
@@ -641,7 +639,6 @@ mod tests {
                     panel: Box::new(RenderProxyProjection {
                         dataset: underlay,
                         proxy: RenderProxyId::from("underlay"),
-                        renderer: RendererKind::List,
                         active: false,
                         title: "Commits".into(),
                         style: StyleSpec::default(),
@@ -654,7 +651,6 @@ mod tests {
                     panel: Box::new(RenderProxyProjection {
                         dataset: interaction,
                         proxy: RenderProxyId::from("interaction"),
-                        renderer: RendererKind::Confirmation,
                         active: true,
                         title: "Command".into(),
                         style: StyleSpec::default(),
